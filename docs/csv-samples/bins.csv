@@ -1,0 +1,5 @@
+warehouse_code,zone_code,aisle_code,rack_code,bin_code,barcode,capacity_qty,map_x,map_y,map_w,map_h,velocity,status
+WH-HCM-01,ZONE-A,A2,R1,A2-08,BIN-A2-08,100,120,80,10,8,fast,empty
+WH-HCM-01,ZONE-A,A2,R1,A2-09,BIN-A2-09,100,132,80,10,8,fast,empty
+WH-HCM-01,ZONE-B,B3,R2,B3-12,BIN-B3-12,80,240,160,10,8,medium,empty
+WH-HCM-01,RECEIVING,STG,R0,RCV-STAGE,BIN-RCV-STAGE,500,30,40,20,15,fast,empty

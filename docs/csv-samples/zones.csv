@@ -1,0 +1,6 @@
+warehouse_code,zone_code,zone_name,zone_type,color_hex,map_x,map_y,map_w,map_h
+WH-HCM-01,RECEIVING,Khu nhận hàng,receiving,#F5A623,10,10,80,60
+WH-HCM-01,ZONE-A,Khu A - hàng nhanh,storage,#4A90D9,100,10,200,120
+WH-HCM-01,ZONE-B,Khu B - hàng thường,storage,#7ED321,320,10,200,120
+WH-HCM-01,PACKING,Khu đóng gói,packing,#BD10E0,530,10,100,80
+WH-HCM-01,SHIPPING,Khu xuất hàng,shipping,#D0021B,640,10,80,80

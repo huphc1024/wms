@@ -1,0 +1,337 @@
+"""
+Auth endpoints: login and token refresh.
+"""
+
+import os
+from datetime import datetime, timezone, timedelta
+
+from flask import Blueprint, g, jsonify, request
+from sqlalchemy import text
+
+from middleware.auth_middleware import require_auth
+from middleware.db import with_db
+from schemas.auth import ChangePasswordRequest, LoginRequest
+from services.auth_service import authenticate_user, decode_token, generate_token, validate_password
+from services.cookie_auth import (
+    AUTH_COOKIE_NAME,
+    clear_auth_cookies,
+    csrf_token_matches,
+    generate_csrf_token,
+    set_auth_cookies,
+)
+from utils.validation import validate_body
+
+ALL_FUNCTIONS = ["receive", "putaway", "pick", "pack", "ship", "count", "transfer"]
+
+# #35: env-configurable so a shared-IP deployment can raise the ceiling
+# without a code change. Defaults preserve the historical 5 / 15.
+MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "5"))
+LOCKOUT_MINUTES = int(os.getenv("LOGIN_LOCKOUT_MINUTES", "15"))
+# V-024: cap login_attempts.key at 64 chars so an attacker cannot bloat
+# the table by spraying long random usernames. Anything longer is SHA-256
+# hashed (hex digest = 64 chars) before it reaches the DB.
+LOGIN_ATTEMPT_KEY_MAX_LEN = 64
+
+auth_bp = Blueprint("auth", __name__)
+
+
+def _normalize_rate_limit_key(key: str) -> str:
+    if len(key) <= LOGIN_ATTEMPT_KEY_MAX_LEN:
+        return key
+    import hashlib
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _check_rate_limit(db, key):
+    """Check if a rate-limit key is locked out. Returns (locked, remaining_seconds)."""
+    key = _normalize_rate_limit_key(key)
+    row = db.execute(
+        text("SELECT attempts, locked_until FROM login_attempts WHERE key = :key"),
+        {"key": key},
+    ).fetchone()
+    if not row or not row.locked_until:
+        return False, 0
+    now = datetime.now(timezone.utc)
+    if row.locked_until > now:
+        remaining = int((row.locked_until - now).total_seconds())
+        return True, remaining
+    return False, 0
+
+
+def _record_failure(db, key, allow_lockout):
+    """Record a failed login attempt against ``key``.
+
+    V-023 / #35: only keys passed with ``allow_lockout=True`` ever set
+    ``locked_until``. The login path locks on the ``(IP, username)``
+    tuple; the username-only key (``user:<name>``) is still incremented
+    for observability but never locks -- an attacker spamming a username
+    from one IP cannot lock the real user out from a different IP.
+
+    Returns (locked_out, attempts_remaining). ``locked_out`` is only
+    True when ``allow_lockout`` is also True and the key has crossed
+    the threshold.
+    """
+    key = _normalize_rate_limit_key(key)
+    lockout_at = datetime.now(timezone.utc) + timedelta(minutes=LOCKOUT_MINUTES)
+    db.execute(
+        text("""
+            INSERT INTO login_attempts (key, attempts, last_attempt)
+            VALUES (:key, 1, NOW())
+            ON CONFLICT (key) DO UPDATE
+            SET attempts = login_attempts.attempts + 1, last_attempt = NOW()
+        """),
+        {"key": key},
+    )
+    row = db.execute(
+        text("SELECT attempts FROM login_attempts WHERE key = :key"),
+        {"key": key},
+    ).fetchone()
+    if allow_lockout and row and row.attempts >= MAX_LOGIN_ATTEMPTS:
+        db.execute(
+            text("UPDATE login_attempts SET locked_until = :until, attempts = 0 WHERE key = :key"),
+            {"key": key, "until": lockout_at},
+        )
+        db.commit()
+        return True, 0
+    db.commit()
+    return False, MAX_LOGIN_ATTEMPTS - (row.attempts if row else 0)
+
+
+def _reset_attempts(db, key):
+    """Clear attempts after successful login."""
+    key = _normalize_rate_limit_key(key)
+    db.execute(
+        text("DELETE FROM login_attempts WHERE key = :key"),
+        {"key": key},
+    )
+    db.commit()
+
+
+@auth_bp.route("/login", methods=["POST"])
+@validate_body(LoginRequest)
+@with_db
+def login(validated):
+    username = validated.username.lower().strip()
+    client_ip = request.remote_addr or "unknown"
+    user_key = f"user:{username}"
+    # #35: lock on the (IP, username) tuple, not the IP alone. Behind a
+    # reverse proxy / corporate NAT, request.remote_addr collapses every
+    # user onto one or two shared egress IPs, so an IP-only bucket let a
+    # single user's mistyped password lock out the whole company. Keying
+    # on (IP, username) isolates the lockout to the account that mistyped.
+    # This still preserves the V-023 protection: an attacker from one IP
+    # cannot lock a username for the user's other IPs (a different tuple),
+    # and a shared office IP accumulates a separate bucket per username
+    # instead of one shared bucket for everyone.
+    lock_key = f"ip:{client_ip}|user:{username}"
+
+    locked, remaining = _check_rate_limit(g.db, lock_key)
+    if locked:
+        minutes = remaining // 60
+        seconds = remaining % 60
+        return jsonify({
+            "error": f"Too many failed login attempts for this account. Try again in {minutes}m {seconds}s",
+        }), 429
+
+    user = authenticate_user(g.db, validated.username, validated.password)
+
+    if not user:
+        # Count the username-only key for observability (never locks) and
+        # the (IP, username) key, which is the one allowed to lock.
+        _record_failure(g.db, user_key, allow_lockout=False)
+        locked, _ = _record_failure(g.db, lock_key, allow_lockout=True)
+        if locked:
+            return jsonify({
+                "error": f"Too many failed login attempts for this account. Locked for {LOCKOUT_MINUTES} minutes",
+            }), 429
+        return jsonify({
+            "error": "Invalid username or password",
+        }), 401
+
+    # Successful login - reset both trackers for this account.
+    _reset_attempts(g.db, user_key)
+    _reset_attempts(g.db, lock_key)
+    token = generate_token(user)
+    # V-045: dual-path auth. The token is returned in the body (mobile)
+    # and also set as HttpOnly + CSRF cookies (admin SPA).
+    csrf = generate_csrf_token()
+    response = jsonify({"token": token, "user": user})
+    set_auth_cookies(response, token, csrf)
+    return response
+
+
+@auth_bp.route("/logout", methods=["POST"])
+def logout():
+    # V-100: the previous version cleared cookies on every POST, which
+    # meant an attacker-origin form submission could force a victim's
+    # browser to apply expired cookies and end the session. SameSite=Strict
+    # prevents the victim's auth cookie from being sent cross-origin but
+    # does not stop the response's Set-Cookie from being applied.
+    #
+    # Current shape:
+    #   - No auth cookie on the request -> 200 no-op, no Set-Cookie.
+    #     Cross-origin attacker (SameSite=Strict stripped the cookie) and
+    #     idempotent cleanup calls both land here.
+    #   - Valid auth cookie -> require CSRF match; clear cookies on match,
+    #     reject with 403 otherwise. A same-origin XSS can already hijack
+    #     the session directly; the CSRF gate here exists to block any
+    #     path that somehow exposes the auth cookie without the CSRF.
+    #   - Expired / invalid auth cookie -> clear cookies silently. The
+    #     session is already dead, so stale-cleanup keeps working without
+    #     demanding a CSRF token the client no longer has.
+    response = jsonify({"message": "logged out"})
+    auth_cookie = request.cookies.get(AUTH_COOKIE_NAME)
+    if not auth_cookie:
+        return response
+    payload = decode_token(auth_cookie)
+    if payload is not None and not csrf_token_matches():
+        return jsonify({"error": "CSRF token missing or invalid"}), 403
+    clear_auth_cookies(response)
+    return response
+
+
+@auth_bp.route("/me")
+@require_auth
+@with_db
+def me():
+    user_id = g.current_user["user_id"]
+    row = g.db.execute(
+        text(
+            "SELECT user_id, username, full_name, role, warehouse_id, allowed_functions, "
+            "must_change_password FROM users WHERE user_id = :uid"
+        ),
+        {"uid": user_id},
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "User not found"}), 404
+
+    if row.role == "ADMIN":
+        functions = list(ALL_FUNCTIONS)
+    else:
+        functions = list(row.allowed_functions) if row.allowed_functions else []
+
+    # Check packing toggle  -  filter out "pack" when packing is disabled
+    packing_row = g.db.execute(
+        text("SELECT value FROM app_settings WHERE key = 'require_packing_before_shipping'")
+    ).fetchone()
+    require_packing = not packing_row or packing_row.value != "false"
+
+    if not require_packing:
+        functions = [f for f in functions if f != "pack"]
+
+    # Web-admin page grants (mig 061). ADMIN sees every
+    # registered page; USER sees only their explicit grants. Returned
+    # alongside the existing mobile allowed_functions so the React
+    # admin's sidebar can filter NAV in one shot.
+    #
+    # Override grants (mig 062): so-full-edit (and future override keys)
+    # ride on the same user_page_permissions table but live in a
+    # separate response field so the frontend can light up edit
+    # controls without scanning allowed_pages for the override slug.
+    # ADMIN gets every override implicitly.
+    from constants import ALL_PAGE_KEYS, ALL_OVERRIDE_KEYS
+    override_set = set(ALL_OVERRIDE_KEYS)
+    if row.role == "ADMIN":
+        allowed_pages = list(ALL_PAGE_KEYS)
+        allowed_overrides = list(ALL_OVERRIDE_KEYS)
+    else:
+        page_rows = g.db.execute(
+            text("SELECT page_key FROM user_page_permissions WHERE user_id = :uid"),
+            {"uid": user_id},
+        ).fetchall()
+        all_keys = [r.page_key for r in page_rows]
+        allowed_pages = [k for k in all_keys if k not in override_set]
+        allowed_overrides = [k for k in all_keys if k in override_set]
+
+    return jsonify({
+        "user_id": row.user_id,
+        "username": row.username,
+        "full_name": row.full_name,
+        "role": row.role,
+        "warehouse_id": row.warehouse_id,
+        "allowed_functions": functions,
+        "allowed_pages": allowed_pages,
+        "allowed_overrides": allowed_overrides,
+        "require_packing": require_packing,
+        "must_change_password": bool(row.must_change_password),
+    })
+
+
+@auth_bp.route("/refresh", methods=["POST"])
+@require_auth
+@with_db
+def refresh():
+    # Re-validate user exists and is active before issuing new token
+    row = g.db.execute(
+        text("""SELECT user_id, username, full_name, role, warehouse_id, warehouse_ids, is_active
+               FROM users WHERE user_id = :uid"""),
+        {"uid": g.current_user["user_id"]},
+    ).fetchone()
+    if not row or not row.is_active:
+        return jsonify({"error": "Account disabled or deleted"}), 401
+
+    user_dict = {
+        "user_id": row.user_id,
+        "username": row.username,
+        "full_name": row.full_name,
+        "role": row.role,
+        "warehouse_id": row.warehouse_id,
+        "warehouse_ids": list(row.warehouse_ids) if row.warehouse_ids else [],
+    }
+    token = generate_token(user_dict)
+    csrf = generate_csrf_token()
+    response = jsonify({"token": token})
+    set_auth_cookies(response, token, csrf)
+    return response
+
+
+@auth_bp.route("/change-password", methods=["POST"])
+@require_auth
+@validate_body(ChangePasswordRequest)
+@with_db
+def change_password(validated):
+    import bcrypt
+    from services.audit_service import write_audit_log
+
+    pw_error = validate_password(validated.new_password)
+    if pw_error:
+        return jsonify({"error": pw_error}), 400
+
+    user_id = g.current_user["user_id"]
+    row = g.db.execute(
+        text(
+            "SELECT password_hash, must_change_password, username, warehouse_id "
+            "FROM users WHERE user_id = :uid"
+        ),
+        {"uid": user_id},
+    ).fetchone()
+
+    if not row or not bcrypt.checkpw(validated.current_password.encode("utf-8"), row.password_hash.encode("utf-8")):
+        return jsonify({"error": "Current password is incorrect"}), 403
+
+    was_forced = bool(row.must_change_password)
+
+    new_hash = bcrypt.hashpw(validated.new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    g.db.execute(
+        text(
+            "UPDATE users SET password_hash = :pw, password_changed_at = NOW(), "
+            "must_change_password = FALSE WHERE user_id = :uid"
+        ),
+        {"pw": new_hash, "uid": user_id},
+    )
+
+    # Distinct action name when the change satisfied a forced-change flag so
+    # operators can grep the audit log for onboarding events separately from
+    # voluntary password rotations.
+    write_audit_log(
+        g.db,
+        action_type="forced_password_change_completed" if was_forced else "password_change",
+        entity_type="user",
+        entity_id=user_id,
+        user_id=row.username,
+        warehouse_id=row.warehouse_id,
+    )
+
+    g.db.commit()
+
+    return jsonify({"message": "Password changed"})

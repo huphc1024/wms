@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+venv/
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json
+*.env.backup*
+.env.backup*
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+**/emulator.*.log
+
+# Build artifacts
+dist/
+build/
+**/mobile/android/
+**/mobile/ios/
+**/mobile/.expo/
+site/
+
+# Docker / local data
+pgdata/
+docker-compose.override.yml
+
+# Nested git backup (preserve locally, never commit)
+.git.bak/
+**/.git.bak/
+
+# sentry-wms baked artifact
+**/api/BUILD_VERSION
+
+# Proxy certs
+**/proxy/certs/

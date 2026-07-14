@@ -1,0 +1,2185 @@
+# Changelog
+
+Every GitHub release includes the full set of fixes and upgrade notes.
+Links below point to the release page for the complete list. This page
+is a shorter, docs-site-friendly summary.
+
+---
+
+## v1.30.0 -- Channel availability (Pipe C)
+
+*2026-06-19.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.30.0).
+
+A new outbound surface that publishes per-channel sellable availability to a configured HTTP sink per channel. Inventory changes are collapsed into a current-state number per (channel, SKU) and debounce-published, so a busy warehouse does not fan every stock tick out to every marketplace. A new `channel_availability` table holds sellable quantity (`on_hand - allocated`, Pickable / PickableStaging bins only) with a `current_version` / `last_version` dirty-row pattern, and the `connector-publisher` daemon reconciles each channel against live inventory -- on the `integration_events_visible` wake and a periodic interval -- and debounce-publishes only the rows whose number actually changed, with a per-channel rate limit, batch size, dispatch-time SSRF guard on the sink, and a per-row retry to a DLQ. Because it reads live inventory rather than replaying events, it stays truthful even for allocation changes that emit no event (reserve-at-creation, cancel) and never publishes a stale count. Channels carry a SKU scope (skus / categories / warehouses) and a declarative transform (field rename + constant injection, for the Amazon FBA vs MFN distinction); a new admin Channels page and `/api/admin/channels` CRUD manage them, with an audit row on every change. Migration 075; new least-privilege `sentry_publisher` role and `connector-publisher` compose service. No mobile changes.
+
+## v1.29.1 -- Production fixes
+
+*2026-06-19.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.29.1).
+
+Two fixes. The login rate-limiter keyed the lockout on the remote IP alone, so behind a shared NAT egress one person's five failed logins returned HTTP 429 to everyone behind that IP for 15 minutes (correct passwords included); it is now keyed on `(IP, username)`. And the Sales Order detail rendered `ship_method` verbatim, so an order that shipped on a different carrier than its named service read misleadingly above its tracking number; the Ship Method line now surfaces the carrier derived from the tracking-number format when it disagrees, display-only. No migrations; no mobile changes.
+
+## v1.29.0 -- Turbo receiving
+
+*2026-06-19.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.29.0).
+
+The handheld receive screen scans continuously. Each scan counts instantly against an optimistic local total and is buffered; batches flush to the receive endpoint in the background (debounced, or at a size cap), removing the per-scan receive-POST-plus-refetch round-trip that capped the operator near one scan per second. Counts reconcile from each batch response; a failed batch rolls back and refetches server truth, and leaving a PO drains the queue first so no scan is lost. The receive handler is tuned alongside it: resolving the PO and user external-ids once per request, memoizing item resolves, and deferring the audit-log writes to just before commit so the audit-chain lock is held for a shorter window. First mobile/ change since 1.19.0; the mobile build moves to version 1.29.0, versionCode 10, and the APK is rebuilt to ship it.
+
+## v1.28.0 -- Local pickup and refund status
+
+*2026-06-19.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.28.0).
+
+A Local Pickup dashboard for the counter, a distinct REFUNDED order status, and returns polish. The dashboard lists local-pickup sales orders (ship method matching "local" or "pickup"), searchable and status-filterable, with a per-row "Picked Up?" and an "Open + Picked" worklist view; `GET /admin/sales-orders` gains an opt-in `local_pickup` filter and a comma-separated status filter. **Behavior change**: a full POS refund now lands the original sales order in the new `REFUNDED` status instead of CANCELLED (superseding v1.22.0), so refunds read apart from plain cancellations and the cancellation rate is not inflated by them; migration 074 relabels existing CANCELLED-refund rows. Returns gain an operator memo (stored in the existing `memo` column, mig 054) and are kept out of the picking queue at the query level. No mobile changes.
+
+## v1.27.0 -- Cycle-count approvals
+
+*2026-06-19.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.27.0).
+
+The cycle-count approval screen shows what the system expected, what was scanned, and the resulting variance side by side. `/admin/adjustments/pending` returns `expected_quantity` and `counted_quantity` for each pending adjustment, pulled from the originating cycle_count_line via correlated subselects (NULL for non-cycle-count adjustments, no row fan-out); the screen renders Expected / Scanned / Variance columns and sorts the count cards by count number or bin. The cycle-count list drops its 200-row cap and fetches all lines in one batched `count_id = ANY` query, so the full backlog is reachable. Request timeouts rise (gunicorn 60s -> 180s, nginx 120s -> 300s) so approving a single bin with 300+ varianced lines finishes inside one transaction instead of being killed. A high-severity undici advisory is cleared in the mobile lockfile (non-breaking, build-tooling only). No migrations. No mobile source changes.
+
+## v1.26.0 -- POS Activity dashboard
+
+*2026-06-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.26.0).
+
+The POS Activity admin page is reworked from a flat list into a full operations dashboard. The top bar carries today's KPI counters (sales count and revenue, average sale, refunds, active terminals) and an hourly revenue chart; below it sit a pace curve against the same hour yesterday, a weekly trend, and channel and tender splits. A date selector anchors the KPIs, the sales-order list, and the analytics on a chosen day. The `/api/admin/pos/summary` endpoint computes the new aggregates in one pass and `/api/admin/pos/sales-orders` gains the matching date and channel filters; both keep the `pos-activity` page-permission gating. No migrations. No mobile changes.
+
+## v1.25.0 -- Inbound editing, performance, and secret scanning
+
+*2026-06-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.25.0).
+
+Three threads. **PO editing**: bumping `quantity_ordered` on a RECEIVED purchase-order line through the admin edit surface reopens it (RECEIVED -> PARTIAL) and the PO header with it, so an over-receipt becomes receivable; every admin PO edit emits `purchaseorderedit.completed/1` with the per-field diff so the ERP can reverse-sync a correction made in Sentry. **Inbound performance**: the line write-through is rebuilt to a constant number of database round-trips -- one batched item resolve, the per-line SKU lookups pre-resolved in one cached batched query, and a single multi-row INSERT -- so a wide PO no longer risks the gunicorn worker timeout mid-write, behavior otherwise unchanged. **Secret scanning**: a gitleaks gate scans the full git history on every push and pull request, running the pinned binary directly with an allowlist limited to known-benign test and CI placeholders. No migrations. No mobile changes.
+
+## v1.24.0 -- Returns, RMA, and exchanges
+
+*2026-06-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.24.0).
+
+The post-fulfillment arc, end to end. `sales_orders.order_type` admits `replacement` / `exchange` / `return` alongside `sale` / `refund` / `backorder`, and a post-fulfillment child takes a readable so_number off its original (`<orig>-REPLACEMENT` / `-EXCHANGE` / `-RMA` / `-REFUND`) linked via `parent_so_id` and, per line, `original_so_line_id`. **RMA goods-in**: `create_rma` mints the return SO and `POST /api/admin/sales-orders/<so_id>/receive-return` books a line into a disposition bin (a sellable bin restocks, a defective bin quarantines), advances the RMA status, and emits `return.received/1` -- idempotent on a handheld-supplied key; a tabbed Returns admin page (RMA + Refunds) fronts it. **POS**: checkout in replacement / exchange mode mints the typed child off an attached original (an exchange also auto-creates the `<orig>-RMA`), refund accepts a line subset for partial refunds, and a sales-order lookup plus a reference-order ingest (for an original that lives only in an upstream source system) support attach-order. Migrations 070-073. No mobile changes. This release completes the fork-to-OSS migration.
+
+## v1.23.0 -- Ship events and operations dashboard
+
+*2026-06-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.23.0).
+
+Two threads. **SO-edit outbound events**: editing a sales-order header through `PUT /api/admin/sales-orders/<so_id>` now emits `salesorderedit.completed/1` with the per-field diff that landed, and a status edit to SHIPPED additionally fires `ship.confirmed/1` via `record_ship` -- the admin surface has no carrier field, so the carrier is derived from the free-text ship method (`carrier_from_ship_method`, defaulting to "Other"), and a local-pickup ship needs no tracking, so `ship.confirmed/1` now permits an empty `tracking_numbers` array. **Operations dashboard**: the dashboard becomes a tab shell adding a Received tab (per-PO receipts for a date range, `GET /api/v1/dashboard/received`) and a Marketplace Health tab (`GET /api/v1/dashboard/shipping-health`) with per-channel Orders Received / Orders Shipped totals and a clickable need-to-ship-today bubble opening the SO drill-down. The channel set is admin-defined in a Settings > Marketplace Health surface that saves `{origin, label}` pairs to the `dashboard_bubble_origins` app setting, matched verbatim against `sales_orders.order_origin`; with nothing configured the view surfaces no channels. No migrations; no mobile changes.
+
+## v1.22.0 -- POS completions and dockd reads
+
+*2026-06-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.22.0).
+
+Two threads. **POS completions**: the sale path is rounded out -- the payment summary gains `shipping_cents` (default 0) and checkout an optional `ship_method`, so a phone order persists shipping charge, method, and order total to `sales_orders.customer_shipping_paid` / `ship_method` / `order_total` (credited back as negatives on a full refund); `split` (part cash + part card) joins card and cash as a tender method; and a full refund now moves the original SO to `status=CANCELLED` so admin and picker views stop showing a refunded sale as SHIPPED (a repeat refund surfaces `422 already_refunded` rather than 404-ing). **dockd reads**: a token-authed `GET /api/v1/dockd/items/<barcode>` resolves an item by barcode and returns its detail plus per-location stock scoped to the token's warehouses, and the dockd order payload now carries `qty_ordered` alongside the fulfilled `qty`; the OpenAPI spec is regenerated to match. No migrations; no mobile changes.
+
+## v1.21.0 -- Pre-allocation and POS phone orders
+
+*2026-06-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.21.0).
+
+Two threads. **Inventory pre-allocation**: `POST /admin/sales-orders` reserves stock at create time -- a greedy, fullest-bin-first `quantity_allocated` walk under `FOR UPDATE` -- so an admin-created or marketplace-inbound order no longer sits OPEN with nothing reserved until a picker batches it, closing the window where POS sales and concurrent inbound orders claimed the same on-hand pool; partial reservation still creates the SO. A manual `PATCH .../lines/<id>/allocation` knob (clamped to `[picked, ordered]`) backs a minus/plus stepper on the SO line table, and the picking flow normalizes a line that arrives already reserved -- releasing its standing reservation to the picked floor before re-planning -- so it no longer produces zero pick_tasks and strands the batch. **POS phone orders**: checkout gains `is_phone_order`, which creates the SO at `status=OPEN`, reserves each line via `quantity_allocated` instead of decrementing on-hand, and captures an optional customer plus a structured `shipping_address` persisted to the `sales_orders.shipping_address_*` columns for the picking ticket. `order_origin` is wire-driven and POS SO numbers drop the prefix (`SO-POS-<n>` -> `POS-<n>`). No migrations; no mobile changes.
+
+## v1.20.0 -- Inbound sync, event rename, and deploy hardening
+
+*2026-06-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.20.0).
+
+Three threads. **Inbound inventory sync**: a state-based `POST /api/v1/inbound/inventory_update` endpoint takes a desired final on-hand quantity, computes the delta against current stock, and applies it as an idempotent APPROVED adjustment (same target = 0-delta no-op) for cutover seed, marketplace mirror, and drift correction; the per-token inbound rate limit becomes env-configurable (`INBOUND_RATE_LIMIT_PER_MINUTE`, default 500). **Source-system external_ids**: outbound webhook `*_external_id` fields now carry the identifier the upstream connector pushed (resolved from `cross_system_mappings`), not Sentry's internal canonical UUID, so consumers stop round-tripping the API per event. **Webhook event rename (BREAKING)**: `transfer.completed/1` and `adjustment.applied/1` are retired and replaced by `inventorytransfer.completed/1` and `inventoryadjusted.completed/1` -- payload shapes unchanged, so migrate by subscribing to the new `event_type`; `cycle_count.adjusted/1` is kept and rides alongside `inventoryadjusted.completed` on the cycle-count branch. **Deploy portability**: `admin/nginx.conf` becomes an `${API_UPSTREAM_*}`-templated config, the api image bakes `db/mappings/` so Pipe B inbound needs no volume mount, and the gunicorn worker timeout rises to 60s. No mobile changes.
+
+## v1.19.0 -- Receiving and putaway
+
+*2026-06-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.19.0).
+
+Three threads. **Admin unreceive**: an admin can reverse a single PO
+receipt (the double-scan fix). `record_unreceive` backs the qty out of
+the warehouse inventory pool (preferring the original bin, then any bin
+holding the item) so the reversal lands even after putaway moved the
+goods, recomputes PO status, hard-deletes the receipt row, and emits
+`receipt.cancelled/1` so downstream inbound counts decrement in step.
+Surfaced as receipt history + a per-row Unreceive control in the admin
+Receiving modal. **Put-Away supervisor dashboard**: an auto-fill grid of
+bin tiles, red when a staging bin holds work and grey when empty, with a
+per-bin CSV export; the `/putaway/pending` list now surfaces the same
+priority-1 preferred bin as the scanner. **Preferred bins**: constrained
+to a strict Pickable-only priority hierarchy -- both write paths reject
+non-Pickable bins, a deferrable `UNIQUE(item_id, priority)` constraint
+(migration 069) plus an auto-resequence keep each item's bins a
+contiguous 1..K, and the rejection is surfaced on the admin page and the
+handheld instead of being swallowed. Mobile: PutAwayScreen shows the
+rejection reason; versionCode 8 -> 9, a new APK build is owed.
+
+---
+
+## v1.18.0 -- Backorders, notifications, and dispatcher reliability
+
+*2026-06-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.18.0).
+
+Three threads. **Partial-fulfillment + backorders**: an operator can ship
+what's pickable and short the rest onto a backorder SO (`order_type='backorder'`,
+`status=WAITING_STOCK`) that carries the shorted lines, holds out of the
+picking queue, and flips back to OPEN on its own when a receipt makes all
+its lines satisfiable. A `/backorders` dashboard (Waiting / Ready-to-ship)
+and a "Partially Fulfill" sub-modal on the SO edit screen front the workflow;
+the shared cancel service gained a parent-cancel cascade. **Teams
+notifications**: per-warehouse Microsoft Teams destinations for the
+`backorder.*` event family, configured on an opt-in `/notifications` page,
+with URLs Fernet-encrypted at rest and cards dispatched fire-and-forget after
+commit. **Dispatcher reliability**: four fixes against the failure mode where
+one stuck delivery silently blocks a whole subscription -- dispatch-time DNS
+bounded inside the wall-clock watchdog, a heartbeat-driven stale-`in_flight`
+reaper, fast-DLQ for permanent failures, and a self-monitor that alerts to
+Teams. Migrations 067 (backorder lifecycle columns + partial index) and 068
+(`notification_webhooks` table). No mobile diffs; no new APK.
+
+---
+
+## v1.17.0 -- Admin at scale
+
+*2026-06-17.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.17.0).
+
+Three threads. **Admin search + scale**: server-side search across
+Inventory, Items, Adjustments, Inventory Transfers, and the Create
+PO/SO modal so the pages hold up at production catalogue size. Inventory
+gains a warehouse + bin filter (the endpoint now honors `bin_id` and
+matches UPC + bin_code), Bins gets pagination + CSV, and Put-Away
+becomes a staging dashboard (new `/putaway/staging-summary` endpoint)
+that lists every staging bin including empty ones.
+
+A **POS Activity** dashboard surfaces point-of-sale order activity and
+daily KPIs from two read-only endpoints that LEFT JOIN audit_log for the
+checkout metadata. It is opt-in via the `pos_activity_enabled` setting
+so non-POS deployments never see the tab.
+
+An **Outbound Fraud** queue holds an order at `FRAUD_REVIEW`, out of the
+picking queue, until a CSR clears it. The billing != shipping auto-flag
+heuristic is opt-in (`fraud_review_billing_shipping`, off by default):
+when on, an inbound order whose billing and shipping addresses diverge
+lands in FRAUD_REVIEW on first receipt. The `/fraud` page shows the two
+addresses side by side with inline memo edit and a push-to-queue action,
+gated by a new `fraud` page permission.
+
+Migration 066 documents the new status value; no DDL (the status column
+has no DB CHECK, and `memo` shipped in 055). No mobile diffs; no new APK.
+
+## v1.16.0 -- Admin platform
+
+*2026-06-17.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.16.0).
+
+The web admin grows three ways. A **Vendors** page adds CRUD over the
+canonical vendors table, gated by a new `vendors` page permission.
+
+A **consolidation** pass restyles the chrome, folds Warehouses / Bins /
+Zones / Preferred Bins under a single Data page with a tab strip (old
+paths redirect), retires the admin Picking/Packing/Shipping mirror pages
+in favor of the handheld scanner flow, widens the SO/PO detail popups
+with a sectioned layout, and adds an **Item History** tab to the audit
+log: a SKU typeahead drives a per-item lifecycle view through a new
+`?item_id` filter that matches both direct `ITEM` events and rows whose
+`details` carry the item. The picking productivity metric now counts
+distinct orders picked, not summed units.
+
+A **purchase-order management** surface makes line items editable, adds
+an `ARCHIVED` status and a status dropdown, exports a PO to CSV, gives
+the Add-Line form a debounced SKU typeahead with live resolution, and
+brings receiving onto the web with an inline per-line receive control
+against the existing `/receiving/receive` endpoint. Backend adds line
+add/update/delete endpoints and status transitions, each writing one
+audit row.
+
+Migration 065 prunes the retired `picking` / `packing` / `shipping` page
+keys from `user_page_permissions`. No mobile diffs; no new APK.
+
+## v1.15.0 -- Admin picking ops
+
+*2026-06-16.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.15.0).
+
+Two admin outbound tools. A virtual-pick path marks an OPEN sales order
+picked from the admin UI when the digital pick never landed:
+`POST /admin/sales-orders/<id>/admin-pick` applies a batched, all-or-nothing
+pick (split-bin aware), bumps line counters, decrements inventory, writes an
+`ACTION_PICK` audit row, and emits `pick.confirmed` when the SO flips to
+PICKED. The synthetic pick tasks undo through the existing Release Picked
+Quantities flow.
+
+A printable Picking Tickets queue (Outbound > Picking Tickets) lists OPEN
+orders with a status switcher, a Hide-Printed toggle, and a sortable Bin
+column in warehouse-walk order, plus a per-SO packing slip (Code 128
+barcode) and a Print All tab capped at 200 tickets. Migration 064 adds
+`printed_at`, stamped by `POST /admin/sales-orders/mark-printed` once a
+client confirms a render, so the queue hides already-printed orders without
+dropping them.
+
+The packing-slip branding (logo, company name + address, returns text) is
+read from `app_settings` and defaults to empty, so a fresh install prints a
+clean, unbranded slip; Settings > Picking Ticket configures it. No mobile
+diffs; no new APK.
+
+## v1.14.0 -- Picking integrity
+
+*2026-06-15.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.14.0).
+
+The pick path gains a layered defense against silently under-fulfilled
+orders. `create_pick_batch` and `wave_create` refuse to batch sales
+orders that pickable inventory cannot cover, returning HTTP 409
+`insufficient_coverage` with an `unpickable[]` payload and accepting an
+`exclude_so_ids` retry for the coverable subset; `complete_batch`,
+`complete_packing`, and `record_ship` each refuse to promote a line
+short-picked without an operator-confirmed SHORT marker.
+
+The pick-batch lifecycle becomes deterministic: a new scan auto-cancels
+the operator's prior in-progress batch with a full revert, so there is
+no half-stored "Resume" state, and admins get an Outbound > Picking
+Batches page to release batches that strand their orders. Wave-validate
+resolves transfer orders alongside sales orders from the same scan.
+
+First mobile/ change since v1.10.3: an unpickable-orders modal, the
+Resume affordance removed from the home screen, and transfer-order scans
+on the pick screen. APK rebuilt at versionCode 8. No new migrations.
+
+## v1.13.0 -- SO status revert + editing refinements
+
+*2026-06-15.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.13.0).
+
+The admin sales-order surface gains a status-revert flow:
+`POST /admin/sales-orders/<id>/revert-status` demotes a PICKED / PACKED /
+SHIPPED order to any earlier status, releasing each picked task's
+inventory back to its source bin, unpacking, and unshipping under one
+transaction and one audit shape (`SO_STATUS_REVERTED` /
+`SO_PICK_RELEASED` / `SO_UNPACKED` / `SO_UNSHIPPED`). A release-only mode
+releases picks without flipping status, and a shared `full_revert_batch`
+gives cancel-batch the same unwind across PENDING / PICKED / SHORT.
+
+Also: a free-text `sales_orders.order_origin` label (mig 063) populated
+by the inbound payload and surfaced in the SO modals; tracking-number
+and inline address editing in the main SO edit modal; a `.modal`-scoped
+type-scale pass; and a dependency audit catch-up (`cryptography` 48.0.1
+plus npm transitive bumps) clearing the 2026-06-15 advisories. No mobile
+diffs; no new APK.
+
+## v1.12.0 -- per-page admin permissions + SO line editing
+
+*2026-06-12.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.12.0).
+
+Web-admin USERs gain per-page permission grants (`user_page_permissions`,
+mig 061): `/auth/me` returns `allowed_pages`, every admin endpoint gates
+through `@require_admin_or_page_permission`, the sidebar filters to
+granted pages, and the Users form carries the grant grid. Background
+fetches are silenced so the Permissions Error popup only fires on pages
+a USER actually visits.
+
+The admin SO surface gains line CRUD with an allocation-release pass,
+shipment-state backfill fields, a company-local Shipped Date
+(`SENTRY_COMPANY_TIMEZONE`, default UTC, noon-anchored across DST), the
+so-full-edit override, and a denormalised `sales_orders.source_system`
+(mig 062) with per-field edit audit rows.
+
+## v1.11.0 -- SO status simplification
+
+*2026-06-12.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.11.0).
+
+The sales_orders lifecycle drops three dead statuses. PACKING was never
+set by application code, ALLOCATED was comment-only, and PICKING merely
+mirrored "this SO sits inside an active pick batch." The lifecycle is
+now OPEN -> PICKED -> PACKED -> SHIPPED, with CANCELLED as the off-ramp.
+
+**Breaking.** Automation keying on the retired statuses must move to
+the derived signal: an SO is "in picking" when it has a
+`pick_batch_orders` row whose batch is OPEN or IN_PROGRESS. Migration
+060 runs the backfill: retired orders fold to OPEN, ALLOCATED lines to
+PENDING (no-op on databases that never held them).
+
+## v1.10.4 -- POS cash tender, connection-pool validation, SO detail round-trip
+
+*2026-06-12.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.10.4).
+
+API-reliability patch from production. Three fixes, no migrations.
+
+**POS cash tender accepts a null processor reference.** `external_txn_ref`
+required a non-empty string, but cash payments carry no card-processor
+session or marketplace_txn_id -- cash checkouts failed validation with
+422 at the register. Now Optional; the DB column was already nullable
+and dedup rides `idempotency_key`.
+
+**Pooled DB connections validated before use.** `pool_pre_ping` replaces
+server-dropped connections and `pool_recycle` retires them before the
+Postgres idle timeout, eliminating first-request-after-idle 500s.
+
+**SO detail returns customer_phone + customer_address.** The PUT path
+accepted both, but the detail SELECT omitted them, so the edit modal
+came back blank after Save.
+
+## v1.10.3 -- PickableStaging put-away + cross-PO receipt-cancel guard
+
+*2026-06-12.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.10.3).
+
+Floor-operations patch. Mobile moves to versionCode 7 for the handheld
+half of the put-away fix.
+
+**PickableStaging bins are valid put-away sources.** The pending-putaway
+queue filtered to `bin_type = 'Staging'` while the receive screen already
+accepts both staging types; items received into PickableStaging tray bins
+were invisible to the handheld put-away flow.
+
+**Receipt cancel refuses cross-PO sweeps.** The mobile receive screen
+accumulates receipt_ids across every PO loaded in a session, so one
+Cancel tap could reverse receipts on POs the operator never intended to
+touch. `po_id` is now required and a pre-flight check refuses the cancel
+before any state is touched when any receipt belongs to a different PO.
+
+## v1.10.2 -- security catch-up + audit chain and pick FK integrity fixes
+
+*2026-06-12.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.10.2).
+
+Security catch-up across all three dependency trees (flask-cors, pyjwt,
+react-router, mobile shell-quote critical) with documented pip-audit
+deferrals, plus two data-integrity fixes: the audit-log hash chain now
+uses `convert_to(payload, 'UTF8')` so multi-line payloads hash instead
+of rolling back the transaction (mig 057; historical `row_hash` values
+still verify), and `pick_tasks` / `wave_pick_breakdown` line FKs move
+to ON DELETE SET NULL (migs 058, 059) so line deletion cannot strand
+historical pick records.
+
+## v1.10.1 -- admin token validator fix + inventory adjustment CSV import
+
+*2026-05-11.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.10.1).
+
+Patch release on top of the v1.10.0 POS surface. Two operator-experience changes.
+
+**`admin/tokens` validator accepts `dockd.dispatch` and `pos.dispatch`.**
+`CreateTokenRequest` and `UpdateTokenRequest` only recognized V150
+outbound slugs in `_known_slugs_only`, so `POST /api/admin/tokens` with
+`endpoints=['pos.dispatch']` or `['dockd.dispatch']` returned 400
+`unknown_endpoint_slugs` even though the auth middleware honors both
+slugs at request time and scope-catalog advertises them. Operators
+could not issue dockd or POS tokens through the admin API. New
+`_KNOWN_ENDPOINT_SLUGS = V150 keys + V190_DOCKD_SLUG + V1100_POS_SLUG`
+is the single source the validator's accept set and "unknown slug"
+error message both read from.
+
+**Inventory adjustment CSV import (#329).** New `inventory-adjustments`
+arm on `POST /api/admin/import/<type>` alongside items / bins /
+purchase-orders / sales-orders. Required columns: `sku`, `warehouse`,
+`bin`, `qty` (signed integer), `memo` (optional, <=500 chars). Each
+accepted row resolves `sku` against `items.sku`, `warehouse` against
+`warehouses.warehouse_code`, `bin` against `bins.bin_code` (must
+belong to the resolved warehouse), and writes an
+`inventory_adjustments` row with `reason_code='CORRECTION'`,
+`status='APPROVED'`, `reason_detail=memo` so the on-hand change applies
+inline. Positive qty goes through
+`services.inventory_service.add_inventory` (advisory-locked, creates
+the inventory row when absent); negative qty takes `FOR UPDATE` on the
+inventory row and rejects with a row-level error when available
+on-hand is insufficient. One `audit_log` row (`ACTION_ADJUST`) and one
+`adjustment.applied/1` outbox event fire per row so subscribers see
+one event per imported correction. Existing 5000-record cap and V-015
+formula-prefix sanitiser apply unchanged. Admin Imports page gains an
+"Inventory Adjustments" tab with template download (5 columns, 3
+example rows). New alignment test pins the template header to the
+server schema field list.
+
+No migrations. Zero mobile/ diffs on this branch; v1.9.0 APK
+(`sentry-wms-v1.9.0.apk`, versionCode 6) remains the working baseline.
+No new APK build for v1.10.1. Operators running the v1.9.0 mobile app
+continue to work against a v1.10.1 backend with no upgrade.
+
+---
+
+## v1.10.0 -- POS endpoint surface
+
+*2026-05-09.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.10.0).
+
+Sentry now serves a dedicated counter-sale API for an external POS
+Service. Four endpoints under `/api/v1/pos/` (`GET /availability`,
+`POST /validate-cart`, `POST /checkout`, `POST /refund`) authenticate
+via a new fourth direction `pos.dispatch` alongside outbound polling,
+inbound POST, and dockd. Checkout and refund are atomic single-
+transaction routes with `SELECT ... FOR UPDATE` on the inventory rows
+being decremented or re-incremented, idempotent on a per-route
+`idempotency_key` (UUID4) with a SHA-256 body hash so a retry with the
+same key + same body replays the cached response and a retry with the
+same key + different body returns 409.
+
+Refund enforces a 90-day window from the original sale's `created_at`,
+a card-vs-cash tender lock comparing the original `POS_CHECKOUT` audit
+row's `payment_method` against `body.refund_summary.method`, and a
+once-per-original-SO guard via `refunded_at` / `refund_so_id` on the
+original `sales_orders` row. Missing / out-of-scope / wrong-source /
+wrong-state original SOs conflate to 404 `original_so_not_found` to
+prevent enumeration; the 422 informational rules only fire after the
+token has proven it can see the SO.
+
+PCI-scope guard at the Pydantic boundary: `CardTender` is a strict-
+typed model with `extra='forbid'` accepting exactly `{type, amount_cents,
+card_brand, card_last4, auth_code, external_ref}`. Any other field
+(`card_pan`, `full_track`, expiry, cvv, etc.) fails 422 at the schema
+layer so Sentry never accepts PAN-shaped data on the wire.
+
+Pricing stays out of Sentry's columns: per-line `unit_price_cents` /
+`tax_cents` / `line_total_cents` ride on the wire and live exclusively
+in `audit_log.details` for archival; mig 056 added no per-line price
+columns. The POS Service owns its own pricing source. New
+`ACTION_POS_CHECKOUT` and `ACTION_POS_REFUND` audit constants extend
+the v1.4 hash chain.
+
+One migration (056). No new APK published; v1.9.0 APK
+(`sentry-wms-v1.9.0.apk`, versionCode 6) remains the working baseline
+since v1.10.0 has no mobile changes. Operators running the v1.9.0
+mobile app continue to work against a v1.10.0 backend with no upgrade.
+
+---
+
+## v1.9.0 -- Dockd shipping integration
+
+*2026-05-09.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.9.0).
+
+Sentry now serves a dedicated outbound shipping API for the in-warehouse
+dockd application. Three endpoints under
+`/api/v1/dockd/orders/<so_number>` (GET, ship, void-ship) authenticate
+via per-station bearer tokens with the new `dockd.dispatch` scope, are
+idempotent under retry through SHA-256 body-hash sentinel rows, and
+serialize concurrent ship attempts on the same SO with
+`SELECT ... FOR UPDATE`. Both ship and void-ship write through the
+existing audit-log hash chain and emit on the `integration_events`
+outbox so downstream ERPs see a fully-shipped or fully-reversed order.
+
+In parallel, the SO lifecycle gains `CANCELLED` status with end-to-end
+wiring (admin + inbound + dashboard counter); a new `sales_orders.memo`
+column inbound-mappable from connector and rendered through the picker,
+packer, and shipper flows; and a UI modernization of the Audit Log page
+with color-coded action badges, chip-style detail previews, an
+action-type select filter, and a Copy JSON button on the detail modal.
+Audit details for PICK / TO_LINE_PICKED / PACK / RECEIVE actions now
+record both expected and actual counts so investigators can reconstruct
+cumulative state from one row.
+
+Two migrations (054-055). Migration 054 adds five void columns to
+`item_fulfillments` and the `dockd_idempotency` table; 055 adds
+`sales_orders.memo TEXT`. Both forward-only.
+
+**Mobile.** The v1.8 APK
+([`sentry-wms-v1.8.0.apk`](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.8.0))
+stays a working baseline -- v1.9 backend changes are additive and v1.8
+keeps picking + packing + receiving + putaway against a v1.9.0 backend.
+The v1.9 mobile build adds a memo block on Pack / Pack-Ship / Ship
+screens (warning-tinted callout above the scan input) and fixes a
+pack-after-short-pick fallback bug where `PackScreen` and
+`PackShipScreen` used `||` against `quantity_picked`, falling back to
+`quantity_ordered` on a fully-shorted line and blocking pack
+completion. **Update to the v1.9 APK on the
+[release page](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.9.0)
+if you ship from the mobile flow or want the memo display, or stay on
+v1.8 if you don't.**
+
+## v1.8.0 -- Transfer Orders + Productivity Dashboard
+
+*2026-05-07.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.8.0).
+
+Sentry now ships its first internal warehouse-to-warehouse workflow
+end-to-end: import a TO via CSV (with shortage detection + per-line
+commit), pick through the existing mobile flow via a new
+`pick_tasks.to_id` discriminator, batch picks into an admin-approval
+row, approve to move inventory source -> destination + emit
+`transfer.completed/1` to the outbox, or reject to leave the source
+stock for re-pick. The operations-overview Dashboard is replaced
+with a per-user productivity grid (Picking units / Packing units /
+Shipped orders / Received unique SKUs / Put Away unique SKUs)
+backed by `audit_log` aggregation through a new compound covering
+index.
+
+The v1.7.0 inbound contract gains `sales_orders.order_total` +
+`customer_shipping_paid` (NUMERIC(12,2)) with per-field decimal
+bounds in mapping docs (rejected at 422 instead of silent Postgres
+rounding); structured per-component billing + shipping address
+fields (16 columns drop the v1.7 single-TEXT placeholders); inbound
+line items write through to `purchase_order_lines` +
+`sales_order_lines` so receiving + picking have something to scan
+against; per-token static `mapping_overrides` JSONB resolves the
+v1.7 deferral (#270); inbound payload `warehouse_id` falls back to
+the issuing token's primary warehouse when source omits it.
+
+Five migrations (049-053). Three security carry-forwards close the
+v1.4 deferral set: `scrub_secrets` credential pattern catalog,
+`ConnectionResult.message` scrub-before-truncate, `\r` permitted
+with JSON-escape on emit. Breaking: v1.7
+`sales_orders.billing_address` + `shipping_address` TEXT columns
+are dropped in favour of the structured fields; mapping docs that
+reference the old names fail boot loud via the #267
+canonical-column validator.
+
+**Mobile.** The v1.5.1 APK
+([`sentry-wms-v1.5.1.apk`](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.5.1))
+stays a working baseline -- backend changes in v1.6 / v1.7 / v1.8
+are additive and v1.5.1 keeps picking + packing + receiving +
+putaway against a v1.8.0 backend. The v1.8 mobile build adds two
+cosmetic improvements for the new TO surface: the picker screen
+header reads "TO {to_number}" instead of "X orders" when the active
+batch is a TO pick, and the home-screen banner flips its label to
+"ACTIVE TRANSFER" + detail line "TO {to_number}". Operators on
+v1.5.1 picking a TO batch see the legacy "X orders" text (which
+renders "0 orders" since the batch has no SO links) -- functional
+but ugly. **Update to the v1.8 APK on the
+[release page](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.8.0)
+for the new TO display, or stay on v1.5.1 if you don't run TO
+workflows.**
+
+Transfer Orders:
+
+- **Three new tables** (#281, mig 049): `transfer_orders` (header
+  with source / destination / status + UUID external_id + state-
+  machine CHECK), `transfer_order_lines` (per-item with monotonicity
+  CHECKs `committed <= requested`, `picked <= committed`,
+  `approved <= picked`), `transfer_order_approvals` (one row per
+  picker submission with `lines_snapshot` JSONB + UUID external_id
+  for outbound event idempotency). `pick_tasks` gains `to_id` +
+  `to_line_id` discriminator with an XOR `CHECK` so exactly one of
+  `(so_id, to_id)` is non-NULL; existing `so_id` / `so_line_id`
+  drop their NOT NULL so SO + TO pick rows share the same table.
+- **TO number generator** (#290) -- format `TO-{YYYYMMDDHHMMSSmmm}`
+  matching the existing `picking_service` batch numbering at
+  millisecond precision. UNIQUE on `to_number` catches the rare
+  same-millisecond burst; the route retries once with a fresh
+  timestamp before surfacing 500.
+- **CSV import** (#291). `POST /api/admin/transfer-orders/import`
+  accepts `{source_warehouse_code, destination_warehouse_code,
+  notes, records: [{sku, quantity}]}`. Pipeline: top-level Pydantic
+  + source != destination + warehouse code -> id resolution + per-row
+  `TransferOrderImportRow` validation with formula-prefix protection
+  + SKU resolution to `items.item_id` + sort by `item_id ASC` +
+  `FOR UPDATE OF inv` walk per item across bins (matches picking +
+  cancel + start-picking lock ordering) + commit `min(requested,
+  available)` distributed across bin rows. Lines with
+  `committed_qty = 0` land `SHORT_CLOSED` so they don't block
+  closure. Response carries header + shortages payload so the
+  Shortage Modal renders cleanly.
+- **Picking dispatch** (#292). `POST /api/admin/transfer-orders/<to_id>/start-picking`
+  walks TO lines with `picked_qty < committed_qty`, finds inventory
+  rows at the source warehouse, INSERTs one `pick_tasks` row per
+  `(line, bin)` with `to_id` + `to_line_id` set, anchors them under
+  a fresh `pick_batch`. `picking_service.confirm_pick` branches on
+  the discriminator: TO picks call `update_transfer_order_line_picked`
+  (atomic over-pick rejection via WHERE-clause guard) and write
+  `ACTION_TO_LINE_PICKED` audit; SO picks unchanged.
+- **Submit + approve + reject** (#293).
+  `POST /api/admin/picker/transfer-orders/<to_id>/submit` (cookie
+  auth, no role gate) snapshots lines with `picked_qty > approved_qty`
+  into a PENDING approval row + flips header to AWAITING_APPROVAL
+  when all lines fully picked.
+  `POST /api/admin/transfer-orders/<to_id>/approvals/<id>/approve`
+  enforces a self-approval gate via
+  `app_settings.transfer_order_block_self_approval` (mig 049 seeded
+  TRUE), bumps `transfer_order_lines.approved_qty`, decrements
+  source `inventory.quantity_allocated` + `quantity_on_hand`
+  distributing across bins, credits destination warehouse's first
+  Staging bin (INSERTs row when missing; 409
+  `no_destination_staging_bin` otherwise), checks closure, emits
+  `transfer.completed/1` with `aggregate_id = to_approval_id`.
+  `POST /api/admin/transfer-orders/<to_id>/approvals/<id>/reject`
+  flips status to REJECTED with optional `rejection_reason`; **no
+  inventory movement, no event emission** so source stock stays
+  available for re-pick.
+- **TO confirm_pick does not decrement source inventory** (#293).
+  v1.8 splits the SO + TO inventory semantics: TO picks update only
+  `transfer_order_lines.picked_qty` at pick time (the import-time
+  reservation persists); inventory moves source -> destination at
+  approval time. SO `confirm_pick` unchanged.
+- **Admin UI** (#294). Single-file `admin/src/pages/TransferOrders.jsx`
+  with list + status filter + source / destination filter, detail
+  modal with lines table + approvals queue, per-line Short-Close
+  + Cancel + Delete + Start Picking action buttons, CSV Import
+  modal with client-side parse + preview + per-row error feedback,
+  Shortage Modal with three actions (Download Shortage CSV,
+  Cancel TO, Create with Available), Approve / Reject buttons on
+  pending approvals. Sidebar entry under Warehouse group; existing
+  `/inter-warehouse-transfers` renamed to "Bin Transfers" to
+  disambiguate. See [`docs/transfer-orders.md`](transfer-orders.md)
+  for the full operator playbook.
+- **Mobile picker TO context** (#295). `/api/picking/active-batch`
+  + `get_batch_tasks` + `get_next_task` LEFT JOIN `transfer_orders`
+  so TO tasks resolve; response gains `kind` + `to_id` + `to_number`.
+  Mobile picker screen renders the TO context (see Mobile note
+  above).
+- **Sidebar pending-approvals badge** (#296). `/admin/dashboard`
+  returns `pending_to_approvals` warehouse-scoped to TOs whose
+  source OR destination matches the requested warehouse_id.
+
+Productivity Dashboard:
+
+- **Service** (#297, `api/services/productivity_service.py`).
+  `DASHBOARD_EVENTS` catalog maps slug -> (action_type, metric_kind):
+  `picking` (PICK / units), `packing` (PACK / units), `shipped`
+  (SHIP / orders), `received_skus` (RECEIVE / unique_skus),
+  `putaway_skus` (PUTAWAY / unique_skus). Per-event aggregator with
+  the actual JSONB field path per metric (PICK uses
+  `details.quantity_picked`, PACK uses `details.total_items`,
+  RECEIVE uses `details.item_id` for distinct count, PUTAWAY uses
+  `entity_id`). 60s in-process TTL cache keyed on `(warehouse_id,
+  start, end)`. Packing visibility honours
+  `app_settings.require_packing_before_shipping`.
+- **API endpoints** (#297). `GET /api/v1/dashboard/productivity`
+  (cookie + ADMIN, Pydantic-validated date range capped at 90 days,
+  422 on `end < start` or `range_too_large`).
+  `GET /api/v1/dashboard/preferences` (returns schema defaults when
+  no row exists). `PUT /api/v1/dashboard/preferences` (upserts,
+  partial body keeps other fields, `chart_order` validated against
+  the catalog allowlist, `user_id` derived from `g.current_user`
+  only -- never from body).
+- **Frontend** (#299, `admin/src/pages/Dashboard.jsx` rewrite).
+  5-card grid (4 when packing hidden) with per-user vertical bars
+  sorted desc by event value, top performer in Sentry red `#8e2715`
+  and others in copper `#c4722a`. Time range selector Today /
+  Yesterday / Last 7d / Last 30d / Custom. Charts (default) /
+  Table view toggle with CSV export from table view. Click-to-
+  expand replaces grid with full-size single chart + Back button.
+  Gear-icon settings panel for chart_order rearrange + default_range
+  + default_view; PUTs preferences on every change.
+
+Inbound contract extensions:
+
+- **`sales_orders.order_total` + `customer_shipping_paid`** (#282,
+  mig 050). Two `NUMERIC(12,2)` nullable columns. Forward-only --
+  existing rows have NULL after the migration.
+- **Per-field decimal bounds in mapping docs** (#285). `FieldMapping`
+  gains optional `max_digits` / `decimal_places` / `ge` / `le`
+  attributes for `type='decimal'`. `_coerce_or_default` always
+  coerces decimals to `Decimal` (safe for psycopg2) and raises
+  `ValueError` (-> 422 `mapping_apply_error`) on bound violation,
+  replacing the v1.7 silent Postgres rounding (excess scale) and
+  500 NumericValueOutOfRange (excess precision). Backward
+  compatible: existing decimal mappings without bounds keep
+  pass-through behaviour.
+- **Structured billing + shipping address** (#288, mig 053). 16
+  structured columns replace the v1.7 mig 046 `billing_address` +
+  `shipping_address` TEXT placeholders. CSV import + admin SO
+  detail render + admin SO `PATCH /address` endpoint with status
+  gate (ADMIN any status / non-admin OPEN only) +
+  `ACTION_SO_ADDRESS_EDITED` audit with field-level delta. Operator
+  template gets 16 worked examples replacing the 2 TEXT examples.
+- **Inbound line item write-through** (#289). `purchase_orders` +
+  `sales_orders` inbound now writes line items to the relational
+  `*_lines` tables (v1.7 stored them only in
+  `inbound_*.canonical_payload` JSONB). Item resolution via
+  `cross_system_lookup` (line declares `item_id` with `source_type:
+  item`); helper dereferences the canonical UUID to the integer
+  `items.item_id`. Re-POST replaces lines via DELETE + INSERT only
+  when no downstream activity exists; PO `quantity_received > 0`
+  or SO `quantity_(allocated|picked|packed|shipped) > 0` returns
+  409 `lines_in_flight`. Empty `line_items` array on re-POST
+  preserves existing lines (header-only update is allowed).
+  Items must be pre-loaded so the lookup resolves; unresolved item
+  -> 409 `cross_system_lookup_miss`.
+- **Per-token static `mapping_overrides`** (#270, mig 052).
+  `wms_tokens` gains `mapping_overrides JSONB NOT NULL DEFAULT '{}'`.
+  The existing `mapping_override BOOLEAN` capability flag stays as
+  the gate; per-token overrides apply only when both the boolean is
+  TRUE and the JSONB is non-empty. Admin issue route validates
+  every override key against the columns of the token's
+  `inbound_resources` canonical tables via `information_schema`
+  (422 `unknown_mapping_overrides_keys`). Audit shape uniform: every
+  TOKEN_ISSUE / TOKEN_ROTATE / TOKEN_DELETE row carries
+  `mapping_overrides_keys` (sorted, **never values**). See
+  [`docs/erp-integration.md`](erp-integration.md) for the
+  operator-facing reference.
+- **`warehouse_id` token fallback** (#300). When source omits
+  `warehouse_id` and the token's `warehouse_ids` array carries at
+  least one entry, the inbound handler fills in
+  `token.warehouse_ids[0]`. Single-warehouse tokens (the common
+  case for connector authors) get the natural fallback;
+  multi-warehouse tokens take the first entry.
+
+Security carry-forward:
+
+- **`scrub_secrets` credential pattern catalog** (#52). New
+  `CREDENTIAL_PATTERNS` covers Sentry's own bearer tokens, AWS
+  access keys, generic Bearer headers, key=value connection-string
+  fragments, NetSuite OAuth fragments, JWT-shaped strings, and a
+  heuristic catch-all for long base64-ish strings near credential
+  keywords. `scrub_secrets` composes URL scrubbing + the new
+  catalog and is idempotent.
+- **`ConnectionResult.message` credential scrubbing** (#53). Runs
+  `scrub_secrets` between the printable-character filter and the
+  500-char length cap so multi-character redaction tags
+  (`<REDACTED>`, `<JWT_REDACTED>`) cannot be split.
+- **Carriage return in `ConnectionResult.message` allowlist** (#55).
+  `\r` stays in `_ALLOWED_MESSAGE_CHARS` so Windows-origin upstream
+  errors (`\r\n` line endings) survive intact. Safety on emit
+  guaranteed by JSON encoding (Pydantic `model_dump_json` escapes
+  `\r` to `\\r`).
+
+Migrations:
+
+- **049** -- transfer orders (`transfer_orders` +
+  `transfer_order_lines` + `transfer_order_approvals` + `pick_tasks`
+  `to_id` / `to_line_id` discriminator with XOR CHECK +
+  `app_settings.transfer_order_block_self_approval`). XOR CHECK
+  lands `NOT VALID` then `VALIDATE` outside the BEGIN/COMMIT so
+  the validation lock is `SHARE UPDATE EXCLUSIVE` rather than
+  `ACCESS EXCLUSIVE`.
+- **050** -- `sales_orders.order_total` + `customer_shipping_paid`
+  (NUMERIC(12,2), nullable).
+- **051** -- `user_dashboard_preferences` table +
+  `ix_audit_log_dashboard` covering index +
+  `warehouses.timezone` (default `'America/Denver'`).
+- **052** -- `wms_tokens.mapping_overrides JSONB NOT NULL DEFAULT '{}'`.
+- **053** -- structured billing + shipping address columns (16 VARCHAR
+  columns replacing the v1.7 `billing_address` + `shipping_address`
+  TEXT).
+
+All five declare `SET lock_timeout = '5s'` + `SET statement_timeout
+= '60s'` at the top so a bad migration fails fast (new v1.8
+convention). `BEGIN/COMMIT`-wrapped per V-213.
+
+Breaking changes:
+
+- **`sales_orders.billing_address` + `shipping_address` TEXT
+  columns dropped** (mig 053). Replaced with 16 structured
+  per-component columns. Mapping docs that still reference the old
+  names fail boot loud via the #267 canonical-column validator with
+  the offending file path + field name.
+- **Old operations-overview Dashboard removed** (#299).
+  `/admin/dashboard` (legacy ops-overview JSON) stays for sidebar
+  badge counts, but the admin panel's `/` route now renders the
+  per-user productivity grid; the previous open SOs / open POs /
+  short-picks tables are dropped from the dashboard surface.
+  Operators find them on `/sales-orders`, `/purchase-orders`, and
+  `/audit-log`.
+
+Reserved for v1.9:
+
+- **Power User role** (#298). Third role tier between USER and
+  ADMIN that admits admin panel login but locks the System sidebar
+  group.
+- **`ship.confirmed/1` event payload extension for structured
+  shipping address** (deferred from #289). v1.9 dockd integration is
+  the actual consumer.
+- **Per-request body `mapping_overrides`** (#270 follow-up).
+  Per-token static config (Option B) is the v1.8 surface;
+  per-request body (Option A) and per-mapping-document escape
+  hatches (Option C) remain deferred until real demand surfaces.
+
+Operator notes:
+
+- After deploy: restart api workers so the new `mapping_overrides`
+  column is in the token cache shape. Existing tokens auto-populate
+  with `'{}'` from the migration's NOT NULL DEFAULT.
+- TO inventory locking pattern: import + cancel + start-picking +
+  approve + short-close all walk inventory rows in `inventory_id
+  ASC` so concurrent SO + TO operations on the same item stay
+  deadlock-free.
+- Productivity Dashboard cache: 60s TTL per `(warehouse_id, start,
+  end)` per worker. Restart workers if you need fresh reads inside
+  the TTL.
+- Transfer Order destination warehouse: must have at least one
+  Staging bin. Approve fires 409 `no_destination_staging_bin`
+  otherwise.
+
+---
+
+## v1.7.0 -- Inbound (Pipe B)
+
+*2026-05-06.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.7.0).
+
+External systems can now POST canonical-shaped resource updates to
+Sentry through five new endpoints under `/api/v1/inbound/`:
+`sales_orders`, `items`, `customers`, `vendors`, and
+`purchase_orders`. Each request carries `external_id` +
+`external_version` + `source_payload`; per-source mapping documents
+(YAML at `db/mappings/<source_system>.yaml`) translate the source
+payload into Sentry's canonical model with strict-typed Pydantic
+validation, JSONPath resolution, simpleeval-sandboxed derived
+expressions, and `cross_system_lookup` for canonical UUID resolution
+against prior ingestions. `X-WMS-Token` authentication gains
+`source_system` + `inbound_resources` scope dimensions on top of
+the v1.5 endpoint scope. `inbound_source_systems_allowlist` gates
+which source systems can POST; misconfigured allowlist or missing
+mapping doc refuses boot loud.
+
+Twelve new migrations (037-048). One new env var
+(`SENTRY_INBOUND_SOURCE_PAYLOAD_RETENTION_DAYS`); two existing env
+vars gain new shape (`SENTRY_INBOUND_MAX_BODY_KB` boot-validated,
+`SENTRY_INBOUND_MAPPINGS_DIR` default changed to absolute
+`/db/mappings`). Three boot validators reject misconfiguration loud
+at startup: canonical-column shape (#267), eval-shape derived
+expressions (#272), and `SENTRY_INBOUND_MAX_BODY_KB` range (#273).
+audit_log strict-by-log_id chain integrity hardened against
+concurrent insert via sentinel-lock + nextval-in-trigger (#271).
+Direct-DB revoke of `wms_tokens.revoked_at` propagates auth
+invalidation across workers via `pg_notify` trigger + LISTEN
+subscriber + lock-step status flip (#274, #278).
+
+Mobile is unchanged. Cookie-auth admin surface is unchanged outside
+the new Inbound activity page (read-only) and the token-create
+modal extensions for `source_system` + `inbound_resources` scope.
+Outbound webhook dispatcher (v1.6) and polling endpoints (v1.5) are
+unchanged. License changed from MIT to Apache 2.0 with this release;
+pre-v1.7.0 tagged releases remain MIT-licensed.
+
+Inbound API surface:
+
+- **Five POST endpoints under `/api/v1/inbound/`** (#253-#257). One
+  per canonical resource. Shared 10-step handler covering
+  external_id + external_version validation, advisory-lock on
+  `(source_system, external_id)` to serialize concurrent upserts on
+  the same key, stale-version 409, mapping-doc apply, canonical
+  INSERT-or-UPDATE, cross_system_mappings registration,
+  source_payload staging, and audit_log on terminal state. Every
+  response carries `X-Sentry-Canonical-Model: DRAFT-v1`. 422 on body
+  validation failure, 413 on `Content-Length > SENTRY_INBOUND_MAX_BODY_KB`,
+  409 on stale_version / cross_system_lookup_miss / lock_held.
+- **`GET /api/v1/inbound/mapping-schema`** (#251). Unauthenticated
+  documentation aid emitting JSON Schema (Draft 2020-12) for offline
+  validation of `db/mappings/<source_system>.yaml`. Cacheable via
+  `Cache-Control: public, max-age=300`.
+- **Cross-direction + per-resource scope on `@require_wms_token`**
+  (#252). Inbound POST routes use the new `inbound_resources` array
+  (Decision-S; separate from `event_types`). Cross-direction tokens
+  refused with 401 `cross_direction_scope_violation`; in-scope token
+  but resource not in the array returns 401
+  `inbound_resource_scope_violation`. Empty array denies.
+
+Mapping document format:
+
+- **Strict-typed YAML loader** (#248-#250). Pydantic with
+  `extra='forbid'`; JSONPath via `jsonpath-ng`; derived expressions
+  via `simpleeval` with a function whitelist (`int`, `float`, `str`,
+  `len`, `abs`, `min`, `max`, `round`); attribute walks and
+  `__import__` / `eval` / `exec` rejected. Cross-system lookup
+  misses on required-true fields raise 409 carrying the missing
+  `(source_system, source_type, source_id)` tuple. simpleeval
+  pinned at 1.0.5.
+- **`boot_load`** writes one `MAPPING_DOCUMENT_LOAD` audit_log row
+  per loaded doc carrying `source_system`, `path`, `sha256`,
+  `mapping_version`, `version_compare`, `resource_count`. Boot
+  refuses to start when an allowlisted source has no doc OR a doc
+  has no allowlist row.
+- **Operator-facing template** (#280) at
+  `db/mappings/example-template.yaml.template`. Annotated YAML
+  covering all five resources with every required canonical column
+  marked `required: true` plus comments naming the schema
+  constraint, every supported `type:` (string / integer / decimal /
+  boolean / uuid / iso_timestamp / enum), all three
+  `version_compare` strategies, `cross_system_lookup` examples on
+  `sales_orders.customer_id` and `purchase_orders.vendor_id`, and a
+  footer block listing common pitfalls. The `.template` suffix
+  excludes it from `boot_load` so it is documentation-only.
+
+Admin panel:
+
+- **Token-create modal extensions** (#258). Issuance surface gains
+  `source_system` (dropdown sourced from
+  `inbound_source_systems_allowlist`) and `inbound_resources`
+  (multi-select). Existing `event_types`, `endpoints`, and
+  `warehouse_ids` stay independent so a token can be outbound-only,
+  inbound-only, or both. The `mapping_override` capability
+  checkbox is present but the v1.7.0 handler rejects requests
+  carrying `mapping_overrides` regardless (#269).
+- **Inbound activity page** (#259). Read-only admin page listing
+  recent inbound rows joined to issuing token + source_system +
+  canonical resource. Filters by source_system, resource, status
+  (`accepted` / `stale_version` / `lookup_miss`), and time range.
+  Per-row drilldown shows the staged `source_payload` JSON, the
+  resolved `canonical_payload`, and the audit_log entry from the
+  upsert.
+
+Retention + cleanup:
+
+- **`source_payload` retention beat task** (#260). Celery beat task
+  NULLs out the staged `source_payload` JSONB column past
+  `SENTRY_INBOUND_SOURCE_PAYLOAD_RETENTION_DAYS` (default 90 days).
+  `inbound_cleanup_runs` log table records every run for operator
+  audit. **7-day hard floor** at boot (V-201 shape) refuses to start
+  the api on a typo'd or zero retention. Migration 045 makes
+  `source_payload` nullable so the retention task NULLs rather than
+  DELETEs (preserves cross_system_mappings + canonical FKs).
+
+Pre-merge gate fixes:
+
+- **mapping_overrides hard reject** (#269). Reserved for v1.7.1
+  pending the source-path-remap-vs-canonical-value-replacement
+  semantics decision (#270).
+- **audit_log chain serialization** (#271). Pre-#271 the V-025
+  chain trigger read `prev_hash` without serialization; concurrent
+  inserts forked the strict-by-log_id chain. Final form (migration
+  047): drop the `BIGSERIAL` DEFAULT, add `audit_log_chain_head`
+  sentinel, replace the trigger to acquire `LOCK TABLE EXCLUSIVE
+  MODE` and assign `NEW.log_id := nextval(...)` inside the critical
+  section. Two earlier iterations (`pg_advisory_xact_lock`, then
+  `SELECT FOR UPDATE` on a sentinel) did not hold under READ
+  COMMITTED + BIGSERIAL DEFAULT timing. See
+  [`docs/audit-log.md`](audit-log.md) for the invariants.
+- **Boot eval-shape rejection of mapping docs** (#272). Static AST
+  walker rejects derived expressions whose AST contains forbidden
+  names, attribute walks rooted off `source`, or call targets
+  outside the function whitelist. Single-sourced helper called from
+  both apply-time and boot-time so a malicious expression in a
+  never-reached branch cannot sit dormant in a loaded doc.
+- **`SENTRY_INBOUND_MAX_BODY_KB` boot validator** (#273). Pre-fix
+  silently clamped to `[16, 4096]` and silently fell back to 256 on
+  parse failure. Boot guard now refuses out-of-range or
+  unparseable values; runtime helper trusts the boot guard rather
+  than re-clamping.
+- **Direct-DB revoke propagates auth invalidation** (#274, #278).
+  AFTER UPDATE OF `revoked_at` trigger fires
+  `pg_notify('wms_token_revocations', token_id::text)` and (#278)
+  flips `status` to `'revoked'` in lock-step. New daemon thread in
+  `services.token_cache` LISTENs and calls
+  `_invalidate_token_id_local` on receipt. `auth_middleware.py` adds
+  a defense-in-depth second 401 gate rejecting `revoked_at IS NOT NULL`
+  regardless of status. Independent of Redis; sub-second cross-worker
+  invalidation for direct-DB revokes.
+- **Allowlist TRUNCATE forensic trigger reachability** (#275).
+  Documented as TRUNCATE-CASCADE-only (plain TRUNCATE raises
+  `ForeignKeyViolation` before the trigger fires; CASCADE is the
+  sole forensic-write path).
+- **`SENTRY_INBOUND_MAPPINGS_DIR` default** (#279). Changed from
+  relative `db/mappings` (resolved from CWD `/app` to
+  `/app/db/mappings`, which silently ignored docs at the documented
+  repo-root path) to absolute `/db/mappings` matching the
+  `./db:/db` Compose volume mount. Operator-facing template moved
+  to `db/mappings/example-template.yaml.template`.
+- **`TEST_DATABASE_URL` hard-fail in conftest** (#265). Pytest now
+  refuses to run unless `TEST_DATABASE_URL` is set and distinct from
+  `DATABASE_URL`; the conftest TRUNCATEs 39 tables at session start
+  and v1.7 added operator-managed state where that wipe was a real
+  footgun. CI workflow already provisions and forwards both vars.
+
+Hygiene + tooling:
+
+- **CI lint suite for v1.7.0 inbound** (#262). New
+  `test_inbound_ci_lints.py` covers no eval/exec/`__import__` in
+  `mapping_loader.py`, every loaded mapping doc declares a valid
+  `version_compare`, mappings dir reachable from CI's path
+  resolution. Plus OpenAPI parity test against
+  `services.inbound_openapi.build_inbound_openapi()`.
+- **`tools/scripts/regenerate-inbound-openapi.py --check` mode**
+  (#276). Default writes the YAML in place; `--check` exits non-zero
+  on drift with a unified diff naming the regen command. Wired into
+  `.github/workflows/test.yml` as a fast-fail step.
+- **k6 load test for the inbound burst** (#277). Operator runbook
+  at [`docs/loadtest.md`](loadtest.md); script at
+  `tools/loadtest/inbound_v1_7.js`. Operator-run, not CI-default.
+
+Migrations:
+
+- **037-038** -- `wms_tokens` inbound columns + `inbound_source_systems_allowlist`
+  + `cross_system_mappings` with audit and DELETE / TRUNCATE forensic
+  triggers.
+- **039-043** -- One staging table per inbound resource. New
+  canonical `customers` and `vendors` tables (UUID PK,
+  denormalized) for resources without a v1.5 canonical home.
+- **044-045** -- `inbound_cleanup_runs` log table; `source_payload`
+  made nullable so the retention beat task NULLs rather than
+  DELETEs.
+- **046** -- `sales_orders.billing_address` + `shipping_address`
+  columns so the gate-test mapping resolves cleanly.
+- **047** -- audit_log chain serialization fix.
+- **048** -- `wms_tokens` AFTER UPDATE OF `revoked_at` trigger
+  (`pg_notify` + lock-step `status` flip).
+
+All twelve are small DDL operations against new or existing tables.
+Operators applying v1.7.0 to a v1.6.x deployment apply 037-048 in
+numeric order before bringing the new compose stack up.
+
+Breaking changes:
+
+- **`TEST_DATABASE_URL` required for `pytest`** (#265).
+- **`SENTRY_INBOUND_MAPPINGS_DIR` default** changed to absolute
+  `/db/mappings` (#279).
+- **`SENTRY_INBOUND_MAX_BODY_KB` boot-validated** (#273) -- typo'd
+  values fail boot rather than silently clamping.
+
+Reserved for v1.7.1: `mapping_overrides` capability (#269; see #270).
+
+Known limitations:
+
+- `sales_orders.billing_address` + `shipping_address` are DB-only
+  in v1.7.0 (#268). Rollout to CSV exports, admin panel, and
+  outbound webhook envelopes lands in a follow-up.
+- No mapping-doc hot-reload; edits require api restart. Each
+  restart writes a `MAPPING_DOCUMENT_LOAD` audit row carrying the
+  file's sha256 so investigators can correlate.
+
+License: changed from MIT to Apache 2.0 with this release.
+Pre-v1.7.0 tagged releases remain MIT-licensed; v1.7.0 and later
+are Apache 2.0. See [`LICENSE`](https://github.com/hightower-systems/sentry-wms/blob/main/LICENSE)
+and [`NOTICE`](https://github.com/hightower-systems/sentry-wms/blob/main/NOTICE).
+
+---
+
+## v1.6.1 -- Webhook Security Patch
+
+*2026-05-03.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.6.1).
+
+Security patch closing 22 findings (V-300 through V-321) from the
+post-v1.6.0 audit on the new outbound webhook surface. The audit
+applied a webhook-classes lens (SSRF, signature timing, retry-storm
+amplification, secret-rotation race windows, DLQ poisoning,
+replay-batch amplification, downstream consumer trust boundaries,
+cross-worker pubsub integrity) plus the v1.5.1 21-class regression
+check; 22 findings landed and every one is fixed in this release. No
+deferrals. No API contract changes. Mobile is unchanged.
+
+Three new migrations (034-036). Five new env vars
+(`SENTRY_PUBSUB_HMAC_KEY`, `DISPATCHER_HTTP_CONNECT_TIMEOUT_MS`,
+`DISPATCHER_HTTP_READ_TIMEOUT_MS`,
+`DISPATCHER_REPLAY_BATCH_GLOBAL_BUDGET`,
+`DISPATCHER_REPLAY_BATCH_GLOBAL_WINDOW_S`). The cookie-auth admin
+surface is unchanged outside the response-body fields surfaced by
+the replay-batch breakdown and the new `hint` field on PATCH
+responses for paused-by-ceiling subscriptions.
+
+Tombstone gate (chained pair):
+
+- **URL canonicalization on the tombstone gate (#218).** Pre-fix the
+  URL-reuse gate matched on the raw `delivery_url_at_delete` column;
+  one-character casing or default-port mutations bypassed the gate
+  without supplying `acknowledge_url_reuse`. New
+  `canonicalize_delivery_url` helper is the single source of truth.
+  Migration 034 adds `delivery_url_canonical`, backfills via a
+  PL/pgSQL twin of the helper, and swaps the partial unique index
+  over to the canonical column.
+- **PATCH endpoint runs the tombstone gate on `delivery_url` change
+  (#219).** Pre-fix the PATCH path validated a new URL against
+  scheme + the dispatch-time SSRF guard but did NOT consult
+  `webhook_subscriptions_tombstones`. Shared `_check_url_tombstone`
+  helper now called from both POST and PATCH; `acknowledge_url_reuse`
+  is accepted on `UpdateWebhookRequest`.
+
+HMAC + secret material:
+
+- **`SecretMaterial` refuses pickle (#220).** The default `__slots__`
+  pickle path serialized `_plaintext` verbatim. Override
+  `__reduce_ex__`, `__reduce__`, `__getstate__`, and `__setstate__`
+  so multiprocessing IPC, joblib, APM local-capture, and shelve all
+  surface loudly.
+- **Single-serialization runtime check raises
+  `SingleSerializationViolation` instead of `assert` (#221).**
+  Python `-O` strips assertions; production deployments under that
+  flag lost the `body == signed_body_for_assertion` defense
+  silently. Replaced with an explicit `raise` so the check is
+  emitted bytecode regardless of optimization level.
+- **Secret-rotation race closed via `SELECT FOR SHARE` (#225).**
+  Concurrent rotation could demote `gen=1` to `gen=2` between the
+  dispatcher's read and its sign + send. `FOR SHARE` serializes
+  against rotation; the row's actual `generation` is projected into
+  the returned `SecretMaterial` and stamped onto
+  `webhook_deliveries.secret_generation` before the HTTP send.
+
+Cross-worker pubsub integrity:
+
+- **HMAC-signed `webhook_subscription_events` envelope (#227).**
+  SECURITY.md explicitly assumes Redis may be compromised; the
+  pre-fix channel accepted unauthenticated JSON, so an attacker with
+  publish rights could forge `event="deleted"`,
+  `event="secret_rotated"`, or `event="delivery_url_changed"`. New
+  `pubsub_signing` module owns `load_key` / `sign` / `verify` /
+  `build_envelope` / `parse_envelope` keyed on
+  `SENTRY_PUBSUB_HMAC_KEY`; subscriber verifies via
+  `hmac.compare_digest` before enqueueing. Boot guard refuses api
+  and dispatcher boot on unset / placeholder / short keys.
+
+Replay-batch hardening:
+
+- **Pre-INSERT `pending_ceiling` check (#222).** Auto-pause in
+  `deliver_one` only fires AFTER a delivery attempt; replay-batch
+  INSERTed N pending rows in one statement BEFORE any attempt,
+  sidestepping the rail. Refuse 409 with structured `current_pending`
+  / `impact_count` / `pending_ceiling` / `gap` fields.
+- **`SELECT FOR UPDATE` on the replay-batch subscription row
+  (#223).** Two HTTP requests racing each other could both pass the
+  60-second per-subscription throttle SELECT before either committed
+  its audit row. `FOR UPDATE` serializes concurrent replay-batches
+  on the same subscription.
+- **Aggregate (cross-subscription) replay-batch throttle (#224).**
+  The per-subscription bucket was bypassable by a factor of N for a
+  compromised admin who creates N subscriptions all pointing at the
+  same consumer URL. New global throttle counts every
+  `WEBHOOK_DELIVERY_REPLAY_BATCH` audit_log row across the
+  deployment in a rolling window; defaults 5 batches per 5 minutes.
+- **Replay-batch reports matched-but-pruned count breakdown
+  (#233).** The impact COUNT used a LEFT JOIN to `integration_events`
+  so rows whose underlying event was pruned silently disappeared
+  from the count. Surface `matched_with_event_data` (replayable) +
+  `matched_without_event_data` (pruned) on both the response body
+  and audit_log details.
+
+HTTP client:
+
+- **Response body buffering capped at 64KB (#226).** `session.post`
+  ran without `stream=True`, so a malicious consumer that streamed a
+  multi-GB 5xx body spiked worker RSS by gigabytes per delivery.
+  Pass `stream=True`, close in a finally block, and refuse oversized
+  advertised `Content-Length` up front.
+- **Tuple HTTP timeouts + wall-clock watchdog (#237).** A consumer
+  dripping one byte every 9 seconds under a 10s read timeout could
+  keep the connection alive forever. Pass timeout as `(connect,
+  read)` and wrap the call with a thread watchdog enforcing a hard
+  wall-clock cap. Two new env vars
+  `DISPATCHER_HTTP_CONNECT_TIMEOUT_MS` (5000) +
+  `DISPATCHER_HTTP_READ_TIMEOUT_MS` (8000); env_validator boot
+  guard refuses configurations where either per-op cap exceeds the
+  wall-clock cap.
+
+Subscription state propagation + filter validation:
+
+- **PATCH publishes `subscription_filter_changed` on filter
+  mutation (#229).** New cross-worker kind appended on filter
+  mutation. Filter changes stay non-retroactive: events committed
+  before the PATCH that match the new filter but not the old do NOT
+  re-deliver. Operators backfilling reach for the replay-batch
+  endpoint.
+- **PATCH publishes `ceiling_changed` and surfaces a non-resume
+  hint (#230).** When the operator lifts the ceiling that paused
+  the subscription but does NOT also flip `status=active`, the
+  response carries a `hint` field naming the follow-up step.
+  Resume stays an explicit operator decision.
+- **Empty `subscription_filter` array refusal (#231).**
+  `subscription_filter={"event_types": []}` looked like "deliver no
+  events" but actually meant "deliver every event": filter clauses
+  are truthy-gated on each list field. New
+  `_reject_empty_filter_arrays` helper called from POST and PATCH
+  refuses with 400 `empty_filter_array`.
+- **Malformed `subscription_filter` fails closed (#232).** Pre-fix,
+  a Pydantic parse failure on the JSONB column logged WARNING and
+  fell back to `SubscriptionFilter()` (matches every event). For an
+  authorization-shaped column this was fail-OPEN. Now fail closed:
+  the dispatcher auto-pauses with `pause_reason='malformed_filter'`,
+  writes a `WEBHOOK_SUBSCRIPTION_AUTO_PAUSE` audit_log row, and
+  backs off.
+
+Cleanup, forensic triggers, CHECK constraints:
+
+- **`cleanup_webhook_deliveries` chunked deletes (#228).** The
+  6-hour beat task issued a single DELETE that could span tens of
+  millions of rows in one transaction at sustained 50 events/sec,
+  holding a long lock and starving autovacuum. Switched to chunked
+  DELETE with COMMIT between batches; default chunk 1000, default
+  10-minute wall-clock cap.
+- **`webhook_deliveries` DELETE/TRUNCATE forensic triggers (#235).**
+  Migration 035 mirrors the V-157 / migration 032 shape on
+  `webhook_deliveries`. New `webhook_deliveries_audit` table,
+  statement-level AFTER DELETE + AFTER TRUNCATE triggers. Brings
+  v1.6 to parity with the v1.5.1 forensic posture.
+- **`webhook_subscriptions.status` + `pause_reason` CHECK
+  constraints (#236).** Migration 036 adds enums for `status` and
+  `pause_reason`. Pre-fix asymmetry: migration 030 had CHECK enums
+  on `webhook_deliveries.status` but migration 029 left the same
+  column on `webhook_subscriptions` to application validation.
+
+Retry storm + boot validation + docs:
+
+- **+/-10% jitter on every retry slot (#234).** Pre-fix the retry
+  schedule was deterministic, so N subscriptions whose first
+  delivery to the same consumer URL failed at the same minute then
+  retried at the same minute on every retry slot. Apply +/-10%
+  jitter using `secrets.SystemRandom`; cumulative worst-case still
+  under 17h.
+- **API container runs `dispatcher_env.validate_or_die` (#238).**
+  validate_or_die ran ONLY in the dispatcher container pre-fix. The
+  api container reads the same dispatcher env vars for
+  admin-endpoint enforcement and the cross-worker pubsub publisher,
+  but a typo'd or out-of-range value never tripped a boot guard
+  there. Wire validate_or_die into `create_app()` after
+  `validate_pepper_config` and before blueprint registration.
+- **Consumer secret-handling guidance in `docs/api/webhooks.md`
+  (#239).** New "Handling the secret bytes" subsection covers
+  secret-manager storage, never-commit / never-log, and the pickle
+  / shelve / joblib / APM / debugger leak surfaces consumers
+  commonly do not think about. Symmetric with the server-side gap
+  V-302 closed.
+
+Migrations: **034** adds
+`webhook_subscriptions_tombstones.delivery_url_canonical` + PL/pgSQL
+backfill + partial unique index swap. **035** adds
+`webhook_deliveries_audit` + statement-level DELETE / TRUNCATE
+triggers. **036** adds CHECK constraints on
+`webhook_subscriptions.status` and `pause_reason`; ships AFTER
+V-314 so `malformed_filter` is in use before the constraint locks
+it down. All three are small DDL operations, BEGIN/COMMIT-wrapped
+per V-213.
+
+Operator notes: `SENTRY_PUBSUB_HMAC_KEY` is required when the
+dispatcher is enabled; both api and webhook-dispatcher containers
+must receive the same value (docker-compose forwards it). Generate
+with `python -c "import secrets; print(secrets.token_hex(32))"`.
+`DISPATCHER_ENABLED=false` bypasses the boot guard so a
+kill-switched deployment can come up without the key.
+`DISPATCHER_HTTP_CONNECT_TIMEOUT_MS` (5000) +
+`DISPATCHER_HTTP_READ_TIMEOUT_MS` (8000) must each be `<=
+DISPATCHER_HTTP_TIMEOUT_MS` (10000, the wall-clock cap).
+`DISPATCHER_REPLAY_BATCH_GLOBAL_BUDGET` (5) +
+`DISPATCHER_REPLAY_BATCH_GLOBAL_WINDOW_S` (300) tune the aggregate
+replay-batch throttle and are operator-only. No mobile APK ships
+with v1.6.1; existing v1.5.1 APKs on Chainway C6000 devices
+continue to work. Standard upgrade procedure applies: `git pull
+&& docker compose down && docker compose build && docker compose
+up -d`.
+
+---
+
+## v1.6.0 -- Outbound Push (Pipe A Write)
+
+*2026-04-30.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.6.0).
+
+Push-delivery counterpart to v1.5.0's polling read. External systems
+no longer have to long-poll `integration_events`: a new
+`sentry-dispatcher` daemon reads each visible event and POSTs it to
+admin-registered consumer URLs over HMAC-signed HTTPS, with
+exponential-backoff retries, a 1,000-row dead-letter lane, and
+admin-panel CRUD + DLQ triage + replay. Builds on the v1.5.0 outbox
+and the v1.5.1 hardening pattern: every architectural choice that
+drove a v1.5.1 audit finding is pre-empted here at the top of the
+branch (strict-typed Pydantic filters, env-var combination guards,
+Redis-pubsub cross-worker invalidation, dedicated least-privilege DB
+role, `audit_log` writes at every admin mutation, DELETE / TRUNCATE
+statement-level forensic triggers, BEGIN/COMMIT-wrapped migrations).
+
+Mobile is unchanged; no new APK ships. Admin panel gains a Webhooks
+page and a wired global search bar (the placeholder TopBar input that
+has been a non-functional stub since v1.4 #163).
+
+Subscription data model + forensic triggers:
+
+- **`webhook_subscriptions` + `webhook_secrets`** (migration 029).
+  UUID PK on subscriptions so admin URLs are not enumerable;
+  per-subscription `rate_limit_per_second` + `pending_ceiling` +
+  `dlq_ceiling` columns with CHECK bounds; secrets are
+  Fernet-encrypted with `SENTRY_ENCRYPTION_KEY` and live at
+  `(subscription_id, generation)` PK with `generation IN (1, 2)` for
+  the dual-accept rotation pattern.
+- **`webhook_deliveries`** (migration 030). Append-only per attempt
+  with one exception: the terminal `dlq` transition flips the same
+  row that was last `in_flight`. `ON DELETE RESTRICT` from
+  `subscription_id` so a hard delete with live deliveries fails;
+  soft-delete (`status='revoked'`) is the supported path. Four
+  partial indexes cover the dispatcher and admin hot paths.
+- **`integration_events` NOTIFY trigger** (migration 031). The v1.5
+  deferred-constraint trigger UPDATEs `visible_at` at COMMIT; this
+  migration adds an AFTER UPDATE trigger that fires
+  `pg_notify('integration_events_visible', event_id)` so the
+  dispatcher's LISTEN thread wakes within ~10ms of commit. 2-second
+  fallback poll runs always so a missed NOTIFY costs at most one poll
+  cycle.
+- **`webhook_subscriptions_audit` + `webhook_secrets_audit`**
+  (migration 032). Inherits the V-157 wms_tokens forensic-trail
+  pattern from day one: every DELETE / TRUNCATE on either table
+  appends a row capturing `event_type`, `rows_affected`, `sess_user`,
+  `curr_user`, `backend_pid`, `application_name`, `event_at`.
+- **`webhook_subscriptions_tombstones`** (migration 033). Hard-delete
+  writes a tombstone capturing `delivery_url_at_delete`; a subsequent
+  CREATE under the same URL returns 409 `url_reuse_tombstone` until
+  the admin acknowledges with `acknowledge_url_reuse: true`. Mirrors
+  v1.5.1 V-207 for consumer-groups.
+
+Dispatcher daemon:
+
+- **New `sentry-dispatcher` Compose service.** Synchronous psycopg2
+  + ThreadPoolExecutor + `requests`; mirrors the v1.5 snapshot-keeper
+  shape. One worker thread per active subscription, refreshed every
+  60s, with `verify=True` always and `allow_redirects=False` so a
+  malicious consumer cannot bounce traffic to an internal target via
+  3xx.
+- **LISTEN/NOTIFY wake + 2s fallback poll + Redis pubsub subscriber.**
+  Three sources merge into one in-process queue. Cross-worker
+  invalidation events (`paused`, `resumed`, `deleted`,
+  `delivery_url_changed`, `rate_limit_changed`, `secret_rotated`)
+  flow on the `webhook_subscription_events` channel; the §2.9 action
+  table documents which combination of subscription-list eviction,
+  session teardown, DB refresh, and rate-limit-bucket re-init each
+  event triggers.
+- **Per-subscription delivery loop.** Cursor-based; advances strictly
+  on terminal state (`succeeded` or `dlq`). Head-of-line blocking is
+  intentional per plan §2.5 (silent skip-ahead is worse than visible
+  growing lag). Hard-coded retry schedule
+  `[1s, 4s, 15s, 60s, 5m, 30m, 2h, 12h]` -- eight attempts, DLQ on
+  the eighth, ~15h cumulative window.
+- **Per-subscription pending and DLQ ceilings auto-pause** the
+  subscription atomically with the ceiling-th write; per-subscription
+  override is constrained to the deployment-wide hard cap
+  (`DISPATCHER_MAX_PENDING_HARD_CAP`,
+  `DISPATCHER_MAX_DLQ_HARD_CAP`), which is env-var-only so an admin
+  who can pause cannot also disable the safety ceiling.
+- **Dispatch-time SSRF guard with DNS-rebinding mitigation
+  invariant.** Every POST resolves `delivery_url` via
+  `socket.getaddrinfo` and rejects RFC1918, loopback, link-local,
+  IMDS, IPv6 ULA + AWS IMDSv2. Subscription mutations that change
+  the resolved network destination force fresh DNS resolution on the
+  next dispatch via session teardown.
+  `SENTRY_ALLOW_INTERNAL_WEBHOOKS=true` bypasses the check in dev /
+  CI; production refuses to boot. The combination
+  `SENTRY_ALLOW_HTTP_WEBHOOKS=true + SENTRY_ALLOW_INTERNAL_WEBHOOKS=true`
+  refuses to boot regardless of `FLASK_ENV`.
+- **Dedicated least-privilege Postgres role** via
+  `db/role-dispatcher.sql`. Operators set `DISPATCHER_DATABASE_URL`
+  to point at the role; dev / single-role deployments leave it unset
+  and the dispatcher falls back to `DATABASE_URL`. A compromise of
+  the dispatcher cannot read `users`, `wms_tokens`, or any table
+  outside the narrow grant set.
+
+HMAC signing + 24-hour dual-accept rotation:
+
+- **HMAC-SHA256 over the canonical signing input
+  `f"{X-Sentry-Timestamp}.{body}"`** where `body` is the exact
+  request bytes the dispatcher serialized once. Three layers of
+  enforcement on the single-serialization invariant: a CI lint that
+  forbids more than one `json.dumps` call on the envelope under
+  `webhook_dispatcher/`, a runtime assertion at the HTTP-client
+  boundary that fails loudly if any code path introduces a
+  transformation between sign and send, and an integration test that
+  fires the assertion when a transformation is introduced.
+  Constant-time signature comparison everywhere
+  (`hmac.compare_digest`); CI lint forbids `==` on signature bytes.
+- **24-hour dual-accept rotation.** Each subscription has two secret
+  slots: `generation=1` (primary, what the dispatcher signs with),
+  `generation=2` (previous, valid for 24 hours after rotation).
+  Plaintext returned exactly once at issuance / rotation; never
+  echoed in `repr()`; never written to `audit_log.details`.
+- **5-minute replay-protection window** documented as the consumer
+  contract: the verifier rejects any request whose
+  `X-Sentry-Timestamp` is more than 5 minutes from the consumer's
+  wall clock (bidirectional). Bounds the value of a captured request
+  to a 5-minute replay window even with a valid signature.
+
+Admin webhooks surface:
+
+- **`/api/admin/webhooks` CRUD** with one-shot plaintext secret on
+  create, server-side validation that `connector_id`, every
+  `event_types` entry, and every `warehouse_ids` entry exists,
+  HTTPS-only `delivery_url` policy with a documented opt-out, ceiling
+  enforcement against the deployment hard caps, URL-reuse tombstone
+  gate, and `audit_log` writes at every mutation site.
+- **PATCH publishes the matching cross-worker pubsub event** after
+  commit (`paused`, `resumed`, `delivery_url_changed`,
+  `rate_limit_changed`); status transitions out of `revoked` are
+  refused. DELETE soft-deletes by default; `?purge=true` hard-deletes
+  with tombstone (cascades through terminal `webhook_deliveries`;
+  refused while live deliveries reference the subscription).
+- **DLQ viewer** paginated and joined to `integration_events` so the
+  operator reads what payload failed without a second round-trip.
+  **Replay-one** inserts a fresh `pending` row pointing at the
+  original `event_id` (URL-tampering check rejects mismatched
+  `delivery_id`). **Replay-batch** with filter, server-computed
+  impact estimate, 10,000-row hard cap (override
+  `DISPATCHER_REPLAY_BATCH_HARD_CAP`) requiring
+  `acknowledge_large_replay: true`, and a 60-second per-subscription
+  throttle tracked through `audit_log` so a missed-trigger restart
+  cannot reset the timer.
+- **Per-subscription stats endpoint** (`?window=1h|6h|24h|7d`) with
+  attempts / succeeded / failed / dlq / in_flight / pending counters,
+  p50/p95/p99 response_time_ms, top 5 error_kinds, and current cursor
+  lag. 30-second in-process cache.
+- **Cross-subscription error log.** `GET /api/admin/webhook-errors`
+  joins delivery failures (status in `failed` / `dlq`) to the
+  server-owned error catalog at response time; the consumer's
+  response body is intentionally NOT stored.
+  `webhook_deliveries.error_detail` carries only categorical short
+  messages from
+  `api/services/webhook_dispatcher/error_catalog.py`. Pre-design the
+  dispatcher captured `response.text[:512]` directly into the column;
+  a misconfigured consumer endpoint can echo upstream credentials
+  (database connection strings, API tokens, session cookies) into a
+  5xx page, and persisting that body would make the DLQ admin viewer
+  a credential-exfiltration channel for the consumer's secrets. The
+  catalog covers `timeout`, `connection`, `tls`, `redirected`, `4xx`,
+  `5xx`, `ssrf_rejected`, `unknown`.
+- **React admin Webhooks page** with subscription list (status badge,
+  last-24h success rate, current pending count), create wizard
+  (connector picker, HTTPS-validated URL, scope-catalog checkbox
+  filter builder, rate-limit + ceiling sliders, one-shot secret
+  reveal modal with saved-secret acknowledgement, URL-reuse warning
+  modal), per-row actions (edit / pause-resume / rotate / DLQ /
+  stats / revoke / purge), DLQ panel with replay-one + replay-batch
+  (server-computed impact estimate inline; 429 throttle response
+  surfaces the countdown), stats panel, and a cross-subscription
+  "View errors" panel with row expansion showing the catalog
+  description and triage hint.
+
+Admin global search bar (#163, carry-forward from v1.4):
+
+- **`GET /api/admin/search?q=&warehouse_id=`.** Single endpoint
+  fanning out across items, bins, purchase_orders, sales_orders, and
+  the denormalized customer columns on sales_orders. Per-type cap of
+  10 rows, total cap of 50, minimum query length 2 to avoid
+  worst-case wildcard scans. Items are global; bins / POs / SOs /
+  customers are filtered to the supplied warehouse_id.
+- **TopBar dropdown wiring + list-page `?q=` prefill.** The TopBar
+  input that has been a non-functional placeholder since v1.4 now
+  drives the new endpoint with a 250ms debounce and a dropdown that
+  follows the existing warehouse-picker shape (click-outside
+  dismisses, Arrow keys + Enter + Esc). Selection routes to the
+  matching list page; the four list endpoints (items, bins, POs,
+  SOs) gained `?q=` ILIKE support.
+
+Hygiene + CI guardrails:
+
+- **Celery beat cleanup.** `cleanup_webhook_deliveries` enforces
+  90-day retention on terminal `webhook_deliveries` rows (every 6h);
+  `cleanup_expired_webhook_secrets` drops gen=2 rows past their 24h
+  `expires_at` (hourly).
+- **CI guardrails consolidation.** Single workflow gate covers no
+  `verify=False` anywhere under `webhook_dispatcher/` (extended in
+  this release to include `http_client.py`); no double `json.dumps`
+  on the envelope; sentinel grep that the `body == signed_body`
+  runtime assertion stays present at the HTTP-client boundary;
+  audit_log coverage check asserting every webhook admin mutation
+  writes a `WEBHOOK_*` row.
+- **Integration test matrix.** `test_v160_integration_matrix.py` maps
+  each of the 26 verification-plan points to a real test function or
+  to an operator-manual gate logged via `caplog`. The Chainway C6000
+  smoke test is the one operator-manual gate; everything else is
+  automated. **1528 backend tests passing** (up from 910 at v1.5.0,
+  1002 at v1.5.1).
+
+Migrations:
+
+- **029** -- `webhook_subscriptions` + `webhook_secrets`. UUID PK,
+  JSONB filter, ceiling columns with CHECK bounds, partial index on
+  active status. BEGIN/COMMIT-wrapped per v1.5.1 V-213 discipline.
+- **030** -- `webhook_deliveries`. BIGSERIAL PK, RESTRICT FK on
+  subscription_id, four partial indexes covering dispatcher and admin
+  hot paths.
+- **031** -- AFTER UPDATE trigger on `integration_events.visible_at`
+  that fires `pg_notify('integration_events_visible', event_id)`.
+  Self-test asserts the deferred-trigger -> UPDATE -> AFTER-UPDATE-trigger
+  -> NOTIFY chain holds under a single outer commit.
+- **032** -- `webhook_subscriptions_audit` +
+  `webhook_secrets_audit` tables with statement-level DELETE /
+  TRUNCATE triggers on both parent tables.
+- **033** -- `webhook_subscriptions_tombstones` table for the
+  URL-reuse acknowledgement gate.
+
+Notes for operators:
+
+- **Existing v1.5.x deployments must apply migrations 029-033 in
+  numeric order** before bringing the new compose stack up; the
+  dispatcher container's startup queries against the new tables fail
+  until they exist. Fresh installs run them automatically. CI
+  verification of the upgrade path lands in v1.7 (#217); until then
+  the operator runs the migration sequence manually as part of the
+  upgrade.
+- **`SENTRY_ENCRYPTION_KEY` now protects two ciphertext stores**:
+  `connector_credentials` (v1.3 inbound vault) and `webhook_secrets`
+  (v1.6 outbound HMAC). Fernet rotation must re-encrypt both in the
+  same transaction; missing one leaves a half-rotated deployment
+  where the affected service cannot decrypt its own secrets after
+  restart. See the updated rotation section in
+  [`docs/connectors.md`](connectors.md).
+- **`DISPATCHER_DATABASE_URL` is optional.** Dev and single-role
+  deployments leave it unset. Production should set up a dedicated
+  least-privilege role via `db/role-dispatcher.sql` and point
+  `DISPATCHER_DATABASE_URL` at it.
+- **`DISPATCHER_ENABLED=false` is the kill switch.** Container boots,
+  logs CRITICAL, sleeps with the heartbeat file still touched. Use
+  it to stop dispatch globally without a code rollback.
+- **No mobile APK ships with v1.6.0.** v1.6.0 has no mobile code
+  changes beyond the version-string bumps for BUILD_VERSION-guard
+  consistency. Operators already on the v1.5.1 APK
+  (`sentry-wms-v1.5.1.apk`) should stay on it -- it carries the
+  dep-tree security overrides from #158 and #61. Operators still on
+  older v1.4.1 / v1.4.3 APKs continue to authenticate and dispatch
+  but lack those security fixes; install v1.5.1 if you have not
+  already.
+
+---
+
+## v1.5.1 -- Security Audit Patch
+
+*2026-04-27.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.5.1).
+
+Security patch closing ~22 findings from the post-v1.5.0 internal audit
+of the Outbound Poll attack surface: the X-WMS-Token vault, the
+`/api/v1/events*` and `/api/v1/snapshot/*` endpoints, the
+`integration_events` outbox, the snapshot-keeper daemon, and the admin
+token / consumer-group / connector-registry CRUD pages. No new
+features. No API contract changes. No mobile runtime changes (the APK
+is a fresh artifact only because the dependency overrides reshape the
+build tree). Existing well-formed clients with correctly-scoped tokens
+see no behaviour difference; what changed is enforcement strictness.
+
+Token auth fixes:
+
+- **Endpoint scope is now actually enforced (#140).** Pre-fix the
+  `endpoints` column on `wms_tokens` was stored and rendered in the
+  admin UI but `@require_wms_token` never consulted it; a token with
+  any-or-no endpoint list could hit every `/api/v1/*` route the
+  warehouse / event-type scope allowed. Migration 026 backfills
+  pre-existing empty arrays so old tokens keep working.
+- **Cross-worker token revocation via Redis pubsub (#146).** Pre-fix
+  `token_cache.clear()` only flushed the handling gunicorn worker's
+  dict; every other worker honored the stale entry until per-entry TTL
+  expired (up to 60s). v1.5.1 publishes revocations on a
+  `wms_token_events` channel that every worker subscribes to at boot.
+  Sub-second across all workers in the Redis-available path; the 60s
+  TTL remains as the backstop when Redis is down.
+- **Stricter pepper validation (#142).** Boot guard rejects unset,
+  empty, whitespace-only, the `.env.example` placeholder, and any
+  value shorter than 32 characters. Pre-fix it rejected only unset /
+  empty.
+- **Uniform `401 invalid_token` body (#149).** Pre-fix the decorator
+  returned three distinct bodies (missing / invalid / expired); an
+  attacker who captured a plaintext could distinguish "this was once
+  valid" from "never valid." Specific reason now stays in DEBUG log
+  on `sentry_wms.auth.wms_token`.
+- **Issuance-time scope existence checks (#150).** Admin token
+  issuance validates that `warehouse_ids` and `event_types` actually
+  point at real entities. Unknown values fail 400 with the offending
+  entries enumerated.
+- **Admin CRUD writes the audit_log hash chain (#141, #154).**
+  `wms_tokens`, `consumer_groups`, and `connector_registry` mutations
+  now append to `audit_log` at every site (issue, rotate, revoke,
+  delete). Plaintext tokens never written to `details`; delete
+  captures pre-mutation scope so the trail survives row removal.
+- **Checkbox scope selectors on the token-create modal (#159).** New
+  admin endpoint `GET /api/admin/scope-catalog` populates the
+  warehouse / event-type / endpoint lists.
+
+Polling and snapshot fixes:
+
+- **`/api/v1/events/ack` enforces cursor horizon and per-event scope
+  (#143).** Pre-fix a token with a legacy admin-issued shape could ack
+  an arbitrary cursor on any consumer_group, jumping the cursor past
+  every future event and silently losing data downstream. Now returns
+  `400 cursor_beyond_horizon` and `403 ack_scope_violation` on the
+  failing shapes; backwards acks remain pure no-ops.
+- **Per-token concurrent-scan cap on `/api/v1/snapshot/inventory`
+  (#144).** A single token could pin the entire 4-slot keeper pool;
+  v1.5.1 caps to one active scan per token. Cursor requests on an
+  active scan are exempt so partial-page flows keep working.
+- **Strict-typed `consumer_groups.subscription` (#145).** Pydantic
+  with `extra="forbid"`. Belt-and-suspenders parse-error path on the
+  poll handler so legacy bad rows surface `409 subscription_invalid`
+  instead of 500.
+- **Consumer-group recreate requires explicit replay acknowledgement
+  (#148).** Migration 027 (`consumer_groups_tombstones`) records
+  `last_cursor_at_delete`. CREATE under a deleted id returns
+  `409 replay_would_skip_history` unless the admin sends
+  `acknowledge_replay: true`.
+- **`/api/v1/events/types` filters by token scope (#151).** Pre-fix
+  every caller saw every event type known to the system regardless of
+  scope; reconnaissance for a later pivot is no longer free.
+
+Database and infrastructure fixes:
+
+- **Migrations 020 + 025 wrapped in transactions (#152).** The
+  ten-table ALTER blocks are now all-or-nothing.
+- **Snapshot-keeper supports a least-privilege DB role (#153).** New
+  `SNAPSHOT_KEEPER_DATABASE_URL` env var; falls back to
+  `DATABASE_URL` when unset so dev and single-role deployments are
+  unchanged. New `db/role-snapshot-keeper.sql` provisions the role
+  with the narrow grant set (`SELECT` on `integration_events`,
+  `SELECT`/`UPDATE`/`DELETE` on `snapshot_scans`, `EXECUTE` on
+  `pg_export_snapshot`).
+- **Boot guard on dangerous proxy + bind combination (#147).** Refuses
+  to start with `TRUST_PROXY=true` AND `API_BIND_HOST=0.0.0.0`
+  because the combo lets any caller who reaches the api port directly
+  spoof `X-Forwarded-For` and poison every rate-limit bucket, audit
+  attribution, and downstream IP allowlist. Escape hatch
+  `SENTRY_ALLOW_OPEN_BIND=1` logs CRITICAL on every boot.
+- **`wms_tokens` deletion forensic trail (#157).** Migration 028 ships
+  a `wms_tokens_audit` table plus AFTER DELETE / AFTER TRUNCATE
+  statement-level triggers capturing `event_type`, `rows_affected`,
+  `sess_user`, `curr_user`, `backend_pid`, `application_name`,
+  `event_at`. Resolves the unattributed token wipe observed during
+  the v1.5.0 release gate.
+- **Audit catch-all (#156).** `proxy_fix_active` hidden from anonymous
+  `/api/health` (moved to admin-gated `GET /api/admin/system-info`);
+  dev-only banners on `docker-compose.proxied.yml` and
+  `proxy/nginx.conf`; ProxyFix `x_prefix=0` reconciled with inline
+  comment; `SENTRY_VALIDATE_EVENT_SCHEMAS` no longer frozen at module
+  import; external-id CI guardrail walks `db/**/*.sql` in addition to
+  `api/**/*.py`.
+- **`source_txn_id` consumer-dedupe contract documented (#155).**
+  `docs/events/README.md` now states explicitly that consumers MUST
+  dedupe on `event_id` (server-side BIGSERIAL, monotonic in commit
+  order), not on `source_txn_id` (attacker-controllable via
+  `X-Request-ID`).
+- **CSP report sink (#54).** New unauthenticated
+  `POST /api/csp-report` logs CSP violations at WARNING, rate-limited
+  60/min per IP.
+
+Dependency hygiene:
+
+- **`@xmldom/xmldom` -> ^0.9.10 override (#158).** Closes four
+  newly-disclosed GHSAs against `<=0.8.12` reachable through five
+  expo-related transitive paths. Build-time only (Expo config
+  plugins). Silences the nightly Dependency Audit on `main` that had
+  been failing since 2026-04-24.
+- **cryptography 44.0.3 -> 46.0.7 (#59).** Closes carried-over
+  GHSA-r6ph-v2qm-q3c2 and GHSA-m959-cc7f-wv43. Fernet / MultiFernet
+  compatibility verified across 45.x and 46.x.
+- **pytest 8.3.4 -> 9.0.3, pytest-cov 6.0.0 -> 7.1.0 (#60).** Closes
+  GHSA-6w46-j5rx-g56g; pip-audit allowlist now empty.
+- **eas-cli dev-tree GHSAs closed (#61).** `minimatch ^5.1.9` and
+  `node-forge ^1.4.0` overrides; eas-cli bumped 18.5.0 -> 18.8.1.
+  `npm-audit-mobile-dev` is now a gating job matching the prod-tree
+  job.
+
+UI defects caught during the audit cycle:
+
+- **Recent Adjustments and Recent Transfers tables on the dashboard
+  render every column (#161, #162).** Both were clipping a column on
+  narrower viewports.
+
+Migrations: **026** backfills `wms_tokens.endpoints` for tokens
+created before v1.5.1 (idempotent), **027** adds
+`consumer_groups_tombstones`, **028** adds `wms_tokens_audit` plus the
+DELETE / TRUNCATE triggers.
+
+Operator notes: a `SENTRY_TOKEN_PEPPER` shorter than 32 characters or
+set to the `.env.example` placeholder now fails boot. Existing
+well-formed peppers (32+ chars of entropy) hash to the same value and
+require no changes. The new APK
+(`sentry-wms-v1.5.1.apk`, attached to the GitHub release) installs
+over v1.5.0 on Chainway C6000 devices. Standard upgrade procedure
+applies: `git pull && docker compose down && docker compose build &&
+docker compose up -d`.
+
+---
+
+## v1.5.0 -- Outbound Poll (Pipe A Read)
+
+*2026-04-22.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.5.0).
+
+First `/api/v1/*` surface. External systems -- ERPs, commerce
+platforms, analytics pipelines -- can now consume every
+inventory-changing write Sentry performs via a cursor-paginated REST
+read. The release ships a transactional outbox, a commit-order
+visibility gate, a bulk-snapshot endpoint for the initial load, and
+X-WMS-Token auth with hash-only storage. Admin panel gains two new
+pages (API tokens, Consumer groups); mobile is untouched.
+
+Outbox + emission:
+
+- **`integration_events` transactional outbox** (migration 020).
+  `BIGSERIAL event_id`, `JSONB payload`, denormalized
+  `aggregate_external_id`, four btree indexes covering the v1.5.0
+  query shapes. Deferred-constraint `visible_at` trigger sets
+  `visible_at = clock_timestamp()` at COMMIT so readers ordering on
+  `(visible_at, event_id)` see events in commit order even when
+  BIGSERIAL assigned `event_id` values in a different order.
+- **Seven emissions pinned to the framework catalog**:
+  `receipt.completed`, `adjustment.applied` (approval + direct),
+  `cycle_count.adjusted`, `transfer.completed`, `pick.confirmed`
+  (one per SO in a pick batch), `pack.confirmed`, `ship.confirmed`.
+  JSON Schema files at `api/schemas_v1/events/<type>/1.json`
+  validated Draft 2020-12. Per-aggregate `SELECT ... FOR UPDATE`
+  retrofit gives FIFO on the outbox without behaviour change for
+  users.
+- **External UUID retrofit across ten aggregate / actor tables**
+  (`users`, `items`, `bins`, orders, receipts, adjustments,
+  transfers, counts, fulfillments). Every insert site supplies
+  `uuid.uuid4()` explicitly; migration 025 drops the
+  `DEFAULT gen_random_uuid()` after the retrofit so a new handler
+  that forgets the column fails loudly.
+- **Schema registry + CI validation.** `events_schema_registry.py`
+  loads every schema at `create_app` time; boot fails on a malformed
+  or missing file. A dedicated CI step imports the registry on a
+  fresh checkout so a broken schema fails the job before tests run.
+
+Polling + snapshot endpoints:
+
+- **`GET /api/v1/events`** -- cursor + consumer-group polling. Plain
+  `int64` cursor (Decision G: not base64, not opaque), no `has_more`
+  field (full page implies more; partial implies caught up). Mutual
+  exclusion of `after` + `consumer_group` returns 400. Strict-subset
+  scope enforcement (Decision H): a filter asking for anything
+  outside the token's scope returns 403, never a silent intersection.
+- **`POST /api/v1/events/ack`** -- consumer-group cursor advance.
+  Atomic UPDATE with a `last_cursor <= :cursor` guard; out-of-order
+  ack is a no-op, retried ack is idempotent.
+- **`GET /api/v1/events/types`** and
+  **`GET /api/v1/events/schema/<type>/<version>`** -- in-process
+  catalog + raw JSON Schema body served as `application/schema+json`.
+- **`GET /api/v1/snapshot/inventory`** -- bulk-snapshot endpoint for
+  the initial load, backed by a new `snapshot-keeper` daemon that
+  holds REPEATABLE READ transactions and exports a `pg_snapshot_id`
+  via `pg_export_snapshot()`. API tier imports the same snapshot on
+  short-lived connections via `SET TRANSACTION SNAPSHOT '<id>'`.
+  Keyset-paginated by `(warehouse_id, item_id, bin_id)` so page cost
+  is O(limit) regardless of scan size.
+- **Per-token rate limits.** 120 req/min on polling routes,
+  2 req/min on the snapshot endpoint. Bucket key prefers
+  `token:<id>` over `user:<id>` over remote IP so a noisy connector
+  cannot starve interactive cookie users.
+
+Auth + token vault:
+
+- **`wms_tokens` hash-only vault** (migration 023). `CHAR(64)`
+  `token_hash` UNIQUE, typed-array scope columns
+  (`warehouse_ids BIGINT[]`, `event_types TEXT[]`,
+  `endpoints TEXT[]`), default `expires_at = NOW() + INTERVAL '1 year'`.
+  No `encrypted_token` column -- lost plaintext means rotate,
+  matching the GitHub / Stripe / AWS standard.
+- **`SENTRY_TOKEN_PEPPER` env var.**
+  `token_hash = SHA256(pepper || plaintext).hex()`. Pepper is
+  env-only (never in the DB), required at boot. Rotating it is an
+  emergency-only control that invalidates every issued token at
+  once; runbook at `docs/runbooks/token-pepper-rotation.md`.
+- **`@require_wms_token` decorator + per-worker 60s TTL cache.**
+  Applied only to `/api/v1/events*` and `/api/v1/snapshot/*`;
+  cookie-auth routes keep `@require_auth`. Revocation is visible
+  within 60 seconds across every API worker.
+
+Admin panel:
+
+- **API tokens page** (`/api-tokens`) with rotation badges +
+  per-row rotate / revoke / delete actions, one-time plaintext
+  reveal with copy-to-clipboard and a save-confirmation checkbox.
+- **Consumer groups page** (`/consumer-groups`) with subscription
+  preview + heartbeat freshness, create + edit modals.
+- **Connector registry endpoints** under
+  `/api/admin/connector-registry` (distinct from the v1.3
+  `connector_credentials` vault; the two concepts converge in v1.9).
+
+Migrations: 020 (`integration_events`), 021 (`connectors`,
+`consumer_groups`), 022 (`credential_type`), 023 (`wms_tokens`),
+024 (`snapshot_scans` + NOTIFY trigger), 025 (drops the
+`external_id` DEFAULT post-retrofit).
+
+Tests: 910 backend passing (up from 740 at v1.4.5, +170 new cases),
+58 admin unchanged, 32 mobile unchanged. CI gains a dedicated
+schema-validation step that imports the registry on every push so
+a broken schema file fails the job before tests run.
+
+Operator notes:
+
+- **First `/api/v1/*` surface.** This is the outbound read side for
+  Pipe A. Cookie-authed admin/mobile routes under `/api/*` keep
+  their existing contract.
+- **`SENTRY_TOKEN_PEPPER` is required at boot.** Generate with
+  `python -c "import secrets; print(secrets.token_hex(32))"` and set
+  it in `.env` before `docker compose up -d`. The api container
+  refuses to boot without it. Rotating the pepper invalidates every
+  issued token; see
+  [`token-pepper-rotation.md`](runbooks/token-pepper-rotation.md)
+  for the procedure.
+- **New `snapshot-keeper` service in `docker-compose.yml`.** After
+  upgrading, `docker compose up -d` starts one additional container
+  alongside the existing `db`, `redis`, `api`, `celery-worker`, and
+  `admin`. The keeper is required for
+  `GET /api/v1/snapshot/inventory`; a downed keeper surfaces as 503
+  `snapshot_keeper_unavailable` on the first page of a scan.
+- **No APK update.** The v1.4.3 APK on Chainway C6000 devices stays
+  current; v1.5.0 has no mobile code changes beyond the version
+  string in the login / home screen footers.
+- **`TRUST_PROXY` behavior unchanged from v1.4.5.** Fresh-install
+  operators who run Sentry behind a TLS-terminating reverse proxy
+  set `TRUST_PROXY=true` in `.env`; direct-connect deployments leave
+  it unset.
+
+Migration guidance for production deployments (multi-million-row
+aggregate tables) lives at
+[`docs/runbooks/v1.5.0-migration.md`](runbooks/v1.5.0-migration.md).
+The apartment-lab seed applies all six migrations in seconds; larger
+tables should use the documented two-step "add nullable column,
+batch backfill, then add UNIQUE + NOT NULL" alternative for
+migration 020's external_id backfill.
+
+---
+
+## v1.4.5 -- Reverse Proxy Hotfix Follow-up
+
+*2026-04-21.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.4.5).
+
+v1.4.4 (#107) wired Werkzeug `ProxyFix` into `api/app.py` behind a
+`TRUST_PROXY` env var, but `docker-compose.yml` was never updated to
+pass `TRUST_PROXY` into the `api` service environment. Operators who
+set `TRUST_PROXY=true` in `.env` saw no effect because Compose does
+not auto-forward arbitrary host env vars: the value stopped at the
+Compose shell and `os.getenv("TRUST_PROXY")` returned `None` inside
+the container, so `ProxyFix` stayed off and the CSRF-403-behind-proxy
+bug from v1.4.0-v1.4.3 kept firing. Fruxh hit this after installing
+v1.4.4 fresh. api + Compose + docs change; admin and mobile untouched.
+
+Fixes:
+
+- **`TRUST_PROXY` now reaches the api container (#136, refs #107,
+  Fruxh's #98).** `docker-compose.yml` `services.api.environment`
+  gains `TRUST_PROXY: ${TRUST_PROXY:-false}`, same pattern as
+  `FLASK_ENV`. Default `false` preserves the direct-connect posture;
+  operators opt in by setting `TRUST_PROXY=true` in `.env`. Without
+  this single line, v1.4.4's `ProxyFix` wiring was cosmetic for every
+  Compose-deployed install.
+- **ProxyFix state is logged at Flask startup.** `api/app.py` emits
+  `ProxyFix active: ...` or `ProxyFix inactive: ...` at WARNING level
+  so the line clears the default gunicorn stderr threshold.
+  Operators verify with `docker compose logs api | grep ProxyFix`
+  without execing into the container.
+- **`/api/health` now returns `proxy_fix_active`.** External monitors
+  and the reverse proxy itself can confirm the wiring end-to-end with
+  a single HTTPS `GET`. A green health response with
+  `"proxy_fix_active": false` behind an nginx deployment is the exact
+  signature of this bug.
+- **`.env.example` gains a `TRUST_PROXY` block with the security
+  warning inline**, and `docs/deployment.md` "Reverse Proxy (HTTPS)"
+  clarifies that `TRUST_PROXY` goes in `.env` at the repo root (not
+  `api/.env`), that `docker compose restart api` does NOT re-read
+  `.env` (use `docker compose up -d` to pick up changes), and that
+  the wiring can be verified three independent ways: `env | grep
+  TRUST_PROXY` in the container, `logs api | grep ProxyFix` at the
+  Flask layer, and `curl /api/health` from outside.
+
+Tests: 740 backend (up from 738 at v1.4.4), 58 admin, 32 mobile.
+`api/tests/test_proxy_fix.py` gains `TestHealthEndpointReportsProxyFixState`
+with two cases locking the `/api/health` `proxy_fix_active` contract
+in both the unproxied and proxied-client states; the original 4 cases
+(opt-in invariant, scheme/host/is_secure rewrite, Secure CSRF + auth
+cookies, change-password NOT 403'ing behind proxy) are unchanged and
+still green. All CI workflows green.
+
+Operator notes: the v1.4.3 APK is stable; no APK update is needed for
+v1.4.5 (mobile has zero code changes and the API contract is
+unchanged). Operators who upgraded to v1.4.4 and set `TRUST_PROXY=true`
+but still saw CSRF-403 errors should pull v1.4.5, run `docker compose
+down && docker compose build && docker compose up -d` (NOT just
+`restart`), and confirm the wiring with `docker compose exec api env
+| grep TRUST_PROXY` and `curl /api/health`.
+
+---
+
+## v1.4.4 -- Reverse Proxy Hotfix
+
+*2026-04-21.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.4.4).
+
+Every production deployment that fronts Sentry with a TLS-terminating
+reverse proxy (nginx, Caddy, Traefik, AWS ALB, etc.) was returning
+`403 CSRF token missing or invalid` on every `POST` / `PUT` / `PATCH` /
+`DELETE`. Fruxh filed #98 from his production install and traced it to
+the root cause: Flask's `request.host` / `request.scheme` were stuck on
+the internal `127.0.0.1:<port>` hop, so cookies were scoped to the wrong
+host and the browser never resubmitted them. api-only change; admin and
+mobile untouched.
+
+Fixes:
+
+- **Trust `X-Forwarded-*` headers from a reverse proxy when
+  `TRUST_PROXY=true` (#107, refs #98).** `app.wsgi_app` is now wrapped in
+  Werkzeug `ProxyFix` when the env var is set, so `request.scheme`,
+  `request.host`, and `request.is_secure` reflect the browser's view of
+  the request instead of the internal hop. Opt-in via env var because
+  honouring `X-Forwarded-*` without a proxy in front lets any client
+  forge its own scheme, hostname, and client IP. The
+  `services/cookie_auth.py` header-based fallback stays as belt-and-
+  suspenders.
+- **Reverse-proxy deployment guidance expanded in `docs/deployment.md`.**
+  New `TRUST_PROXY` section with an annotated nginx config, Caddy and
+  Traefik v2+ snippets, a one-line note covering AWS ALB / GCP HTTPS LB /
+  Azure Application Gateway / Cloudflare Tunnels / Fly / Render, an
+  explicit security warning on header-forgery risk, and a multi-hop
+  section for CDN-in-front deployments.
+- **`python-dotenv` bumped `1.0.1` -> `1.2.2` (#106)** to clear
+  `GHSA-mf9w-mj56-hr94`. OSV published the advisory between the
+  2026-04-21 scheduled `main` audit (green) and the v1.4.4 initial push
+  (red). Drop-in compatible; no code changes needed.
+
+Tests: 738 backend (up from 734 at v1.4.3), 58 admin, 32 mobile. New
+file `api/tests/test_proxy_fix.py` (4 cases): the opt-in invariant,
+`TRUST_PROXY=true` rewriting `scheme` / `host` / `is_secure`, login
+behind proxy headers returning `Secure` + `SameSite=Strict` cookies,
+and change-password behind proxy headers NOT 403'ing on the CSRF gate
+(Fruxh's exact repro path). All CI workflows green.
+
+Operator notes: the v1.4.3 APK is stable; no APK update is needed for
+v1.4.4 (mobile has zero code changes and the API contract is unchanged).
+API operators behind a reverse proxy MUST add `TRUST_PROXY=true` to the
+API environment before rebuilding; direct-connect deployments must NOT
+set it.
+
+---
+
+## v1.4.3 -- Mobile Patch
+
+*2026-04-20.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.4.3).
+
+Mobile patch release. Two fixes from the v1.4.3 mobile bug bash, plus a
+follow-up for a regression surfaced during Chainway C6000 verification.
+Zero backend or admin code changes. Closes the keyboard-fallback half
+of Fruxh's #70 report; the camera-scanner half remains tracked under
+#70 for v2.x.
+
+Fixes:
+
+- **Put-away "done" screen no longer overlays the success checkmark on
+  the title (#103).** The done phase was rendered inside a flex
+  container with `justifyContent: 'center'` that also holds a growing
+  session-history list. Once history overflowed the viewport, the
+  centered content pushed the large check glyph visually into the
+  title below it. Swapped to a ScrollView with natural top-down flow,
+  matching the CountScreen done-phase pattern.
+- **Scan input fields now allow keyboard fallback for manual entry and
+  copy/paste (#104, refs #70).** `ScanInput` had
+  `showSoftInputOnFocus={false}` and `contextMenuHidden`, so tapping a
+  scan field on the Chainway C6000 did nothing and long-press did not
+  expose copy/paste. Removed both. Broadcast-intent scans still route
+  through `ScanSettingsContext` and bypass the TextInput; keyboard-mode
+  scans still land in `onChangeText` the same way manual typing does.
+- **Scan input soft keyboard now only opens on user tap, not on
+  auto-refocus (#105).** The #104 removal made the 1-second refocus
+  loop that keeps the field ready for hardware scans re-pop the
+  keyboard on every tick. `ScanInput` now tracks a `softInput` state
+  that is false by default and flipped to true only on `onPressIn`,
+  with a forced blur/refocus cycle so the updated
+  `showSoftInputOnFocus` prop applies. Reset on blur and after submit
+  so the auto-refocus loop, mount autofocus, and post-submit refocus
+  stay silent.
+
+Tests: 734 backend, 58 admin, 32 mobile (up from 24; new file
+`mobile/src/components/__tests__/ScanInput.test.js` locks the
+tap-to-open contract at the source level since the mobile vitest
+harness has no RN runtime). All CI workflows green.
+
+Operator notes: a new `sentry-wms-v1.4.3.apk` is attached to the
+GitHub release and installs over v1.4.1 / v1.4.2 on Chainway C6000
+devices without a data wipe. API and admin images have no source
+changes; rebuilding them is safe but not required for mobile-only
+operators.
+
+---
+
+## v1.4.2 -- Admin Panel Patch
+
+*2026-04-20.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.4.2).
+
+Admin panel patch release. Operator safeguard against upgrades-without-rebuild, the V-017 `validation_error` cluster closed on seven admin create/edit forms, admin list page CRUD affordances and UI consistency across every page, plus a bundle of Fruxh-reported fixes from external deployments. Zero mobile code changes; v1.4.3 will follow for mobile-side reports.
+
+Highlights:
+
+- **Upgrade-without-rebuild detection (#73)** -- v1.4.0 added Flask-Limiter;
+  v1.3.x operators who ran `git pull && docker compose up` without
+  rebuilding crashed on `ModuleNotFoundError: flask_limiter`. The API
+  now bakes the source `__version__` into the image at build time and
+  fail-fast exits 2 with a clear remediation message when the code
+  and image versions disagree. `docs/deployment.md` gains an
+  "Upgrading" section.
+- **V-017 validation_error cluster (#74-#81, #99)** -- Bin, Zone,
+  PreferredBin, Inventory Adjustment, Inter-Warehouse Transfer,
+  manual PO, manual SO create, Zone edit, plus the pre-merge
+  Bin-create Zone-dropdown fix. Consolidated alignment tests lock
+  every form's payload shape against the backend schema.
+- **Admin list page CRUD affordances (#85 #86 #87 #88 #89 #90)** -- Bin
+  row click opens a detail view with delete; Zone edit gains a delete
+  button with 409-guard when bins are assigned; new dedicated Sales
+  Orders admin list page; Close / Reopen PO and Cancel SO as
+  reversible / one-way state transitions (not deletes).
+- **UI consistency pass (#102)** -- pencil (&#9998;) and trash
+  (&#128465;) row actions across every admin list page. PO / SO
+  show pencil only; Close / Cancel remain state transitions in the
+  edit modal.
+
+Fruxh-reported from a production v1.4.1 deployment:
+
+- `#72` flask_limiter upgrade crash -- closed by #73.
+- `#71` validation_error cluster across four admin create forms --
+  closed alongside #74-#81 and #85.
+- `#98` First-time-setup "Your session is out of sync" false failure
+  -- closed by the redirect-to-login fix.
+
+Test counts: 734 backend, 58 admin, 24 mobile. All CI workflows
+(Tests, Dependency Audit, Lockfile Version Check, Deploy Docs) green
+on the merge commit.
+
+Operator notes: upgrades MUST rebuild Docker images.
+`git pull && docker compose down && docker compose build && docker compose up -d`
+is the correct procedure. Skipping the build step now exits 2 at
+startup with the remediation command in the logs.
+
+---
+
+## v1.4.1 -- Forced Password Change + Mobile Version Fix
+
+*2026-04-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.4.1).
+
+Patch release bundling two bug fixes deferred from v1.4.0.
+
+Highlights:
+
+- **Forced password change on first login (#69)** -- fresh installs
+  seed admin as `admin/admin` with a `must_change_password` flag. Auth
+  middleware blocks every route except `/api/auth/me`,
+  `/api/auth/change-password`, and `/api/auth/logout` until the admin
+  changes the password. Eliminates the "grep logs for the random
+  password" onboarding paper-cut that shipped from v1.0 through
+  v1.4.0.
+- **Mobile version display fix (#68)** -- HomeScreen and LoginScreen
+  had been hardcoding `v1.2.0` for two releases. Now read the current
+  version. Issue #67 tracks the v1.5 refactor that eliminates this
+  class of bug permanently via build-time injection.
+- **Forced-mode navigator fix** -- mobile `ChangePasswordScreen` save
+  spinner stuck bug resolved. React Navigation native-stack was
+  preserving the route when `must_change_password` flipped false;
+  removing the screen from the non-forced branch lets native-stack
+  fall through to Home.
+
+Security:
+
+- `validate_password` rejects `admin` as the new password
+  (case-insensitive, whitespace-stripped).
+- Mobile force-kill-and-reopen bypass closed: the flag persists
+  inside the SecureStore-backed user dict, so a relaunch rehydrates
+  forced mode.
+- Distinct `audit_log` action `forced_password_change_completed`
+  separates onboarding completions from voluntary rotations.
+
+Test counts: 690 backend, 42 admin, 24 mobile. All CI green.
+
+Operator notes: fresh installs are prompted to set a new password on
+first login. Existing installs are unaffected (migration 019 defaults
+the column to FALSE).
+
+---
+
+## v1.4.0 -- Security Backlog Cleanup
+
+*2026-04-18.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.4.0).
+
+Pure security and hardening release. No new features. Addresses remaining
+High-severity items from the v1.3.0 audit, all 9 findings from a fresh
+audit of the v1.4 work, and the most impactful Medium / Low items from
+the deferred backlog.
+
+Highlights:
+
+- **HttpOnly cookie + CSRF for admin auth (V-045)** -- admin JWT no
+  longer lives in `localStorage`. CSRF double-submit pattern protects
+  mutating requests. Mobile continues using bearer tokens.
+- **SecureStore on mobile (V-047)** -- JWT migrated from plaintext
+  AsyncStorage to the Android Keystore via `expo-secure-store`. One-shot
+  migration on app launch.
+- **Content-Security-Policy (V-050)** -- strict CSP on both API and
+  nginx. Self-hosted fonts eliminate the last third-party origin.
+- **Sync state race fix (V-102)** -- `run_id` UUID prevents stale
+  workers from clobbering fresh sync state after the 1-hour takeover
+  threshold.
+- **Flask-Limiter rate limiting (V-041)** -- Redis-backed, per-user and
+  per-IP quotas on sensitive admin endpoints.
+- **Dependency audit in CI (V-042)** -- `pip-audit` and `npm audit` gate
+  every push.
+- **DNS rebinding pin (V-108)** -- connector outbound requests pin the
+  resolved IP after the SSRF guard check.
+
+Test counts: 647 backend, 32 admin, 8 mobile. All CI workflows green.
+
+See the release notes for the full list of V-numbers, the accepted-risk
+section, and the upgrade notes for admin panel, mobile app, and Docker
+deployment.
+
+---
+
+## v1.3.0 -- Connector Framework + Security Hardening
+
+*2026-04-17.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.3.0).
+
+The connector foundation. All the infrastructure for ERP integration
+without any actual connector -- the framework that NetSuite,
+BigCommerce, and Amazon connectors will plug into starting in v2.0.
+
+- Abstract base class with auto-discovery registration
+- Celery + Redis background job runner so sync operations never block
+  the API thread
+- Encrypted credential vault (Fernet, per-warehouse scoping,
+  credentials never in logs or API responses)
+- Sync state tracking with green / yellow / red health per connector
+- Per-connector rate limiter, exponential backoff with jitter, and
+  5-failure circuit breaker
+
+Security audit: 4 Critical and 12 High findings fixed before release.
+Removed hardcoded encryption key default, documented historical JWT
+secret exposure (SA-2026-001, SA-2026-002), admin panel rebuilt as
+production nginx, Redis broker requires auth, SSRF protection on
+connector outbound requests, audit log is now append-only with
+SHA-256 hash chain, plus IDOR fixes and race-condition fixes on
+receiving and inventory operations. 570 total backend tests.
+
+**Breaking for operators:**
+
+- `SENTRY_ENCRYPTION_KEY` is required (no default)
+- `REDIS_PASSWORD` is required
+- Admin panel port changed from 3000 to 8080
+- Migration `016_audit_log_tamper_resistance.sql` must be applied
+
+---
+
+## v1.2.0 -- Validation Schemas & Error Boundaries
+
+*2026-04-16.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.2.0).
+
+- Pydantic v2 validation schemas on every JSON-accepting endpoint (17
+  schema files). `@validate_body` decorator for consistent request
+  validation. Invalid requests now return structured `validation_error`
+  responses with `type` / `loc` / `msg` detail per field.
+- Admin panel: every page route wrapped in an independent error
+  boundary so one section crashing no longer white-screens the whole
+  panel. Retry button to recover without a full page refresh.
+- Mobile: handles the new `validation_error` format with
+  operator-friendly messages.
+- 75 new validation tests + 4 ErrorBoundary tests. 382 backend + 10
+  frontend tests passing.
+
+---
+
+## v1.1.1 -- Patch
+
+*2026-04-16.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.1.1).
+
+Three fixes for issues incorrectly closed or missed in v1.1.0. API /
+admin only, no APK rebuild.
+
+- CSV formula-injection guard on exports (cell values starting with
+  `=`, `+`, `-`, `@`, `\t`, `\r` are prefixed with a single quote)
+- `DATABASE_URL` fallback removed (startup `RuntimeError` if unset,
+  same pattern as `JWT_SECRET`)
+- Login-attempt count no longer leaked in failed-login error messages
+
+---
+
+## v1.1.0 -- Security Hardening
+
+*2026-04-15.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.1.0).
+
+Twelve backlog fixes from the v1.0 audit.
+
+- **Token invalidation on password change (M1)** -- `password_changed_at`
+  column added; auth middleware rejects tokens issued before the last
+  password change
+- **JWT `iat` / `jti` claims (L10)** -- issued-at and UUID claims for
+  revocation and replay detection
+- **DB-backed rate limiting (M8)** -- `login_attempts` table, persistent
+  across restarts, per-username and per-IP tracking (5 attempts, 15
+  min lockout)
+- **Password complexity (L1)** -- minimum 8 characters, at least one
+  letter and one digit
+- **Self-service password change (L2)** -- `POST /api/auth/change-password`
+  plus a mobile UI modal in the user dropdown
+- **Warehouse listing auth (L7)** -- `GET /api/warehouses/list` now
+  requires JWT; mobile warehouse selection moved to a post-login
+  blocking modal
+- **`suggest_bin` warehouse scope (L8)** -- preferred-bin and default-bin
+  queries filtered to the user's allowed warehouses
+- **CSV import limit (M10)** -- reject payloads over 5000 records
+- **Cycle count self-approval check (M3)** -- configurable
+  `require_count_approval_separation` setting
+- **Pagination (M6)** -- `page` / `per_page` on warehouses, zones, bins,
+  and users endpoints
+- **Cleartext HTTP disabled for production (L5)** -- `usesCleartextTraffic`
+  gated to dev / preview profiles
+- **Production docker-compose (L6)** -- `docker-compose.prod.yml` with
+  no source volume mounts
+
+Migrations added: `014_password_changed_at.sql`, `015_login_attempts.sql`.
+19 new tests (307 total).
+
+---
+
+## v1.0.0 -- Production Release
+
+*2026-04-14.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.0.0).
+
+The first open-source warehouse management system built for e-commerce.
+
+- Full warehouse lifecycle: Receive, Put-Away, Pick Walk, Pack, Ship,
+  Cycle Count, Transfer
+- React Native mobile app with Chainway C6000 broadcast-intent scanner
+  support
+- React admin panel with dark theme, warehouse context picker, audit log
+- Inventory adjustments and inter-warehouse transfers
+- CSV / JSON bulk import with templates
+- Docker Compose one-command setup with demo data
+- 288 automated tests passing
+
+Security baseline: JWT with live database validation per request,
+warehouse authorization middleware on every endpoint, parameterized SQL
+throughout, login lockout, bcrypt hashing, CORS restriction, random
+admin password on first run, and a full pre-release audit.
+
+MIT licensed. Free forever.

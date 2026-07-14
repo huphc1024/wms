@@ -1,0 +1,6 @@
+sku,barcode,name,uom,weight_kg,expiry_flag,velocity
+SKU-MILK-1L,SKU-MILK-1L,Sữa tươi 1L,EA,1.05,true,fast
+SKU-RICE-5KG,SKU-RICE-5KG,Gạo 5kg,EA,5.00,false,medium
+SKU-OIL-1L,SKU-OIL-1L,Dầu ăn 1L,EA,0.92,false,medium
+SKU-NOODLE,SKU-NOODLE,Mì gói thùng,EA,8.50,false,slow
+SKU-WATER-24,SKU-WATER-24,Nước thùng 24,EA,12.00,false,fast

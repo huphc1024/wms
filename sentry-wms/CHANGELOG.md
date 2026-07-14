@@ -1,0 +1,1818 @@
+# Changelog
+
+All notable changes to Sentry WMS will be documented in this file.
+
+## [v1.30.0] - 2026-06-19
+
+"Channel availability (Pipe C)" release. A new outbound surface that publishes per-channel sellable availability to a configured HTTP sink per channel (a marketplace connector receives it; first-party connectors are a later release). Inventory changes are collapsed into a current-state number per (channel, SKU) and debounce-published, so a busy warehouse does not fan every stock tick out to every marketplace.
+
+**Mobile.** Zero mobile/ diffs on this release. The current mobile build (version 1.29.0, versionCode 10) remains current; no new APK for v1.30.0.
+
+### Added
+
+- **Channel availability materialization (Pipe C)** (#424): a new `channel_availability` table holds sellable quantity (`on_hand - allocated`, Pickable / PickableStaging bins only) per channel and SKU, with a `current_version` / `last_version` pattern marking a row dirty only when the number actually changes. A `connector-publisher` daemon reconciles availability against live inventory - on the `integration_events_visible` wake and a periodic interval - and debounce-publishes dirty rows to each channel's sink. Reading live inventory rather than replaying events, it converges to the truth even for allocation changes that emit no event (reserve-at-creation, cancel), so it never publishes a stale count. Migration 075; least-privilege `sentry_publisher` role; new `connector-publisher` compose service.
+- **Per-channel config + admin Channels page** (#424): channels carry a delivery URL, a SKU scope (skus / categories / warehouses), a declarative transform (field rename + constant injection, for the Amazon FBA vs MFN distinction), and rate / batch / debounce knobs. CRUD under `/api/admin/channels` with a dispatch-time SSRF guard on the sink, pause/resume, soft-delete, and a DLQ view; a new admin Channels page mirrors the Webhooks page. Every config change writes an audit_log row.
+
+## [v1.29.1] - 2026-06-19
+
+Two production fixes.
+
+**Mobile.** Zero mobile/ diffs on this release. The current mobile build (version 1.29.0, versionCode 10) remains current; no new APK for v1.29.1.
+
+### Fixed
+
+- **Login lockout keyed on (IP, username)** (#422): the login rate-limiter keyed the lockout on the remote IP alone, so behind a shared NAT egress one person's five failed logins returned HTTP 429 to everyone behind that IP for 15 minutes, correct passwords included. The lockout is now keyed on `(IP, username)`, so one user's failures lock only that user's attempts from that IP.
+- **Show the actual carrier when the ship method contradicts it** (#422): the Sales Order detail rendered `ship_method` verbatim, so an order that shipped on a different carrier (a USPS-named service moved onto a 1Z UPS label) read misleadingly above its tracking number. The Ship Method line now surfaces the carrier derived from the tracking-number format when it disagrees ("USPS Ground Advantage (shipped UPS)"). Display-only: `ship_method` and the outbound `ship.confirmed` service level are unchanged.
+
+## [v1.29.0] - 2026-06-19
+
+"Turbo receiving" release. The handheld receive screen scans continuously - each scan counts instantly and flushes to the server in batched background submits - and the receive handler is tuned to hold the audit-chain lock for a shorter window.
+
+**Mobile.** This release changes mobile/ for the first time since 1.19.0 (the receive screen and a new batched-receive hook). The mobile build moves to version 1.29.0, versionCode 10; rebuild the APK to ship the change.
+
+### Changed
+
+- **Turbo batched receiving** (#420): the handheld receive screen no longer disables the scan input on a full round-trip per scan (a receive POST plus a PO refetch), which had capped the operator near one scan per second. Each scan now counts instantly against an optimistic local total and is buffered; batches flush to the receive endpoint in the background (debounced, or at a size cap), so scanning is continuous. Counts reconcile from each batch response; a failed batch rolls back its optimistic counts and refetches server truth, and leaving a PO drains the queue first so no scan is lost.
+- **Receive handler optimization** (#420): the receive handler resolves the PO and user external-ids once per request instead of per item, memoizes item resolves, and defers the audit-log writes to just before commit so the audit-chain global lock (`LOCK TABLE audit_log_chain_head`) is held for a shorter window.
+
+## [v1.28.0] - 2026-06-19
+
+"Local pickup and refund status" release. A Local Pickup dashboard for the counter, a distinct REFUNDED order status that reads apart from plain cancellations, and returns polish (an operator memo, returns kept out of the picking queue).
+
+**Behavior change.** A full POS refund now lands the original sales order in the new REFUNDED status instead of CANCELLED (superseding v1.22.0). Migration 074 relabels existing CANCELLED-refund rows so history reads consistently.
+
+**Mobile.** Zero mobile/ diffs on this release. The current mobile build (version 1.19.0, versionCode 9) remains current; no new APK for v1.28.0.
+
+### Added
+
+- **Local Pickup dashboard** (#417): a new Dashboard tab lists local-pickup sales orders (ship method matching "local" or "pickup"), searchable by customer or order number and filterable by status, with a per-row "Picked Up?" that marks a PICKED/PACKED order shipped through the existing edit endpoint (tracking waived for pickups). Header fields are editable in place. `GET /admin/sales-orders` gains an opt-in `local_pickup` filter, and an "Open + Picked" status option (#418) surfaces the active pickup worklist in one view via a comma-separated status filter.
+- **Distinct REFUNDED order status** (#417): a new `REFUNDED` sales-order status, distinct from CANCELLED, so refunds read apart from plain cancellations in the operator views and reporting. Operator-settable and side-effect-free (the money and inventory move in the refund flow, never on this status transition); excluded from the dashboard "need to ship today" count and tracked as its own KPI.
+- **RMA operator memo** (#418): operators can attach a free-form note to an RMA, stored in the existing `sales_orders.memo` column (mig 054); set on the Create RMA modal and editable from the RMA detail in any status.
+
+### Changed
+
+- **POS full refund lands REFUNDED, not CANCELLED** (#417): the POS full-refund and cancel-with-reason=refunded paths now set the original SO to `REFUNDED`, superseding the v1.22.0 behavior. The order-level `already_refunded` gate and the `refunded_at` / `refund_so_id` links are unchanged.
+- **Returns stay out of the picking queue** (#418): a return is goods-in and must never be picked or printed, so the `/admin/sales-orders` list drops `order_type IN ('return', 'refund')` whenever the picking-ticket queue mode is active, enforced at the query.
+
+### Migrations
+
+- **074** (#417) -- backfill existing refunds (CANCELLED rows with `refunded_at`, `refund_so_id`, or `cancellation_reason=refunded`) to the new REFUNDED status. Pure status relabel, idempotent, no DDL (status is unconstrained VARCHAR).
+
+## [v1.27.0] - 2026-06-19
+
+"Cycle-count approvals" release. The cycle-count approval screen shows what the system expected, what was scanned, and the resulting variance side by side, sortable and uncapped, and the request timeouts are raised so a large approval finishes instead of timing out.
+
+**Mobile.** Zero mobile/ source diffs on this release. The current mobile build (version 1.19.0, versionCode 9) remains current; no new APK for v1.27.0.
+
+### Added
+
+- **Expected / Scanned / Variance on cycle-count approval** (#415): the approval screen (`/admin/adjustments/pending`) now carries `expected_quantity` and `counted_quantity` for each pending adjustment, pulled from the originating cycle_count_line via correlated subselects (NULL for non-cycle-count adjustments, no row fan-out), and renders Expected / Scanned / Variance columns the operator approves against. The count cards sort by count number or bin, and the cycle-count list drops its 200-row cap (all lines fetched in one batched `count_id = ANY` query) so the full backlog is reachable.
+
+### Changed
+
+- **Higher request timeouts for large approvals** (#415): approving a single bin with 300+ varianced lines applies each line's inventory change and emits its events inside one transaction, which ran past the 60s gunicorn worker timeout. The gunicorn `--timeout` rises 60s -> 180s and the nginx `proxy_read/send_timeout` 120s -> 300s (kept above the app ceiling so the proxy never severs a still-working backend).
+
+### Security
+
+- **undici 6.27.0 in the mobile lockfile** (#415): clears a high-severity undici advisory (Set-Cookie HTTP header injection, WebSocket DoS, response queue poisoning, SameSite downgrade) that landed against the version pinned transitively through the Expo/Metro build tooling. Non-breaking, lockfile-only; the mobile app build is unchanged. The remaining moderate js-yaml and postcss advisories need breaking react-native/expo major upgrades and stay below the audit gate's high threshold.
+
+## [v1.26.0] - 2026-06-18
+
+"POS Activity dashboard" release. The POS Activity admin page becomes a full operations dashboard: today's KPI counters with an hourly revenue chart, a pace curve against the same hour yesterday, a weekly trend, channel and tender splits, and a date selector that anchors the whole view on a chosen day.
+
+**Mobile.** Zero mobile/ diffs on this release. The current mobile build (version 1.19.0, versionCode 9) remains current; no new APK for v1.26.0.
+
+### Changed
+
+- **POS Activity dashboard revamp** (#413): the POS Activity page is reworked from a flat list into an operations dashboard. The top bar carries today's KPI counters (sales count and revenue, average sale, refunds, active terminals) and an hourly revenue chart; below it sit a pace curve against the same hour yesterday, a weekly trend, and channel and tender splits. A date selector anchors the KPIs, the sales-order list, and the analytics on a chosen day. The `/api/admin/pos/summary` endpoint computes the new aggregates in one pass and `/api/admin/pos/sales-orders` gains the matching date and channel filters; both keep the `pos-activity` page-permission gating.
+
+## [v1.25.0] - 2026-06-18
+
+"Inbound editing, performance, and secret scanning" release. Three threads. The admin purchase-order edit surface reopens a received line when its quantity grows -- so an over-receipt becomes receivable -- and emits a reverse-sync event on every edit. The inbound line write-through is rebuilt to a constant number of database round-trips, so a wide PO no longer risks the gunicorn worker timeout mid-write. And a gitleaks secret-scanning gate now runs over the full git history on every push and pull request.
+
+**Mobile.** Zero mobile/ diffs on this release. The current mobile build (version 1.19.0, versionCode 9) remains current; no new APK for v1.25.0.
+
+### Added
+
+- **PO line-edit reopen + `purchaseorderedit.completed` event** (#409): bumping `quantity_ordered` on a RECEIVED purchase-order line through the admin edit surface reopens it (RECEIVED -> PARTIAL) and the PO header with it, so an over-receipt becomes receivable instead of being stranded behind a fully-received line; line and header status now flow through a shared `recompute_po_status` helper that `record_unreceive` reuses. Every admin PO edit (header `PUT`, line add / update / remove) emits a new `purchaseorderedit.completed/1` event carrying the per-field diff so the ERP can reverse-sync a correction made in Sentry; a line edit qualifies the changed field with the SKU (`line[SKU].quantity_ordered`) so the consumer knows which line moved.
+- **gitleaks secret-scanning gate** (#411): a new workflow scans the entire git history for secrets on every push and pull request and fails on any finding, so nothing sensitive can land in this public repo. It runs the pinned gitleaks binary directly (the gitleaks-action requires a registered license for org-owned repos), with a `.gitleaks.toml` that extends the default ruleset and allowlists only the known-benign test and CI placeholders by precise value, so a real secret in those same files is still caught.
+
+### Changed
+
+- **Inbound line write-through is constant round-trips** (#410): the inbound handler resolved each line's item and inserted each line one at a time -- 2N round-trips per POST -- so a wide PO could outrun the gunicorn worker timeout mid-write. It now resolves all line items in one batched query, pre-resolves the per-line SKU lookups (`cross_system_mappings`) in one batched query served from a cache, and writes every line in a single multi-row INSERT. Behavior is unchanged (identical rows, same `lines_in_flight` guard, same `cross_system_lookup_miss` precedence); a round-trip guard asserts a 50-line PO costs one batched SKU lookup, one batched item resolve, and one INSERT.
+
+## [v1.24.0] - 2026-06-18
+
+"Returns, RMA, and exchanges" release. The post-fulfillment arc, end to end: replacements, exchanges, returns (RMA), and partial refunds. A sale can now spawn typed child orders -- a replacement or exchange outbound, a goods-in RMA to receive returned stock against, a credit-memo refund -- each numbered off and linked to its original, completing the order lifecycle.
+
+**Mobile.** Zero mobile/ diffs on this release. The current mobile build (version 1.19.0, versionCode 9) remains current; no new APK for v1.24.0.
+
+### Added
+
+- **Post-fulfillment order types and numbering** (#407): `sales_orders.order_type` admits `replacement` / `exchange` / `return` alongside `sale` / `refund` / `backorder`. A post-fulfillment child takes a readable so_number off its original (`<orig>-REPLACEMENT` / `-EXCHANGE` / `-RMA` / `-REFUND`, suffixed `-N` for repeats) and links back via `parent_so_id` and, per line, `original_so_line_id`.
+- **RMA goods-in** (#407): `create_rma` mints the return SO; `POST /api/admin/sales-orders/<so_id>/receive-return` books a line into a disposition bin (a sellable bin restocks, a defective bin quarantines), advances the RMA status, and emits `return.received/1`. The receive is idempotent on a handheld-supplied key. A tabbed Returns admin page (RMA + Refunds) fronts the flow.
+- **POS returns** (#407): POS checkout in replacement / exchange mode mints the typed child off an attached original (an exchange also auto-creates the `<orig>-RMA` for the returned goods); refund accepts a line subset for partial refunds (a full refund still cancels the original, as in v1.22.0); a POS sales-order lookup and a reference-order ingest (for an original that lives only in an upstream source system) support the attach-order flow.
+
+### Migrations
+
+- **070** (#407) -- `sales_orders.order_type` CHECK expands to include `replacement`, `exchange`, `return`.
+- **071** (#407) -- `sales_order_lines.original_so_line_id` links a post-fulfillment child line to the original line it derives from (NULL on ordinary lines).
+- **072** (#407) -- `item_receipts` can book against a return SO (nullable `so_id` / `so_line_id`); `sales_order_lines.quantity_received` tracks per-line return receipts.
+- **073** (#407) -- `sales_orders.so_number` widens to `VARCHAR(128)` so the longest suffixed child numbers fit.
+
+## [v1.23.0] - 2026-06-18
+
+"Ship events and operations dashboard" release. Two threads. The admin sales-order edit surface now emits the outbound events a marketplace consumer needs -- a per-field `salesorderedit.completed` event, and `ship.confirmed` when an edit ships the order (carrier derived from the free-text ship method, tracking made optional for local pickups). And the dashboard gains an operations view: a per-PO Received tab and a Marketplace Health tab whose per-channel health bubbles are admin-defined in Settings rather than hardcoded.
+
+**Mobile.** Zero mobile/ diffs on this release. The current mobile build (version 1.19.0, versionCode 9) remains current; no new APK for v1.23.0.
+
+### Added
+
+- **SO-edit outbound events** (#404): editing a sales-order header via `PUT /api/admin/sales-orders/<so_id>` emits `salesorderedit.completed/1` carrying the per-field diff that landed (the same `{field, old_value, new_value}` set as the audit row), so marketplaces can sync header edits that previously produced no event. When the same edit transitions the order to SHIPPED it additionally fires `ship.confirmed/1` via `record_ship`; the admin surface has no carrier field, so `carrier_from_ship_method` derives one from the free-text ship method (defaulting to "Other"). A local-pickup ship (the ship method names a pickup) needs no tracking, so `ship.confirmed/1` now permits an empty `tracking_numbers` array (minItems 0, a backward-compatible widening).
+- **Operations dashboard** (#405): the dashboard becomes a tab shell adding a Received tab (per-PO receipts for a date range, `GET /api/v1/dashboard/received`) and a Marketplace Health tab (`GET /api/v1/dashboard/shipping-health`) with per-channel Orders Received / Orders Shipped totals and a clickable need-to-ship-today bubble that opens the SO drill-down. The channel set is admin-defined: a Settings > Marketplace Health surface saves `{origin, label}` pairs to the `dashboard_bubble_origins` app setting, matched verbatim against the free-text `sales_orders.order_origin`; with nothing configured the view surfaces no channels, never implicitly from the data. Shared range picker across the date-scoped tabs.
+
+## [v1.22.0] - 2026-06-18
+
+"POS completions and dockd reads" release. Two threads. The POS sale path is rounded out -- shipping charges and ship method persist on the order, split (part cash + part card) tender is accepted, and a full refund now cancels the original sale instead of leaving it SHIPPED. And the dockd warehouse-floor integration gains a barcode item-lookup endpoint plus the ordered quantity on its order payload.
+
+**Mobile.** Zero mobile/ diffs on this release. The current mobile build (version 1.19.0, versionCode 9) remains current; no new APK for v1.22.0.
+
+### Added
+
+- **POS shipping charge, ship method, and totals** (#399): the payment summary gains `shipping_cents` (default 0, preserving the counter-sale contract) and checkout gains an optional `ship_method`. On a phone order the shipping charge persists to `sales_orders.customer_shipping_paid`, the operator-selected method to `ship_method`, and the order total to `order_total`, so the picking ticket and downstream consumers see real freight figures. A full refund credits the shipping back with the order: the credit-memo SO stores negative `order_total` and `customer_shipping_paid` to mirror its negative credit lines.
+- **POS split tender** (#400): `split` is accepted as a `PaymentSummary.method` for a part-cash + part-card sale; the tenders list carries the per-method breakdown and the refund path matches it symmetrically (split sale -> split refund). Additive under the DRAFT-v1 POS contract.
+- **dockd item lookup + ordered quantity** (#401): `GET /api/v1/dockd/items/<barcode>` resolves an item by barcode (UPC) and returns its canonical detail plus per-location stock, scoped to the token's warehouses; gated as a dockd inbound resource like the other dockd reads. The dockd GET order payload also returns `qty_ordered` alongside the fulfilled `qty` on each line. The OpenAPI spec and `docs/api/dockd-openapi.yaml` are regenerated to match (parity test enforced).
+
+### Fixed
+
+- **POS refund cancels the original SO** (#402): a v1 refund is full-order only, so a refunded sale is now a cancelled sale -- the original SO moves to `status=CANCELLED` (keeping the `refunded_at` + `refund_so_id` link) so admin and picker views stop showing it as SHIPPED. The "must be SHIPPED" state gate moves below the already-refunded check, so a repeat refund attempt surfaces `422 already_refunded` instead of 404-ing on the now-CANCELLED status.
+
+## [v1.21.0] - 2026-06-18
+
+"Pre-allocation and POS phone orders" release. Two threads. Admin-created and marketplace-inbound sales orders now reserve inventory at create time instead of leaving stock claimable until a picker batches the order, and the picking flow was taught to handle a line that arrives already reserved. On top of that reservation work, POS checkout gains a phone-order path: a phoned-in order is paid at the register but enters the warehouse pick queue with a real structured ship-to, reserving stock rather than decrementing it.
+
+**Mobile.** Zero mobile/ diffs on this release. The current mobile build (version 1.19.0, versionCode 9) remains current; no new APK for v1.21.0.
+
+### Added
+
+- **Inventory pre-allocation for admin SOs** (#396): `POST /admin/sales-orders` now follows each line insert with a greedy reservation walk -- it locks the available inventory rows for the line's `(item_id, warehouse_id)` `FOR UPDATE`, takes from the fullest bin first, and bumps `quantity_allocated` until the line is satisfied or stock is exhausted. The order no longer sits OPEN with `quantity_allocated=0` until a picker batches it, closing the window where POS sales and concurrent inbound orders could claim the same on-hand pool. Partial reservation is allowed: a short warehouse still creates the SO and the picker handles the short at fulfillment. A manual `PATCH /admin/sales-orders/<so_id>/lines/<so_line_id>/allocation` knob (signed delta, clamped to `[quantity_picked, quantity_ordered]`) is surfaced as a minus/plus stepper on the Allocated cell of the SO line table.
+- **POS phone orders** (#397): POS checkout gains an `is_phone_order` flag (default false; the counter-sale contract is preserved). A phone order creates the SO at `status=OPEN` with `shipped_at` NULL and reserves each line via `quantity_allocated` instead of decrementing `quantity_on_hand`, so it enters the existing pick queue and the unit stays in its bin until the picker removes it. Checkout accepts an optional customer (`customer_name` / `customer_phone` / `customer_email`) and a structured `shipping_address` object; on a phone order the structured fields persist to the `sales_orders.shipping_address_*` columns so the picking ticket renders a real label without a cross-system lookup, while the flat `ship_address` stays as the floor-screen mirror. `order_origin` is now wire-driven (the POS sends "POS" / "Phone Order" verbatim; older clients that omit it land as NULL). POS sales-order numbers drop the redundant prefix: `SO-POS-<n>` becomes `POS-<n>` and `SO-POS-REF-<n>` becomes `POS-REF-<n>`.
+
+### Changed
+
+- **Pickable pre-reserved lines** (#396): a sales-order line can now reach picking already fully reserved -- from pre-allocation, POS phone-order checkout, or a stranded prior allocation. The coverage and allocation passes keyed on `quantity_ordered > quantity_allocated`, so such a line produced zero pick_tasks and stranded every order in the batch. The picking flow now normalizes each line's standing reservation to its picked floor before planning (releasing `quantity_allocated - quantity_picked` back to inventory inside the one transaction), then re-reserves and tasks it like any fresh line. Applies to `create_pick_batch` and `wave_create`.
+
+## [v1.20.0] - 2026-06-18
+
+"Inbound sync, event rename, and deploy hardening" release. Three threads. A state-based inventory-sync inbound endpoint lets an upstream system push desired on-hand quantities (cutover seed, marketplace mirror, drift correction) that land as idempotent adjustments, and outbound webhook payloads now carry the source-system external_ids consumers actually need instead of Sentry's internal UUIDs. The inventory completion events are renamed to the entity-prefixed names connectors filter on -- a breaking webhook change. And a set of deploy-portability changes lets one image set run across docker-compose and managed container platforms without rebuilds.
+
+**Mobile.** Zero mobile/ diffs on this release. The current mobile build (version 1.19.0, versionCode 9) remains current; no new APK for v1.20.0.
+
+### BREAKING
+
+- **Webhook event rename** (#393): `transfer.completed/1` and `adjustment.applied/1` are retired and replaced by `inventorytransfer.completed/1` and `inventoryadjusted.completed/1` -- the entity-prefixed names connectors filter on. Payload shapes are unchanged, so a consumer migrates by subscribing to the new `event_type`. Every emit site emits only the new name: bin-to-bin move and transfer-order approval emit `inventorytransfer.completed`; review approval, direct adjustment, CSV import, and the Pipe B inbound sync path emit `inventoryadjusted.completed`. `cycle_count.adjusted/1` is kept (it carries variance detail the canonical event does not); the cycle-count approval branch now emits it alongside `inventoryadjusted.completed`. The `inventoryadjusted.completed/1` schema permits a null `applied_by_user_external_id` for the system-driven inbound path. api-reference, webhooks, and events docs updated to the new names.
+
+### Added
+
+- **Inbound inventory sync** (#392): `POST /api/v1/inbound/inventory_update` takes a desired final quantity, computes the delta against current on-hand, and applies it as an APPROVED adjustment emitting the adjustment event; idempotent (same target = 0-delta no-op). Resolves the item via `cross_system_mappings` (source_system from the token) and the bin via `(warehouse_id, bin_code)`; scoped by a new `inventory_update` inbound resource key. The per-token inbound rate limit is env-configurable via `INBOUND_RATE_LIMIT_PER_MINUTE` (default 500). System tokens carry no user identity, so an inbound adjustment attributes `adjusted_by` to the admin user.
+
+### Changed
+
+- **Source-system external_ids in webhook payloads** (#392): outbound `*_external_id` fields now carry the source-system identifier the upstream connector pushed (resolved from `cross_system_mappings` via the new `resolve_source_external_id` helper), not Sentry's internal canonical UUID, so consumers no longer round-trip the Sentry API per event. The canonical UUID stays available on the envelope `aggregate_id`; the field falls back to the canonical UUID when no mapping exists. Not an event-version bump -- the field-name contract always meant source-side, so the prior content was a bug.
+- **Deploy portability** (#394): `admin/nginx.conf` becomes a `${API_UPSTREAM_URL}` / `${API_UPSTREAM_HOST}`-templated config substituted at container start, so one image deploys across docker-compose and managed container platforms; the api image bakes `db/mappings/` (build context moves to the repo root, with a repo-root `.dockerignore`) so Pipe B inbound works without a volume mount; `docker-compose.override.yml` is gitignored; and gunicorn's worker timeout is raised to 60s so the slowest single-transaction inbound writes are not cut off at the default 30s.
+
+## [v1.19.0] - 2026-06-18
+
+"Receiving and putaway" release. Three threads. An admin can now reverse a single PO receipt (the double-scan fix) with a warehouse-pool inventory walk and a `receipt.cancelled` event so downstream inbound counts stay in step. The Put-Away supervisor dashboard becomes a grid of bin tiles, red when a staging bin holds work and grey when empty, so the whole staging map reads at a glance; the pending list now surfaces the same preferred-bin hint as the scanner. And preferred bins are constrained to a strict, Pickable-only priority hierarchy (one bin per priority), with the rejection surfaced on the admin page and the handheld instead of being swallowed. Migration 069 backs the priority constraint.
+
+**Mobile.** PutAwayScreen surfaces the preferred-bin rejection reason instead of silently swallowing it. versionCode 8 -> 9, version 1.14.0 -> 1.19.0; a new APK build is owed.
+
+### Added
+
+- **Admin unreceive** (#388): `record_unreceive` service reverses one PO receipt in a single transaction -- decrements the PO line, recomputes PO status, hard-deletes the `item_receipts` row, writes an `ACTION_RECEIVE_CANCEL` audit row (`details.source='admin_unreceive'`), and emits `receipt.cancelled/1`. Inventory backs out of the warehouse pool (preferring the original bin, then any bin holding the item) so the reversal lands even after putaway has moved the goods; refuses with `insufficient_available` when the warehouse total is short. `GET /admin/purchase-orders/<id>/receipts` and `POST /admin/receipts/<id>/unreceive` (both gated by the existing `receiving` page key), plus receipt history + a per-row Unreceive control in the admin Receiving modal.
+- **Put-Away supervisor dashboard** (#389): the dashboard becomes an auto-fill grid of bin tiles, alphabetised, red-bordered when a staging bin has items awaiting putaway and grey when empty; clicking a populated tile opens the per-item breakdown with a per-bin CSV export. The `/putaway/pending` list now joins `preferred_bins` so it surfaces the same priority-1 suggested bin as the single-item suggest endpoint, without a per-row round trip.
+
+### Changed
+
+- **Preferred bins: strict Pickable priority hierarchy** (#390): both preferred-bin write paths (the admin POST and the putaway set-as-primary) reject any bin whose type is not Pickable, so a transient Staging / PickableStaging bin can never become an item's home. A deferrable `UNIQUE(item_id, priority)` constraint plus an admin auto-resequence keep each item's bins a contiguous 1..K hierarchy (the bin you set wins its priority; the rest cascade down). The rejection is now surfaced on the admin Preferred Bins page (as an error, not a green banner) and on the handheld putaway prompt.
+
+### Migrations
+
+- **069** (#390) -- `preferred_bins` gains a deferrable `UNIQUE(item_id, priority)` constraint and drops the redundant non-unique `(item_id, priority)` index, enforcing one bin per priority per item. Aborts if duplicate `(item_id, priority)` rows remain, so dedup before applying.
+
+## [v1.18.0] - 2026-06-18
+
+"Backorders, notifications, and dispatcher reliability" release. Three threads. A partial-fulfillment workflow lets an operator ship what's pickable and spin the shortfall into a backorder that waits for stock and rejoins the picking queue on its own when a receipt makes it whole. Per-warehouse Microsoft Teams notifications fire on the backorder lifecycle so the floor hears about shorts and restocks without watching a screen. And the outbound webhook dispatcher is hardened against the failure mode where one stuck delivery silently blocks an entire subscription. Migrations 067 and 068 back the backorder lifecycle and the notification destinations.
+
+**Mobile.** Zero mobile/ diffs on this release. The v1.14.0 mobile build (versionCode 8) remains current; no new APK for v1.18.0.
+
+### Added
+
+- **Partial-fulfillment + backorders** (#384): `POST /admin/sales-orders/<id>/partial-fulfill` shorts the unshippable lines on a sales order and creates a backorder SO (`order_type='backorder'`, `status=WAITING_STOCK`, `parent_so_id` back-pointer, full address copy, NULL totals) carrying the shorted quantity; the original continues through pack/ship with what was picked, and a SHORT inventory adjustment is written when on-hand stock exists for a shorted line. BO chaining is capped at one level and refund SOs are rejected. `POST .../cancel-backorder` cancels a BO with a reason; the shared cancel service gained a parent-cancel cascade (cancelling a parent recursively cancels its non-terminal backorders). The receiving loop matches `WAITING_STOCK` backorders on every receipt and flips a fully-satisfiable one to OPEN. A `/backorders` dashboard (Waiting / Ready-to-ship tabs) and a "Partially Fulfill" sub-modal on the SO edit screen front the workflow, gated by a new `backorders` page key. Events `backorder.opened` / `backorder.fulfillable` / `backorder.cancelled` register at v1.
+- **Teams notification webhooks** (#385): per-warehouse Microsoft Teams destinations for the `backorder.*` event family. A pure MessageCard builder (one variant per event, with an "Open in Sentry" deep-link), an SSRF-guarded sender, admin CRUD (list / create / PATCH / rotate-url / delete / test-send) gated by a new `notifications` page key, and a `/notifications` admin page. URLs are Fernet-encrypted at rest and never returned in plaintext. Each `backorder.*` emit dispatches its card after commit on a daemon thread, so a slow Teams response never couples to operator latency; failures are isolated per-webhook and the outbox row persists for replay. Cards carry item names alongside SKUs.
+
+### Fixed
+
+- **Webhook dispatcher reliability** (#386): four hardening fixes against silent head-of-line blocking. (1) Dispatch-time DNS resolution moved inside the wall-clock watchdog so a hung `getaddrinfo` fails as a timeout instead of wedging a delivery `in_flight` forever. (2) A heartbeat-driven reaper reclaims rows stuck `in_flight` past `DISPATCHER_INFLIGHT_RECLAIM_S` (default 120s), not just at boot. (3) Permanent failures (4xx except 408/429, ssrf_rejected) fast-DLQ on attempt 1 instead of burning the full ~15-hour retry schedule; transient failures keep the schedule. (4) A dispatcher self-monitor posts straight to Teams (never through the delivery queue) when a delivery stalls, the DLQ grows, a subscription lags, or an auto-pause fires; opt-in via a `dispatcher.*` alert subscription, de-spammed by transition + cooldown. New `DISPATCHER_INFLIGHT_RECLAIM_S` and `DISPATCHER_HEALTH_*` env vars (documented in `.env.example`).
+
+### Migrations
+
+- **067** (#384) -- `sales_orders` gains `backorder_opened_at`, `backorder_fulfillable_at`, and `cancellation_reason`; the `order_type` CHECK expands to include `'backorder'`; the new `WAITING_STOCK` status and `SHORT` adjustment reason are documented via column comments (app-enforced, no DB CHECK); adds the `ix_sales_orders_waiting_stock` partial index for the receipt-hook lookup.
+- **068** (#385) -- `notification_webhooks` table: per-warehouse chat-channel destinations (Teams in v1) with a Fernet-encrypted URL, distinct from the signed-envelope `webhook_subscriptions`.
+
+## [v1.17.0] - 2026-06-17
+
+"Admin at scale" release. Three threads. The admin pages are reworked to hold up at production catalogue size: server-side search across Inventory, Items, Adjustments, Inventory Transfers, and the Create PO/SO modal, plus a warehouse/bin filter on Inventory, Bins pagination + CSV, and a Put-Away staging dashboard. A POS Activity dashboard surfaces point-of-sale order activity and daily KPIs, gated behind a settings toggle so non-POS deployments never see it. And an Outbound Fraud queue can hold an order at FRAUD_REVIEW until a CSR clears it, with the billing/shipping auto-flag heuristic opt-in (off by default). Migration 066 documents the new status value; no DDL.
+
+**Mobile.** Zero mobile/ diffs on this release. The v1.14.0 mobile build (versionCode 8) remains current; no new APK for v1.17.0.
+
+### Added
+
+- **Admin search + scale** (#379): Inventory gains warehouse + dependent bin filter dropdowns, the endpoint honors `bin_id` (was a silent no-op), and `q` matches UPC + bin_code beyond SKU / item name. Bins gets pagination, a total counter, and CSV export. Items search extends to the `barcode_aliases` array, debounces typed input with stale-response cancellation, and returns one row per item (a duplicate priority-1 preferred bin no longer fans it out). Adjustments and Inventory Transfers move their bin/item pickers to debounced server-side search. Put-Away becomes a staging dashboard backed by a new `/putaway/staging-summary` endpoint that lists every staging bin (including empty ones) with per-item detail and CSV export. The Create PO/SO modal resolves a typed SKU server-side on a cache miss.
+- **POS Activity dashboard** (#380): a paginated POS sales-order list (order-type / terminal / cashier / date filters) and a daily KPI strip (sales, revenue, refunds, active terminals), from two read-only endpoints that LEFT JOIN audit_log for the POS_CHECKOUT metadata. Opt-in via the `pos_activity_enabled` setting (default off, Settings > POS); the Outbound nav entry is hidden until enabled.
+- **Outbound Fraud queue** (#381): an order can be held at `status=FRAUD_REVIEW`, out of the picking queue, until a CSR clears it. The billing != shipping auto-flag heuristic is opt-in (`fraud_review_billing_shipping`, default off, Settings > Fraud Review): when on, an inbound order whose billing/shipping addresses diverge (line1/line2/city/state/postal, normalised, both sides populated) lands in FRAUD_REVIEW on first receipt only. A `/fraud` page shows billing/shipping side by side with inline memo edit and a push-to-queue action; `PATCH .../memo` and `POST .../push-to-queue` are gated by a new `fraud` page permission and each write an audit row.
+
+### Migrations
+
+- **066** (#381) -- refreshes the `sales_orders.status` column comment to document the new `FRAUD_REVIEW` value. No DDL: the status column has no DB CHECK (the application layer is the source of truth) and the `memo` column shipped in 055.
+
+## [v1.16.0] - 2026-06-17
+
+"Admin platform" release. The web admin grows three ways. A Vendors page adds CRUD over the canonical vendors table, which shipped without an admin path. A consolidation pass restyles the chrome, folds the warehouse-layout pages under a single Data tab strip, retires the admin Picking/Packing/Shipping mirrors in favor of the handheld scanner flow, widens the SO/PO detail popups, and adds an Item History view to the audit log. A purchase-order management surface makes line items editable, adds an ARCHIVED status and a status dropdown, exports a PO to CSV, and brings receiving onto the web with an inline per-line receive control. Migration 065 prunes the retired page keys.
+
+**Mobile.** Zero mobile/ diffs on this release. The v1.14.0 mobile build (versionCode 8) remains current; no new APK for v1.16.0.
+
+### Added
+
+- **Vendors admin** (#373): list / get / create / update / delete over the canonical `vendors` table, gated by a new `vendors` page permission, with a Vendors page (list + create + edit + delete), sidebar entry, and Users-grid row. `is_active` defaults to true on create; soft-archive via `is_active=false` is the supported retire path. No migration -- the table already existed; the `items.vendor_id` linkage stays deferred.
+- **Warehouse-data consolidation** (#376): Warehouses / Bins / Zones / Preferred Bins fold under a single Data page with a tab strip; the old top-level paths redirect so existing bookmarks still land, and per-tab visibility honors the existing page permissions.
+- **Wide detail modals** (#376): a Modal `size` prop drives a wide variant, and the SO/PO detail popups gain a 2-column header grid, titled sections, and a shared `.lines-table` so the popups read consistently with the rest of the shell.
+- **Audit Item History** (#376): the Audit Log opens on an Item History tab -- a SKU/item-name typeahead resolves to an item and drives a per-item lifecycle view via a new `?item_id` filter that matches both direct `ITEM` events and rows whose `details` carry the `item_id`. The full feed stays under its own tab.
+- **PO line editing + status lifecycle** (#375): the PO Edit modal gains a status dropdown (replacing the Close/Reopen buttons), editable line quantities committed per line, per-line removal, and an Add Line row with a debounced SKU typeahead, live resolution preview, and inline errors. Header fields lock while CLOSED/ARCHIVED with the status dropdown still editable; validation errors surface field-level detail in a sticky banner. Backend adds `POST/PATCH/DELETE` line endpoints and PUT status transitions with the ARCHIVED-from-CLOSED gate, each writing one audit row.
+- **PO CSV export** (#375): the PO detail popup exports SKU, Item Name, Ordered, Received, and Variance to `po_<number>_<date>.csv`, generated client-side.
+- **Inline web receiving** (#375): the Receiving detail modal gains a per-line receive control (qty + bin, defaulting to the first Staging bin) that posts to the existing `/receiving/receive` endpoint and refetches the PO on success. Hidden when the PO status is not OPEN/PARTIAL.
+
+### Changed
+
+- **Picking productivity metric** (#376): the dashboard picking card now counts distinct orders picked (`COUNT(DISTINCT entity_id) WHERE entity_type='SO'`) instead of summed units, so a picker closing ten 1-unit orders is no longer outranked by one filling a single 10-unit order. Card label flips from "units" to "orders".
+- **Admin chrome legibility** (#376): contrast, sizing, and font tweaks on the sidebar and topbar.
+
+### Removed
+
+- **Admin Picking / Packing / Shipping mirror pages** (#376): retired. The floor workflow lives on the handheld scanners; the admin mirrors duplicated supervisor state without adding a control surface. Sales Orders + Picking Tickets cover the supervisor view, and Dashboard counts still surface throughput.
+
+### Migrations
+
+- **065** (#376) -- prunes the retired `picking` / `packing` / `shipping` page keys from `user_page_permissions` so a stale grant cannot persist past the next permissions save.
+
+## [v1.15.0] - 2026-06-16
+
+"Admin picking ops" release. Admins gain two outbound tools: a virtual-pick path that marks an OPEN sales order picked from the admin UI when the digital pick never landed, and a printable Picking Tickets queue with per-SO and Print All packing-slip views. The packing slip's branding is Settings-driven with neutral defaults, so a fresh install prints a clean, unbranded slip. Migration 064 adds `printed_at` so the queue can hide already-printed orders without dropping them.
+
+**Mobile.** Zero mobile/ diffs on this release. The v1.14.0 mobile build (versionCode 8) remains current; no new APK for v1.15.0.
+
+### Added
+
+- **Admin virtual pick** (#369): `POST /admin/sales-orders/<id>/admin-pick` applies a batched, all-or-nothing pick from the SO edit view -- per-line `{bin, quantity}` entries (split-bin allowed) bump the line counters, decrement inventory at the chosen bin, write an `ACTION_PICK` audit row with `details.source='admin_virtual'`, and emit `pick.confirmed` when the SO flips to PICKED. The end state is indistinguishable from a handheld pick, and the synthetic `pick_tasks` feed the existing Release Picked Quantities flow for undo. A `GET .../lines/<line>/available-bins` endpoint powers the per-line bin dropdown. Gated to ADMIN or the so-full-edit override.
+- **Picking Tickets queue + print views** (#370): Outbound > Picking Tickets lists OPEN sales orders with a status switcher, a Hide-Printed toggle, and a sortable Bin column in warehouse-walk order (lowest-`pick_sequence` preferred bin). A per-SO packing slip renders with a Code 128 barcode, and a standalone Print All tab renders the on-screen queue page-broken for printing, capped at 200 tickets per tab. Gated by a new `picking-tickets` page permission.
+- **printed_at tracking** (#370, migration 064): `POST /admin/sales-orders/mark-printed` stamps `printed_at` once the client confirms a render, never as a side effect of the GET, so the queue hides already-printed orders without dropping them; the print pages mark-printed with one retry and surface persistent failures via a toast.
+- **Configurable packing-slip branding** (#370): the picking-ticket response carries a `branding` object read from `app_settings` (`picking_ticket_company_name` / `_company_address` / `_logo_url` / `_returns_text`), all defaulting to empty so a fresh install prints an unbranded slip; the slip renders the logo, company block, and returns text only when set, and Settings > Picking Ticket configures them.
+
+### Migrations
+
+- **064** (#370) -- `sales_orders.printed_at TIMESTAMPTZ` plus a partial index `(status, ship_by_date) WHERE printed_at IS NULL` for the unprinted-queue predicate.
+
+## [v1.14.0] - 2026-06-15
+
+"Picking integrity" release. The pick path gains a layered defense against silently under-fulfilled orders: a batch can no longer be created for sales orders that pickable inventory cannot cover, and a line that was never picked can no longer ride the SO header through PICKED, PACKED, and SHIPPED. The pick-batch lifecycle becomes deterministic -- a new scan auto-cancels the operator's prior in-progress batch with a full revert, so there is no half-stored "Resume" state -- and admins get a Picking Batches page to release batches that strand their orders. Wave-validate now resolves transfer orders alongside sales orders from the same scan.
+
+**Mobile.** First mobile/ change since v1.10.3: the picker surfaces an unpickable-orders modal on under-allocation, the home screen drops the Resume affordance, and the pick screen accepts transfer-order scans. APK rebuilt at versionCode 8 (version 1.14.0).
+
+### Added
+
+- **Under-allocation pre-flight at batch creation** (#364): `create_pick_batch` and `wave_create` run a coverage check inside the same transaction as the `FOR UPDATE` inventory locks; if any SO cannot be fully covered by pickable inventory, the helper walks contributors FIFO, rolls back any partial state, and raises `InsufficientCoverageError` -> HTTP 409 `insufficient_coverage` with an `unpickable[]` payload of `{so_id, so_number, lines:[{sku, item_name, ordered, available}]}`. Both endpoints accept an `exclude_so_ids` list so the client's second call commits the pickable subset, replacing the historical "log a warning and proceed" path that let SOs ship under-allocated.
+- **Line-level fulfillment guards across batch / pack / ship** (#364): `complete_batch`, `complete_packing`, and `record_ship` each refuse to promote an SO whose line has `quantity_picked < quantity_ordered` without an operator-confirmed shortfall marker (`pick_tasks.status = SHORT`, or `wave_pick_breakdown.short_quantity > 0` for wave picks that fan one task across many lines). A refused ship rolls back before the fulfillment INSERT, so no fulfillment row is written; legitimate shorts via `/api/picking/short` still complete.
+- **Admin pick-batch list and release** (#365): `GET /api/admin/pick-batches` lists the active batches that hold the cross-pick lock; `POST /api/admin/pick-batches/<id>/delete` reuses `full_revert_batch` to cancel one and unwind every effect, returning its orders to a clean pickable state. Transfer-order batches list read-only and refuse delete with 409. Surfaced as the Outbound > Picking Batches admin page and gated by a new `picking-batches` page permission.
+- **Wave-validate accepts transfer orders** (#366): the pick-screen scan resolves `sales_orders` first, then `transfer_orders`, returning a `kind` discriminator ('SO' or 'TO') so the caller routes by type. A TO is scannable only when OPEN / PARTIALLY_PICKED, provisioned with a `pick_batch` via admin start-picking, and assigned to the caller; other states return 404 / 409 with the reason in the body. `WaveValidateRequest` renames `so_barcode` -> `barcode` with a `populate_by_name` alias so older mobile builds keep working.
+
+### Changed
+
+- **No-Resume pick-batch lifecycle** (#365): `create_pick_batch` and `wave_create` run `cancel_prior_user_batches` as their first step, reverting every OPEN / IN_PROGRESS batch the scanning user owns in the target warehouse before the new batch is created -- inventory restored, line counters reset, tasks RELEASED, batch CANCELLED. The mobile home screen no longer fetches or renders the active-batch banner, since a scan is always a fresh session. Cross-user picking is unchanged: a different user scanning an SO already in someone else's active batch still hits the per-SO active-batch rejection.
+
+### Docs
+
+- **Stuck-pick-after-revert recovery runbook** (#365): cleanup procedure for SOs left carrying stale `quantity_allocated` residue by the pre-fix revert path -- diagnose the residue against live `pick_tasks`, cancel any active batches via the API so `full_revert_batch` restores inventory, clamp the residue down to the live-task sum in a logged transaction, and re-scan to validate.
+
+## [v1.13.0] - 2026-06-15
+
+"SO status revert and editing refinements" release. The admin sales-order surface gains a status-revert flow that demotes a PICKED, PACKED, or SHIPPED order to any earlier status -- releasing picked inventory back to source bins, unpacking, and unshipping under one transaction and one audit shape -- plus a free-text `order_origin` label, tracking-number and inline address editing in the main edit modal, and a `.modal`-scoped type-scale pass. Cancel-batch now does the same full revert across PENDING / PICKED / SHORT.
+
+**Mobile.** Zero mobile/ diffs on this release. v1.10.3 mobile source (versionCode 7) remains current; no new APK build for v1.13.0.
+
+### Added
+
+- **SO status-revert flow + Release Picked Quantities** (#361): `POST /admin/sales-orders/<id>/revert-status` demotes an SO from PICKED/PACKED/SHIPPED to any earlier status, composing the unwind per effect -- a per-pick_task release restores `quantity_picked` to the source bin via `add_inventory()`, decrements `sales_order_lines.quantity_picked` and `quantity_allocated`, and marks the task RELEASED (the new terminal pick_task status); unpack zeros `quantity_packed` and clears `packed_at`; unship clears `tracking_number` / `carrier` / `shipped_at`. A guard rejects with `picked_qty_remaining` (409) when a sub-PICKED target would strand picked units. `new_status == current` is a release-only mode that releases picks without flipping status. The edit modal intercepts backward transitions and opens a per-pick_task checkbox modal (release vs keep), and `GET /admin/sales-orders/<id>` returns a `pick_tasks` array so the modal renders without a second round-trip. New audit actions SO_STATUS_REVERTED / SO_PICK_RELEASED / SO_UNPACKED / SO_UNSHIPPED. Cancel-batch routes through a shared `full_revert_batch` helper that unwinds PENDING reservations, PICKED moves, and SHORT residue so a cancelled batch leaves the SO indistinguishable from "never started picking".
+- **Free-text order_origin label** (#361): `sales_orders.order_origin` VARCHAR(64) (migration 063), a free-text upstream-origin / channel label populated by the inbound payload (no FK / enum, so any connector value lands without a deploy), surfaced read/write across the SO modals and the GET/PUT/POST surface. Distinct from `source_system` (which connector pushed the order) and `order_source` (the web/pos enum); the inbound mapping template gains an annotated example.
+- **Tracking number + inline address editing in the SO modal** (#361): `tracking_number` joins the view + edit modals (GET now returns `carrier` + `tracking_number`), and address editing moves out of its standalone modal into the main edit form so header + addresses save under one click (PUT, then a conditional PATCH `/address`) with a client-side `addressEditable` gate mirroring the backend status rule.
+- **Modal text scale + line-items polish** (#361): a `.modal`-scoped type-scale bump (labels, inputs, section/card titles step up one size inside popups), the line-items item-name column reverts from muted grey to default text, and the view-modal Order Total / Shipping Paid render with a `$` prefix.
+
+### Security
+
+- **Dependency audit catch-up** (#361): `cryptography` 46.0.7 -> 48.0.1 (GHSA-537c-gmf6-5ccf) and transitive npm lockfile bumps clearing the HIGH advisories (vite `server.fs.deny` bypass, ws memory exhaustion, node-tar file smuggling, form-data CRLF) raised by advisories published 2026-06-15. Lockfile-only, no direct-dependency version moves; the remaining mobile moderate-tier advisories sit below the `--audit-level=high` gate.
+
+### Migrations
+
+- **063** (#361) -- `sales_orders.order_origin` free-text upstream-origin column.
+
+## [v1.12.0] - 2026-06-12
+
+"Admin permissions and SO editing" release. Web-admin USERs gain per-page permission grants and a new so-full-edit override; the admin SO surface gains line-level CRUD with allocation-release, shipment-state backfill fields, a company-local Shipped Date, and a denormalised source_system tag.
+
+**Mobile.** Zero mobile/ diffs on this release. v1.10.3 mobile source (versionCode 7) remains current; no new APK build for v1.12.0.
+
+### Added
+
+- **Per-page permission grants for web-admin USERs** (#356): new `user_page_permissions` table (migration 061) with replace-set CRUD on the user endpoints; `/auth/me` returns `allowed_pages` (None for ADMIN, list for USER). `@require_admin_or_page_permission` replaces `@require_role("ADMIN")` across every admin endpoint, keyed to the page each endpoint serves; `ALL_PAGE_KEYS` in constants.py is the single source the decorator and the sidebar filter both read. The sidebar renders only granted pages, the Users form gains a permission grid with Select all / Clear, and a denied navigation surfaces one clean Permissions Error popup; background fetches (badges, settings probes, modal catalogs) pass `silentPermissionDenied` so the popup only ever fires on a page the USER actually visited. The Packing nav entry hides when packing is disabled in settings.
+- **Admin SO editing expansion** (#357): SO header edits at any status (ADMIN); PUT ALLOWED_FIELDS gains status / carrier / tracking_number / shipped_at for one-off backfill of orders shipped through external systems (direct UPDATE, no inventory_movements or outbox events); the admin topbar surfaces the running api version via `/api/admin/system-info`; and the SO modal gains a company-local **Shipped Date**: the API computes `shipped_date_local` via the new `SENTRY_COMPANY_TIMEZONE` env (IANA zone, default UTC), and a manually-picked date anchors at noon in that zone so it reads back as the same calendar date across DST without clobbering a precise dockd ship instant.
+- **SO line CRUD + so-full-edit override + source_system** (#358): line add/update/remove endpoints with an allocation-release pass (shrinking below `quantity_allocated` or deleting an allocated line walks pending pick_tasks, decrements bin allocation, and deletes the pending tasks; picked/packed/shipped quantities block both); the so-full-edit override rides `user_page_permissions` in a separate Overrides grid group so a non-admin can edit past the OPEN window (SHIPPED stays ADMIN-only); migration 062 denormalises `sales_orders.source_system` (FK to the inbound allowlist, backfilled from `latest_inbound_id`) so a mis-tagged order can be repointed without rewriting inbound history; header edits write one audit row per changed field and the PUT response carries `edited_fields`. The edit modal becomes a sectioned detail view with an editable line table, SKU typeahead add-line, and status dropdown.
+
+### Migrations
+
+- **061** (#356) -- `user_page_permissions` table.
+- **062** (#358) -- `sales_orders.source_system` + allowlist FK (tail ALTER so a fresh schema.sql load resolves declaration order) + backfill.
+
+## [v1.11.0] - 2026-06-12
+
+"Status simplification" release. The sales_orders lifecycle drops three statuses that production showed were dead weight: PACKING was never set by application code, ALLOCATED was a comment-only value, and PICKING merely mirrored "this SO sits inside an active pick batch," state already carried by `pick_batch_orders` + `pick_batches`. The lifecycle is now **OPEN -> PICKED -> PACKED -> SHIPPED**, with CANCELLED as the off-ramp. Picking concurrency is unchanged: row locks and the pick_batches aggregate still serialize batch creation and completion.
+
+**Mobile.** Zero mobile/ diffs on this release; no new APK build for v1.11.0.
+
+### Breaking changes
+
+- **PICKING, PACKING, ALLOCATED retired from the SO lifecycle** (#351): `sales_orders.status` never returns PICKING or PACKING; `sales_order_lines.status` never returns ALLOCATED. Status filters using retired values match nothing (no error). External automation keying on the retired statuses must move to the derived signal: an SO is "in picking" when it has a `pick_batch_orders` row whose batch is OPEN or IN_PROGRESS. Migration 060 **runs a backfill**: live orders in retired statuses fold to OPEN, ALLOCATED lines fold to PENDING (no-op on databases that never held them). If folded orders belonged to open pick batches, cancel or complete those batches before re-enabling pick traffic; `create_pick_batch` now refuses an OPEN SO that already sits in an active batch.
+
+### Changed
+
+- `cancel_sales_order` folds the former PICKING branch into OPEN: an OPEN SO with allocated quantity is the release-allocation-on-cancel path. Dashboard `in_picking` is derived via the batch join; `ready_to_pick` is open SOs minus in-picking, so the tiles stay disjoint.
+
+### Migrations
+
+- **060** (#351) -- retire statuses, executed backfill, column comments updated.
+
+## [v1.10.4] - 2026-06-12
+
+Patch release. Three API-reliability fixes from production: cash tenders no longer fail POS checkout validation, pooled DB connections are validated before use so the first request after an idle period stops 500ing, and the SO detail endpoint returns the customer phone and address it already accepted on PUT.
+
+**Mobile.** Zero mobile/ diffs on this branch. v1.10.3 APK (versionCode 7) remains the working baseline; no new APK build for v1.10.4.
+
+### Fixed
+
+- **POS cash tender accepts a null processor reference** (#346): `external_txn_ref` required a non-empty string, but cash payments legitimately carry no external processor reference (no card-processor session, no marketplace_txn_id) -- a cash checkout failed Pydantic validation with 422 invalid_body and surfaced at the register as an error popup after Pay. Now `Optional[str] = Field(None, ...)`. Safe by construction: the DB column is already nullable, the partial unique index already filters IS NOT NULL, and the dedup contract is `idempotency_key`, not `external_txn_ref`. Card tenders are unaffected.
+- **Pooled DB connections validated before use** (#347): `pool_pre_ping` replaces connections the server has already dropped and `pool_recycle` retires connections before the Postgres idle timeout. Without this, the first request after an idle period failed with "server closed the connection unexpectedly" and a 500.
+- **SO detail returns customer_phone + customer_address** (#348): the PUT path accepted both and the write landed, but the detail SELECT omitted them, so the edit modal came back blank after Save and operators assumed the save had failed. Both fields now ride the SELECT and the response payload.
+
+### Migrations
+
+None on this release.
+
+## [v1.10.3] - 2026-06-12
+
+Patch release. Two floor-operations fixes from production: PickableStaging bins become valid put-away sources (matching the receive screen), and receipt cancel gains a cross-PO guard after a single Cancel tap was observed reversing 564 receipts across 17 POs.
+
+**Mobile.** The put-away fix has a handheld half: PutAwayScreen accepts both staging bin types on bin-scan and item-scan. Mobile version moves to 1.10.3 (versionCode 7). No standalone v1.10.3 APK is published; the handheld half of the put-away fix ships in the next APK build, which covers everything since the v1.9.0 baseline. Stay on v1.9.0 until then if you do not put away from PickableStaging bins.
+
+### Fixed
+
+- **PickableStaging bins are valid put-away sources** (#343): the pending-putaway queue filtered bins to bin_type = 'Staging' while the receive screen already accepts both 'Staging' and 'PickableStaging' -- items received into PickableStaging tray bins (which stay sales-pickable for concurrency) were invisible to the handheld put-away flow. `pending_putaway()` extends the filter to IN ('Staging','PickableStaging'); the handheld bin-scan handler and item-scan staging detector accept both. Existing Staging bins surface unchanged; server change is backward-compatible with the v1.9.0 handheld.
+- **Receipt cancel refuses cross-PO sweeps** (#344): the mobile receive screen accumulates receipt_ids across every PO loaded in a session, so one Cancel tap could reverse receipts on POs the operator never intended to touch (observed: 564 receipts across 17 POs from a single tap on a PO with zero receipts of its own). `po_id` is now required on the cancel request, and a pre-flight check refuses the cancel with the list of mismatched receipt_ids -- before any inventory, PO line, or receipt row is touched -- when any visible receipt belongs to a different PO. Legitimate single-PO cancels are unchanged; out-of-warehouse receipts remain silently skipped per the existing scope clause (V-026).
+
+### Migrations
+
+None on this release.
+
+## [v1.10.2] - 2026-06-12
+
+Patch release. Security catch-up across all three dependency trees plus two data-integrity fixes from production: the audit-log hash chain now survives multi-line memo content, and line-level pick bookkeeping moves to ON DELETE SET NULL so line deletion cannot strand historical pick records.
+
+**Mobile.** `mobile/package-lock.json` picks up in-range security bumps only (the shell-quote critical reachable through the expo prebuild chain); zero mobile source diffs. v1.9.0 APK (versionCode 6) remains the working baseline; no new APK build for v1.10.2.
+
+### Fixed
+
+- **Audit hash chain handles multi-line payloads** (#340): `audit_log_chain_hash()` built its hash input via `payload::bytea`, which parses PostgreSQL bytea ESCAPE format and rejects the backslash-n sequence `JSONB::text` emits for multi-line strings -- saving an SO memo with line breaks rolled back the entire transaction as a generic 500, and from the operator's side Save appeared to do nothing. Both the chain trigger and `verify_audit_log_chain()` now use `convert_to(payload, 'UTF8')` so the text-to-bytea conversion encodes verbatim. ASCII payloads hash to identical bytes under both conversions, so historical `row_hash` values continue to verify.
+- **Line-level pick FKs no longer block line deletion** (#341): `pick_tasks.{so_line_id, to_line_id}` and `wave_pick_breakdown.so_line_id` were created with the PostgreSQL default ON DELETE NO ACTION, so deleting a `sales_order_lines` row failed with an FK violation whenever any historical pick record still pointed at it. Both move to ON DELETE SET NULL: pick rows survive as free-standing audit records (quantities, status, who/when intact) with only the line pointer nulled. `so_id` / `to_id` / `bin_id` / `item_id` remain RESTRICT.
+
+### Security
+
+- **flask-cors 6.0.0 -> 6.0.2, pyjwt 2.12.0 -> 2.13.0** (#339): with documented pip-audit deferrals for PYSEC-2024-271 (CRLF log injection, reachable only under debug logging; production runs at INFO and above) and PYSEC-2025-183 (vendor-disputed pyjwt key-length advisory; the signing key is generated via `secrets.token_urlsafe(>=32)`), each spelled out in audit.yml with rationale and removal criteria.
+- **react-router / react-router-dom -> 7.17.0** (#339): clears two HIGH advisories in the admin tree; in-range under the existing `^7.14.0` caret.
+- **Mobile shell-quote critical cleared** (#339): advisories published 2026-06-12 put the mobile tree over both gating audits; `npm audit fix` resolves shell-quote <=1.8.3 (GHSA-w7jw-789q-3m8p), lockfile-only with package.json pins unchanged. Remaining mobile findings are moderate/low, below both jobs' `--audit-level=high` gate.
+
+### Migrations
+
+- **057** (#340) -- audit_log chain hash UTF-8 conversion (function replacement; touches no rows).
+- **058** (#341) -- `pick_tasks` line FKs -> ON DELETE SET NULL.
+- **059** (#341) -- `wave_pick_breakdown.so_line_id` FK -> ON DELETE SET NULL.
+
+## [v1.10.1] - 2026-05-11
+
+Patch release. Two operator-experience changes on top of the v1.10.0 POS surface: the admin token validator now accepts the dockd and POS slugs it would not before, and the admin Imports page gains a fifth tab for bulk inventory-adjustment CSV uploads.
+
+**Mobile.** Zero mobile/ diffs on this branch. v1.9.0 APK (versionCode 6) remains the working baseline; no new APK build for v1.10.1. Operators running the v1.9.0 mobile app continue to work against a v1.10.1 backend with no upgrade.
+
+### Added
+
+- **Inventory adjustment CSV import** (#329): new `inventory-adjustments` arm on `POST /api/admin/import/<type>` alongside items / bins / purchase-orders / sales-orders. Required columns: `sku`, `warehouse`, `bin`, `qty` (signed integer), `memo` (optional, <=500 chars). Each accepted row resolves `sku` against `items.sku`, `warehouse` against `warehouses.warehouse_code`, `bin` against `bins.bin_code` (must belong to the resolved warehouse), and writes an `inventory_adjustments` row with `reason_code='CORRECTION'`, `status='APPROVED'`, `reason_detail=memo` so the on-hand change applies inline. Positive qty goes through `services.inventory_service.add_inventory` (advisory-locked, creates the inventory row when absent); negative qty takes `FOR UPDATE` on the inventory row and rejects with a row-level error when available on-hand is insufficient. One `audit_log` row (`ACTION_ADJUST`) and one `adjustment.applied/1` outbox event fire per row so subscribers see one event per imported correction. Existing 5000-record cap and V-015 formula-prefix sanitiser apply unchanged. Admin Imports page gains an "Inventory Adjustments" tab with template download (5 columns, 3 example rows). New alignment test pins the template header to the server schema field list so a future schema change fails the test instead of an operator's import.
+
+### Fixed
+
+- **`admin/tokens` validator accepts `dockd.dispatch` and `pos.dispatch`**: `CreateTokenRequest` and `UpdateTokenRequest` only recognized V150 outbound slugs in `_known_slugs_only`, so `POST /api/admin/tokens` with `endpoints=['pos.dispatch']` or `['dockd.dispatch']` returned 400 `unknown_endpoint_slugs` even though the auth middleware honors both slugs at request time and scope-catalog advertises them. Operators could not issue dockd or POS tokens through the admin API. New `_KNOWN_ENDPOINT_SLUGS = V150 keys + V190_DOCKD_SLUG + V1100_POS_SLUG` is the single source the validator's accept set and "unknown slug" error message both read from.
+
+## [v1.10.0] - 2026-05-09
+
+"POS endpoint surface" release. Sentry now serves a dedicated counter-sale API for an external POS Service: four endpoints under `/api/v1/pos/` (`GET /availability`, `POST /validate-cart`, `POST /checkout`, `POST /refund`) authenticated by a new fourth direction `pos.dispatch` alongside outbound polling, inbound POST, and dockd. Checkout and refund are atomic single-transaction routes with row-level `SELECT ... FOR UPDATE` on the inventory rows being decremented or re-incremented, idempotent on a per-route `idempotency_key` (UUID4) with a SHA-256 body hash so a retry with the same key + same body replays the cached response and a retry with the same key + different body returns 409. Refund enforces a 90-day window, a card-vs-cash tender lock, and a once-per-original-SO guard via `refunded_at` / `refund_so_id` on the original sales_orders row. Pricing stays out of Sentry: per-line `unit_price_cents` / `tax_cents` / `line_total_cents` ride on the wire and land in `audit_log.details` for archival, while the POS Service owns its own pricing source.
+
+**Mobile.** Zero mobile/ diffs on this branch. v1.9.0 APK (versionCode 6) is the working baseline; no new APK build for v1.10.0. Operators running the v1.9.0 mobile app continue to work against a v1.10.0 backend with no upgrade. A future v1.10.x release that lands a real mobile fix picks up the versionCode bump.
+
+### Added -- POS endpoint surface
+
+- **`GET /api/v1/pos/availability`** (#322): per-warehouse, per-bin stock for one item by `barcode` or `sku` (XOR query parameter). Wire-level `warehouse_id` is `warehouses.warehouse_code`; wire-level `bin_id` is `bins.bin_code`. Empty bins (`qty_available <= 0`) and empty warehouses are omitted from the response. SKU exists with no in-scope inventory returns `200 {"availability": []}` (out of stock) when no out-of-scope warehouse holds available stock either, and `404 item_not_found` otherwise (warehouse-membership conflation, no enumeration oracle). `@limiter.limit("120 per minute")` per token covers the high-frequency barcode-scan path.
+- **`POST /api/v1/pos/validate-cart`** (#324): pre-flight check called just before initiating a Windcave charge, re-validating that every line resolves to a known SKU + warehouse + bin and the requested quantity is available. Read-only, no idempotency_key needed, returns 200 `{"valid": true}` when every line passes or 409 `{"valid": false, "conflicts": [...]}` with all conflicts in one response. Six conflict reasons in stable precedence order: `sku_not_found`, `item_inactive`, `warehouse_not_found`, `warehouse_not_in_scope`, `bin_not_found`, `insufficient_stock` (carrying `available_qty` for the last). Single-query bulk classifier via `unnest()` LEFT JOIN against items / warehouses / bins / inventory.
+- **`POST /api/v1/pos/checkout`** (#327): atomic counter-sale. Creates a `sales_orders` row with `status='SHIPPED'`, `order_source='pos'`, `order_type='sale'`, populates `external_txn_ref` (Windcave DpsTxnRef), `idempotency_key`, `idempotency_body_hash`, and `cached_response_body` for the replay path. Per-line `SELECT FOR UPDATE` ordered by `(item_id, bin_id)` to prevent deadlock between concurrent checkouts; `INSERT sales_order_lines` with `status='SHIPPED'` and all per-line quantity columns equal to `line.quantity`; `UPDATE inventory SET quantity_on_hand = quantity_on_hand - line.quantity`. `INSERT sales_orders ... ON CONFLICT (idempotency_key) DO NOTHING` is the cross-request sentinel; a peer-committed retry re-reads for the cached body. `SET LOCAL lock_timeout = SENTRY_POS_LOCK_TIMEOUT_MS` and matching `statement_timeout` so a stuck lock surfaces as 503 `lock_contention` with `Retry-After: 1`. One `POS_CHECKOUT` audit_log row carries the cashier_id as `user_id` and per-line price details in `details`; pricing fields live in audit only (no per-line price columns added in v1.10). `so_number` follows `SO-POS-{integer}` using the existing SERIAL. PCI-scope guard at the Pydantic boundary: card tenders accept exactly `{type, amount_cents, card_brand, card_last4, auth_code, external_ref}`; any other field (PAN-shaped or otherwise) fails 422. `@limiter.limit("30 per minute", exempt_when=replay_hit)` so a buggy retry loop does not starve real traffic.
+- **`POST /api/v1/pos/refund`** (#328): atomically reverses a previously-completed POS sale. Creates a credit-memo `sales_orders` row with `order_type='refund'`, `parent_so_id` pointing at the original, negative-quantity `sales_order_lines`, and `external_txn_ref` set to the refund's reference; re-increments `inventory.quantity_on_hand` to the original warehouse + bin; marks the original SO `refunded_at = NOW()` and `refund_so_id = credit_memo.so_id`. Server-side rules: 90-day window from original `created_at` (else 422 `refund_window_expired`), card-vs-cash tender lock comparing the original `POS_CHECKOUT` audit row's `payment_method` against `body.refund_summary.method` (else 422 `tender_mismatch`), once-refunded-never-again guard (else 422 `already_refunded` with `existing_refund_so_id`). Missing / out-of-scope / wrong-source / wrong-state original SO conflates to 404 `original_so_not_found` to prevent enumeration. Idempotent on the refund's own `idempotency_key`, separate from the original sale's. `so_number` follows `SO-POS-REF-{integer}`. `@limiter.limit("10 per minute", exempt_when=replay_hit)`; refunds are intentionally rarer than sales.
+
+### Added -- POS scaffolding
+
+- **Migration 056** (#320): adds `order_source VARCHAR(20) NOT NULL DEFAULT 'web'`, `external_txn_ref VARCHAR(128)`, `idempotency_key VARCHAR(64) UNIQUE`, `idempotency_body_hash CHAR(64)`, `cached_response_body JSONB`, `order_type VARCHAR(20) NOT NULL DEFAULT 'sale' CHECK ('sale','refund')`, `parent_so_id INT REFERENCES sales_orders(so_id)`, `refunded_at TIMESTAMPTZ`, `refund_so_id INT REFERENCES sales_orders(so_id)` to `sales_orders`. Three partial indexes (idempotency_key / external_txn_ref / parent_so_id) keep the on-disk footprint small while serving the POS replay and refund-lookup paths. Forward-only; existing web SOs default to `order_source='web'` / `order_type='sale'`. SET lock_timeout / statement_timeout per the v1.8 migration convention.
+- **`pos.dispatch` token scope** (#321): a fourth `auth_middleware` dispatcher branch alongside outbound polling (V150), inbound POST (V170), and dockd (V190). `V1100_POS_SLUG = "pos.dispatch"` and `_V1100_POS_FLASK_ENDPOINTS` frozenset cover the four POS Flask endpoint names. A POS token must carry `pos.dispatch` and must not carry any outbound (`event_types`) or inbound (`source_system` / `inbound_resources`) markers; mixed-direction tokens are explicitly rejected. Admin scope-catalog includes `pos.dispatch` once the surface is registered. `@require_wms_token` on every POS route fails closed if the path matches `/api/v1/pos/` but the Flask endpoint name is not in the frozenset (wiring-bug guard).
+- **POS body schemas** (#324, #327, #328): `api/schemas/pos.py` carries `ValidateCartLine` / `ValidateCartBody`, `CheckoutLine` / `CheckoutBody` / `PaymentSummary` / `CardTender` / `CashTender` (Pydantic discriminated union on `type`), and `RefundBody` (with `original_so_id` regex `^SO-POS-\d+$`). Every model uses `extra="forbid"` so a typo or rogue field fails 422. Field widths match the corresponding DB column widths so a Pydantic-validated body cannot fail at INSERT on length.
+- **POS service module** (#324, #327): `api/services/pos_service.py` exposes `get_max_body_kb()` (default 256, range [16, 4096]) and `lock_timeouts_ms()` (default 2000 / 4000 ms, range [100, 30000]). Boot guards in `app.py` reject non-integer or out-of-range values for `SENTRY_POS_MAX_BODY_KB`, `SENTRY_POS_LOCK_TIMEOUT_MS`, `SENTRY_POS_STATEMENT_TIMEOUT_MS` so a typo'd value cannot silently degrade the body cap or lock posture.
+- **Audit constants** (#327): `ACTION_POS_CHECKOUT` and `ACTION_POS_REFUND` join the existing audit-log action enum.
+
+### Fixed
+
+- **POS availability out-of-scope conflation** (#323): the initial `/availability` implementation in #322 returned `200 {"availability": []}` for an SKU that existed only in warehouses outside the token's scope, leaking warehouse-membership: a token scoped to one warehouse could distinguish "this SKU exists in a sister warehouse" from "this SKU does not exist anywhere". Now runs a second probe query when the in-scope inventory query is empty: any out-of-scope warehouse with available qty produces 404 `item_not_found`; truly out-of-stock everywhere returns 200 `[]`. Both responses are byte-identical for the genuinely-empty case so no leak remains.
+
+### Migrations
+
+- **056** (#320) -- `sales_orders` POS columns + indexes.
+
+## [v1.9.0] - 2026-05-09
+
+"Dockd shipping integration" release. Sentry now serves a dedicated outbound shipping API for the in-warehouse dockd application: three endpoints under `/api/v1/dockd/orders/<so_number>` (GET, ship, void-ship) authenticated by per-station bearer tokens with `dockd.dispatch` scope, idempotent under retry via SHA-256 body-hash sentinel rows, and serialized against concurrent shipment via `SELECT ... FOR UPDATE` on the SO. Dockd ship and void-ship both write through the existing audit-log hash chain and the `integration_events` outbox so downstream ERPs see a fully-shipped or fully-reversed order.
+
+In parallel, the SO lifecycle gains `CANCELLED` status with end-to-end wiring (admin + inbound + dashboard counter), a new `sales_orders.memo` column inbound-mappable from connector and rendered through the picker / packer / shipper flows, several mobile and admin polish fixes, and a UI modernization of the Audit Log page.
+
+**Mobile.** v1.8 APK (`sentry-wms-v1.8.0.apk`) stays a working baseline: v1.9 backend changes are additive and v1.8 keeps picking + packing + receiving + putaway against a v1.9.0 backend. The v1.9 mobile build adds a memo block on Pack / Pack-Ship / Ship screens (warning-tinted callout above the scan input) and fixes the pack-after-short-pick fallback bug (`PackScreen` and `PackShipScreen` used `||` against `quantity_picked`, falling back to `quantity_ordered` even on a fully-shorted line and blocking pack completion -- now uses `??` so a shorted pick of 0 stays 0). **Update to the v1.9 APK linked on the release page if you ship from the mobile flow or want the new memo display, or stay on v1.8 if you don't.** APK build attaches to the release shortly after tagging.
+
+### Added -- Dockd integration
+
+- **Migration 054** (#302): `item_fulfillments` gains 5 columns (`pre_ship_status VARCHAR(20)`, `voided_at TIMESTAMPTZ`, `voided_by VARCHAR(100)`, `void_reason VARCHAR(500)`, `shipping_cost NUMERIC(12,2)`) so a void can revert the SO to its pre-ship state and the audit row carries who voided and why. Adds `dockd_idempotency` (PK `(token_id, idempotency_key)`, FK CASCADE to `wms_tokens`, prune index on `created_at`) for sentinel-row idempotency. SET lock_timeout / statement_timeout per the v1.8 migration convention.
+- **`ship.voided/1` outbound event** (#303): JSON Schema (Draft 2020-12) at `api/schemas_v1/events/ship.voided/1.json` with required `sales_order_external_id`, `voided_at`, `voided_by_user_external_id`, `reason`, `reverted_to_status` (enum `PICKED` | `PACKED`). Registered in `V150_CATALOG`; emitted on the `integration_events` outbox at void time. New `ACTION_SHIP_VOID` audit-log action.
+- **`dockd.dispatch` token scope** (#304): a third `auth_middleware` dispatcher branch alongside `inbound` and `outbound`. Endpoint resolution gates the slug at the path layer (`_V190_DOCKD_FLASK_ENDPOINTS` frozenset); cross-direction tokens are rejected with 403 `wrong_token_direction`. Admin scope-catalog includes `dockd.dispatch`.
+- **`GET /api/v1/dockd/orders/<so_number>`** (#305): returns header + lines for an SO in PICKED / PACKED / SHIPPED state. Response carries the `X-Sentry-Canonical-Model: DRAFT-v1` header so dockd clients can detect a future schema bump.
+- **`POST /api/v1/dockd/orders/<so_number>/ship`** (#306): accepts `idempotency_key` (UUID4), `tracking_number`, `carrier`, optional `shipping_cost` (Decimal, decimal-bounded), and optional `dimensions`. Body validated through Pydantic with `extra="forbid"`. Idempotency uses sentinel-row INSERT ON CONFLICT against `dockd_idempotency` keyed on `(token_id, idempotency_key)` with SHA-256 body hash; replay with the same key + same body returns the original 200; same key + different body returns 409 `idempotency_body_mismatch`. Concurrent ship attempts on the same SO are serialized by `SELECT ... FOR UPDATE` on `sales_orders`. `SET LOCAL lock_timeout = '5s'` so a stuck FK share lock fails fast.
+- **`POST /api/v1/dockd/orders/<so_number>/void-ship`** (#307): reverses a SHIPPED SO back to its `pre_ship_status` (PICKED or PACKED), reverses the matching `item_fulfillments` row, rolls back `sales_order_lines.quantity_shipped`, writes `ACTION_SHIP_VOID` audit, emits `ship.voided/1`. Same idempotency + serialization as ship.
+- **OpenAPI 3.1 spec** (#308): generated at `docs/api/dockd-openapi.yaml` from the route-level Pydantic models + hand-rolled response schemas; CI runs `tools/scripts/regenerate-dockd-openapi.py --check` on every PR (drift -> red); local regen via `--stdout` or write mode.
+- **Integration test suite** (#309): coverage across migration / scope / GET / POST ship / POST void-ship / OpenAPI parity / e2e lifecycle / polling. Race + retry coverage: idempotency replay, body-hash mismatch, concurrent ship serialization, double-cancel, double-void.
+- **Polling-pipe coverage** (#310): `ship.voided/1` lands in `event_types` for the Fabric polling token at admin issue / rotate time. Fabric token rollout runbook published at `docs/runbooks/fabric-token-add-ship-voided.md`.
+- **Operator pre-provisioning runbook** (#312): `docs/runbooks/dockd-operator-provisioning.md` walks an operator through issuing per-station tokens, scope assignment, rotation cadence, and post-incident revoke.
+
+### Added -- Sales order lifecycle + memo
+
+- **`SO_CANCELLED` end-to-end** (#311): admin + inbound surfaces both delegate to `services/sales_order_service.cancel_sales_order(db, *, so_id, source, username)` with per-status unwind. OPEN / ALLOCATED release allocation; PICKED / PACKED revert allocated and packed counters and revert inventory back to the default receiving bin; all paths emit a single audit row. New `ACTION_CANCEL` audit constant. Inbound surface detects a cancel intent before `_upsert_canonical` so the cancel path is idempotent under re-POST. Dashboard counter shipped on the admin scope-catalog. **No outbound event** -- SO cancels travel ERP -> WMS, never WMS -> ERP.
+- **`sales_orders.memo` column** (#315 backend, #316 frontend): migration 055 + inbound mapping + admin / operator / dockd surfaces wire the new TEXT column (max 4096 chars) through every read path. Frontend renders memo block on Pack / Pack-Ship / Ship screens (warning-tinted callout) and the admin SO detail + edit modal (textarea). YAML template gains a `memo` example.
+
+### Added -- Audit log polish
+
+- **UI modernization** (#317): action types render as color-coded `tag-*` pills (lifecycle / security / config / warning / danger / success); entity column pairs the entity-type label with a mono entity name; details column shows chip-style key=value pairs capped at 3 with `+N more` overflow; user column appends `@warehouse` when present; filter bar moves to a labeled card with an Action select populated from the known constants and a Clear button; detail modal gains a header strip, structured KV grid, Copy JSON button, and Close footer button. Empty state distinguishes filtered vs. unfiltered.
+- **Expected vs. actual counts in details** (#318): PICK and TO_LINE_PICKED happy-path audit details gain `quantity_to_pick` alongside `quantity_picked` (matching the keys SHORT_PICK already writes). PACK details gain `total_expected` and `total_packed`. RECEIVE details gain `quantity_ordered` and `quantity_received_before` so cumulative PO state is reconstructable from one row. Hash chain unaffected; only the JSONB payload shape changes.
+
+### Fixed
+
+- **Mobile pack-after-short-pick** (#313): `PackScreen.js` and `PackShipScreen.js` used `quantity_picked || quantity_ordered` for short-pick fallback. JS `||` falls back on 0 (falsy), so a fully-shorted line (picked = 0) silently fell back to ordered and required N scans against an empty pick, blocking pack completion. Fixed to `??` (nullish coalescing) at three sites in each screen.
+- **SHIPPED status badge color** (#314): the SHIPPED tag-gray pill in the admin SO list now renders in the success-green palette so it visually matches its terminal-state semantics.
+- **Stray version strings** (#319): admin Settings about-card and mobile login / home footers updated from `1.5.0` to `1.9.0`.
+
+### Refactored
+
+- **`services/shipping_service.record_ship`** (#301): extracted from `api/routes/shipping.py` so the dockd POST /ship and the existing operator-flow shipping endpoint share one transactional implementation. `record_ship` accepts optional `pre_ship_status`, `shipping_cost`, and `audit_details_extra` to cover both surfaces.
+
+### Migrations
+
+- **054** (#302) -- `item_fulfillments` void columns + `dockd_idempotency` table.
+- **055** (#315) -- `sales_orders.memo TEXT`.
+
+Both migrations declare `SET lock_timeout = '5s'` + `SET statement_timeout = '60s'` and use `IF NOT EXISTS` guards per the v1.8 convention. Forward-only; existing rows have NULL for the new columns.
+
+## [v1.8.0] - 2026-05-07
+
+"Transfer Orders + Productivity Dashboard" release. Sentry now ships its first internal warehouse-to-warehouse workflow end-to-end: import a TO via CSV (with shortage detection + per-line commit), pick through the existing mobile flow via a new `pick_tasks.to_id` discriminator, batch picks into an admin-approval row, approve to move inventory source -> destination + emit `transfer.completed/1` to the outbox, or reject for re-pick. The operations-overview Dashboard is replaced with a per-user productivity grid (Picking units / Packing units / Shipped orders / Received unique SKUs / Put Away unique SKUs) backed by `audit_log` aggregation through a new compound covering index.
+
+The v1.7.0 inbound contract gains: `sales_orders.order_total` + `customer_shipping_paid` (NUMERIC(12,2)) with per-field decimal bounds in mapping docs (`max_digits` / `decimal_places` / `ge` / `le` rejected at 422 instead of silent Postgres rounding); structured per-component billing + shipping address fields (16 columns drop the v1.7 single-TEXT placeholders); inbound line items write through to `purchase_order_lines` + `sales_order_lines` so receiving + picking have something to scan against; per-token static `mapping_overrides` JSONB resolves the v1.7 `mapping_overrides` deferral (#270); inbound payload `warehouse_id` falls back to the issuing token's primary warehouse when source omits it.
+
+Five migrations (049-053). Three security carry-forwards close the v1.4 deferral set: `scrub_secrets` credential pattern catalog, `ConnectionResult.message` scrub-before-truncate, `\r` permitted with JSON-escape on emit. Breaking: v1.7 `sales_orders.billing_address` + `shipping_address` TEXT columns are dropped in favour of the structured fields; mapping docs that reference the old names fail boot loud via the #267 canonical-column validator.
+
+**Mobile.** v1.5.1 APK (`sentry-wms-v1.5.1.apk`) stays a working baseline: backend changes in v1.6 / v1.7 / v1.8 are additive and the v1.5.1 APK keeps picking + packing + receiving + putaway against a v1.8.0 backend. The v1.8 mobile build adds two cosmetic improvements for the new TO surface: the picker screen header reads "TO {to_number}" instead of "X orders" when the active batch is a TO pick, and the home-screen active-batch banner flips its label to "ACTIVE TRANSFER" + detail line "TO {to_number}". Operators on v1.5.1 picking a TO batch see the legacy "X orders" text (which renders "0 orders" since the batch has no SO links) -- functional but ugly. **Update to the v1.8 APK linked on the release page for the new TO display, or stay on v1.5.1 if you don't run TO workflows.** APK build may attach to the release shortly after tagging.
+
+### Added -- Transfer Orders
+
+- **Three new tables** (#281, mig 049): `transfer_orders` (header with source / destination / status + UUID external_id + state-machine CHECK), `transfer_order_lines` (per-item with `requested_qty` / `committed_qty` / `picked_qty` / `approved_qty` plus monotonicity CHECKs and per-line state machine), `transfer_order_approvals` (one row per picker submission with `lines_snapshot` JSONB + UUID external_id for outbound event idempotency). `pick_tasks` gains `to_id` + `to_line_id` discriminator with an XOR `CHECK` constraint that exactly one of `(so_id, to_id)` is non-NULL; existing `so_id` / `so_line_id` drop their NOT NULL so SO + TO pick rows share the same table.
+- **Service module** (`api/services/transfer_order_service.py`, #290): TO number generator (`TO-{YYYYMMDDHHMMSSmmm}` mirroring `picking_service.py`'s batch numbering at millisecond precision; route retries once on UNIQUE collision), state-machine validators (header / line / approval), `update_transfer_order_line_picked` WHERE-clause guard for atomic over-pick rejection without FOR UPDATE, header-promotion helpers (`maybe_promote_header_to_partially_picked`, `maybe_promote_header_to_awaiting_approval`), closure derivation (`evaluate_to_closure`).
+- **Admin CRUD routes** (#290): `GET /api/admin/transfer-orders` (paginated with status / source / destination filters), `GET /api/admin/transfer-orders/<to_id>` (header + lines + approval queue), `DELETE /api/admin/transfer-orders/<to_id>` (pre-pick + pre-approval, rejects with 409 `to_not_deletable` when downstream activity exists), `POST /api/admin/transfer-orders/<to_id>/cancel` (state-machine-validated, releases inventory.quantity_allocated, refuses with 409 `to_already_partially_approved` when a non-PENDING approval exists), `POST /api/admin/transfer-orders/<to_id>/lines/<line_id>/short-close` (transitions a line to SHORT_CLOSED and releases the committed - approved remainder).
+- **CSV import** (#291): `POST /api/admin/transfer-orders/import` accepts JSON `{source_warehouse_code, destination_warehouse_code, notes, records: [{sku, quantity}]}`. Pipeline: top-level Pydantic; source != destination; warehouse code -> id resolution (404 `unknown_warehouse`); per-row `TransferOrderImportRow` validation with formula-prefix protection; SKU resolution to `items.item_id` (422 `unknown_sku` with row index, no value echo); sort by item_id ASC; for each item, walk all inventory rows for `(item, source_warehouse)` under `FOR UPDATE OF inv` (deterministic lock ordering matches picking + cancel + start-picking); commit `min(requested, available)`; distribute committed across bin rows in inventory_id ASC; line status PENDING when committed > 0, SHORT_CLOSED when 0; same-millisecond TO number collision retried once on UNIQUE violation. Response carries header + shortages payload so the admin UI renders the Shortage Modal.
+- **Picking dispatch** (#292): `POST /api/admin/transfer-orders/<to_id>/start-picking` walks TO lines with `picked_qty < committed_qty`, finds inventory rows at the source warehouse, INSERTs one `pick_tasks` row per (line, bin) with `to_id` + `to_line_id` set (so_id NULL), creates a pick_batch anchor. Refuses with 409 `no_pickable_inventory` when source bins cannot fulfil; 409 `invalid_status_for_start_picking` on terminal states. `picking_service.confirm_pick` branches on the discriminator: TO picks call `update_transfer_order_line_picked` + `maybe_promote_header_to_partially_picked` and write `ACTION_TO_LINE_PICKED` audit with `entity_type='TO_LINE'`; SO picks unchanged.
+- **Submit + approve + reject** (#293): `POST /api/admin/picker/transfer-orders/<to_id>/submit` (cookie auth, no role gate -- picker-facing) snapshots lines where `picked_qty > approved_qty` into a PENDING `transfer_order_approvals` row + flips header to AWAITING_APPROVAL when all lines fully picked. `POST /api/admin/transfer-orders/<to_id>/approvals/<id>/approve` locks the approval, enforces self-approval gate via `app_settings.transfer_order_block_self_approval` (mig 049 seeded TRUE), bumps `transfer_order_lines.approved_qty`, decrements source `inventory.quantity_allocated` + `quantity_on_hand` distributing across bins in inventory_id ASC, credits destination warehouse's first Staging bin (INSERTs row when missing; 409 `no_destination_staging_bin` otherwise), checks closure via `evaluate_to_closure`, emits `transfer.completed/1` via `integration_events` outbox with `aggregate_id = to_approval_id`, `aggregate_external_id = approval.external_id`. `POST /api/admin/transfer-orders/<to_id>/approvals/<id>/reject` flips status to REJECTED with optional `rejection_reason` (max 1000 chars); NO inventory movement, NO event emission.
+- **Inventory at pick time** (#293 fix): TO `confirm_pick` does NOT decrement source inventory at pick time -- the import-time `quantity_allocated` reservation persists through pick + submit, and inventory moves source -> destination only at approval time. Rejections leave source stock available for re-pick; short-close on a line is the operator-side closeout for picks that should not return.
+- **Admin UI** (#294, single-file `admin/src/pages/TransferOrders.jsx` mirroring `SalesOrders.jsx` pattern): list view with status / source / destination filters; detail modal with header + lines table + approvals queue; per-line Short-Close + Cancel + Delete + Start Picking action buttons; CSV Import modal with client-side parse + preview + per-row error feedback; Shortage Modal with three actions (Download Shortage CSV, Cancel TO, Create with Available); Approve / Reject buttons on pending approvals; Reject sub-modal collects optional `rejection_reason`. Sidebar entry under "Warehouse" group; existing `/inter-warehouse-transfers` renamed to "Bin Transfers" to disambiguate.
+- **Mobile picker TO context** (#295): `/api/picking/active-batch` + `get_batch_tasks` + `get_next_task` LEFT JOIN `transfer_orders` so TO tasks resolve; response gains `kind` ("SO" | "TO") + `to_id` + `to_number`. Mobile picker screen header surfaces the TO context for TO batches (see Mobile note above).
+- **Sidebar pending-approvals badge** (#296): `/admin/dashboard` returns `pending_to_approvals` (warehouse-scoped to TOs whose source OR destination matches the requested warehouse_id). Sidebar maps to the `/transfer-orders` entry's badge.
+
+### Added -- Productivity Dashboard
+
+- **Backend service** (`api/services/productivity_service.py`, #297): `DASHBOARD_EVENTS` catalog maps slug to (action_type, metric_kind) for `picking` (PICK / units) / `packing` (PACK / units) / `shipped` (SHIP / orders) / `received_skus` (RECEIVE / unique_skus) / `putaway_skus` (PUTAWAY / unique_skus). Per-event aggregator with explicit JSONB field path per metric (PICK uses `details.quantity_picked`, PACK uses `details.total_items`, RECEIVE uses `details.item_id` for distinct count, PUTAWAY uses `entity_id` since the put-away action stores `items.item_id` there). 60s in-process TTL cache keyed on `(warehouse_id, start, end)` with module-level lock. Packing visibility honours `app_settings.require_packing_before_shipping`. Users sorted by total desc with tie-break on user_id asc.
+- **API endpoints** (#297): `GET /api/v1/dashboard/productivity` (cookie + ADMIN, Pydantic-validated date range capped at 90 days, 422 on `end < start` or `range_too_large`), `GET /api/v1/dashboard/preferences` (returns schema defaults when no `user_dashboard_preferences` row exists), `PUT /api/v1/dashboard/preferences` (upserts; partial body keeps other fields; `chart_order` validated against the catalog allowlist; duplicates rejected; `user_id` derived from `g.current_user`, never from body).
+- **Frontend** (#299, single-file `admin/src/pages/Dashboard.jsx` rewrite): 5-card grid (4 when packing hidden) with per-user vertical bars sorted desc by event value, top performer in Sentry red `#8e2715` and others in copper `#c4722a`. Time range selector Today / Yesterday / Last 7d / Last 30d / Custom. Charts (default) / Table view toggle with CSV export from table view. Click-to-expand replaces grid with full-size single chart + Back button. Gear-icon settings panel for chart_order rearrange + default_range / default_view; PUTs preferences on every change.
+
+### Added -- Inbound contract extensions
+
+- **`sales_orders.order_total` + `customer_shipping_paid`** (#282, mig 050): two `NUMERIC(12,2)` nullable columns. Forward-only -- existing rows have NULL after the migration.
+- **Per-field decimal bounds in mapping docs** (#285): `FieldMapping` gains optional `max_digits` / `decimal_places` / `ge` / `le` attributes for `type='decimal'` fields. `_coerce_or_default` always coerces decimals to `Decimal` (safe for psycopg2) and raises `ValueError` (-> 422 `mapping_apply_error`) on bound violation -- replaces the v1.7 silent Postgres rounding (excess scale) and 500 NumericValueOutOfRange (excess precision). Backward compatible: existing decimal mappings without bounds keep pass-through behaviour.
+- **Structured billing + shipping address** (#288, mig 053): replaces the v1.7 mig 046 `billing_address` + `shipping_address` TEXT placeholders with 16 structured columns (`billing_address_{name, line1, line2, city, state, postal_code, country, phone}` + `shipping_address_*`). CSV import + admin SO detail render + admin SO `PATCH /address` endpoint with status gate (ADMIN any status / non-admin OPEN only) + `ACTION_SO_ADDRESS_EDITED` audit with field-level delta. Operator template gets 16 worked examples replacing the 2 TEXT examples.
+- **Inbound line item write-through** (#289): `purchase_orders` + `sales_orders` inbound now writes line items to the relational `*_lines` tables (v1.7 stored them only in `inbound_*.canonical_payload` JSONB). Item resolution via `cross_system_lookup` (line declares `item_id` with `source_type: item`); helper dereferences the canonical UUID to the integer `items.item_id`. Required line shape: `item_id` + `quantity_ordered`; `line_number` auto-assigns 1..N when omitted. Re-POST replaces lines via DELETE + INSERT only when no downstream activity exists; PO `quantity_received > 0` or SO `quantity_(allocated|picked|packed|shipped) > 0` returns 409 `lines_in_flight`. Empty `line_items` array on re-POST preserves existing lines (header-only update is allowed). Items must be pre-loaded (via prior inbound POST or admin UI) so the lookup resolves; unresolved item -> 409 `cross_system_lookup_miss`.
+- **Per-token static `mapping_overrides`** (#270, mig 052): `wms_tokens` gains `mapping_overrides JSONB NOT NULL DEFAULT '{}'`. The existing `mapping_override BOOLEAN` capability flag stays as the gate; per-token overrides apply only when both the boolean is TRUE and the JSONB is non-empty. Admin issue route validates every override key against the columns of the token's `inbound_resources` canonical tables via `information_schema` (422 `unknown_mapping_overrides_keys` with the offending list). Audit shape uniform: every TOKEN_ISSUE / TOKEN_ROTATE / TOKEN_DELETE row carries `mapping_overrides_keys` (sorted, never values, empty list when no overrides). Per-request body overrides remain rejected with 403 `mapping_overrides_not_supported_in_body`. New `docs/erp-integration.md` covers the integration model + worked example + security note.
+- **Operator template extension** (#286, #299 follow-up): `db/mappings/example-template.yaml.template` gains `order_total` + `customer_shipping_paid` examples with the per-field decimal bounds attributes; pitfall #5 rewritten to describe the v1.8 per-token `mapping_overrides` semantics; pitfall #6 rewritten from "deferred to v1.8+" to the v1.8 line-write-through contract; PO + SO blocks gain working `line_items` examples demonstrating `cross_system_lookup` + the required field shape; `warehouse_id` mapping flips `required: true` -> `required: false` with a comment naming the token-fallback semantics.
+- **`warehouse_id` token fallback** (#300): when the resolved canonical_payload has no `warehouse_id` AND the token's `warehouse_ids` array carries at least one entry, the inbound handler fills in `token.warehouse_ids[0]`. Single-warehouse tokens (the common case for connector authors) get the natural fallback without per-mapping-doc plumbing; multi-warehouse tokens take the first entry. Connector authors no longer need to source-side warehouse_id when the token already encodes the destination warehouse.
+
+### Fixed -- Security carry-forward
+
+- **`scrub_secrets` credential pattern catalog** (#52). `api/utils/log_sanitize.py` gains `CREDENTIAL_PATTERNS` covering Sentry's own bearer tokens (`wms_t_`), AWS access keys (`AKIA...`), generic Bearer headers, key=value connection-string fragments, NetSuite OAuth fragments, JWT-shaped strings, and a heuristic catch-all for long base64-ish strings near credential keywords. `scrub_secrets` composes URL scrubbing + the new catalog and is idempotent. Pattern false positives are acceptable -- defence favours over-redaction. Closes the V-105 deferral that has been carried forward across v1.4 -> v1.5 -> v1.6 -> v1.7.
+- **`ConnectionResult.message` credential scrubbing** (#53). `_sanitize_connection_message` at `api/connectors/base.py` runs `scrub_secrets` between the printable-character filter and the length cap so multi-character redaction tags (`<REDACTED>`, `<JWT_REDACTED>`) cannot be split by the 500-char cap. Defence in depth: scrub at construction (this) plus scrub at log emission (existing `RedactionFilter`); a forgotten scrub at one site is caught by the other. Closes V-106.
+- **Carriage return permitted in `ConnectionResult.message` allowlist** (#55). `\r` stays in `_ALLOWED_MESSAGE_CHARS` so Windows-origin upstream errors (which use `\r\n` line endings) survive intact. Safety on emit guaranteed by JSON encoding (Pydantic `model_dump_json` escapes `\r` to `\\r`). Reverses the original V-113 recommendation (drop `\r`) per the architectural lock for Windows ERP `\r\n` survival; tests-only commit pinning the keep decision so a future cleanup pass cannot silently drop it.
+- **`#267` boot_load YAML validation verified shipped** during the v1.8.0 carry-forward sweep. The fix landed in `703e05b` (v1.7.0 branch); GitHub auto-close did not fire so the issue stayed OPEN. Closed with a verification comment naming the shipping commit + the three regression tests.
+
+### Migrations
+
+- **049** -- transfer orders (`transfer_orders` + `transfer_order_lines` + `transfer_order_approvals` + `pick_tasks` `to_id` / `to_line_id` discriminator with XOR CHECK + `app_settings.transfer_order_block_self_approval` row). XOR CHECK lands `NOT VALID` then `VALIDATE` outside the BEGIN/COMMIT so the validation lock is `SHARE UPDATE EXCLUSIVE` rather than `ACCESS EXCLUSIVE`.
+- **050** -- `sales_orders.order_total` + `customer_shipping_paid` (NUMERIC(12,2), nullable).
+- **051** -- `user_dashboard_preferences` (per-user override storage with `chart_order` JSONB + `default_range` + `default_view` CHECKs) + `ix_audit_log_dashboard` covering index on `audit_log(action_type, created_at, user_id, warehouse_id) INCLUDE (entity_id, details)` + `warehouses.timezone` (VARCHAR(64) NOT NULL DEFAULT `'America/Denver'`).
+- **052** -- `wms_tokens.mapping_overrides JSONB NOT NULL DEFAULT '{}'`.
+- **053** -- structured billing + shipping address columns (16 VARCHAR columns replacing the v1.7 `billing_address` + `shipping_address` TEXT).
+
+All five migrations declare `SET lock_timeout = '5s'` + `SET statement_timeout = '60s'` at the top so a bad migration fails fast rather than holding ACCESS EXCLUSIVE during a long table rewrite (new v1.8.0 convention). `BEGIN/COMMIT`-wrapped per V-213.
+
+### Breaking changes
+
+- **`sales_orders.billing_address` + `shipping_address` TEXT columns dropped** (mig 053). Replaced with 16 structured per-component columns. Mapping docs that still reference the old names fail boot loud via the #267 canonical-column validator with the offending file path + field name. No production deployments existed at v1.7.0 ship; the rollout is forward-only.
+- **Old operations-overview Dashboard removed** (#299). `/admin/dashboard` route (legacy ops-overview JSON) stays for the sidebar badge counts, but the admin panel's `/` route now renders the per-user productivity grid; the previous open SOs / open POs / short-picks tables are dropped from the dashboard surface. Operators who relied on those find them on `/sales-orders`, `/purchase-orders`, and `/audit-log` respectively.
+
+### Reserved for v1.9
+
+- **Power User role** (#298). Third role tier between USER and ADMIN that admits admin panel login but locks the System sidebar group. Per-route audit + frontend gating documented in the issue.
+- **`ship.confirmed/1` event payload extension for structured shipping address** (deferred from #289). Out-of-scope for v1.8 since the v1.9 dockd integration is the actual consumer.
+- **Per-request body `mapping_overrides`** (#270 follow-up). Per-token static config (Option B) is the v1.8 surface; per-request body (Option A) and per-mapping-document escape hatches (Option C) remain deferred until real demand surfaces.
+
+### Operator notes
+
+- After deploy: restart api workers so the new `mapping_overrides` column is in the token cache shape. Existing tokens auto-populate with `'{}'` from the migration's NOT NULL DEFAULT.
+- TO inventory locking pattern: import + cancel + start-picking + approve + short-close all walk inventory rows in `inventory_id ASC` to share the picking_service lock ordering (deadlock prevention). Concurrent SO + TO operations on the same item stay safe.
+- Productivity Dashboard cache: 60s TTL per `(warehouse_id, start, end)` per worker. Restart workers if you need fresh reads inside the TTL.
+- Transfer Order destination warehouse: must have at least one Staging bin. Approve fires 409 `no_destination_staging_bin` otherwise; operator adds a Staging bin to the destination warehouse's bins before re-trying.
+
+## [v1.7.0] - 2026-05-06
+
+"Inbound (Pipe B)" release. External systems can now POST canonical-shaped resource updates to Sentry through five new endpoints under `/api/v1/inbound/`: `sales_orders`, `items`, `customers`, `vendors`, and `purchase_orders`. Each request carries `external_id` + `external_version` + `source_payload`; per-source mapping documents (YAML at `db/mappings/<source_system>.yaml`) translate the source payload into Sentry's canonical model with strict-typed Pydantic validation, JSONPath resolution, simpleeval-sandboxed derived expressions, and `cross_system_lookup` for canonical UUID resolution against prior ingestions. `X-WMS-Token` authentication gains `source_system` + `inbound_resources` scope dimensions on top of the v1.5 endpoint scope. `inbound_source_systems_allowlist` gates which source systems can POST; misconfigured allowlist or missing mapping doc refuses boot loud.
+
+Twelve new migrations (037-048). One new env var (`SENTRY_INBOUND_SOURCE_PAYLOAD_RETENTION_DAYS`); two existing env vars gain new shape (`SENTRY_INBOUND_MAX_BODY_KB` boot-validated, `SENTRY_INBOUND_MAPPINGS_DIR` default changed to absolute `/db/mappings`). Three boot validators reject misconfiguration loud at startup: canonical-column shape (#267), eval-shape derived expressions (#272), and `SENTRY_INBOUND_MAX_BODY_KB` range (#273). audit_log strict-by-log_id chain integrity hardened against concurrent insert via sentinel-lock + nextval-in-trigger (#271). Direct-DB revoke of `wms_tokens.revoked_at` propagates auth invalidation across workers via `pg_notify` trigger + LISTEN subscriber + lock-step status flip (#274, #278).
+
+Mobile is unchanged. The cookie-auth admin surface is unchanged outside the new Inbound activity page (read-only) and the token-create modal extensions for `source_system` + `inbound_resources` scope. The outbound webhook dispatcher (v1.6) and the polling endpoints (v1.5) are unchanged.
+
+Pre-merge gate ran a 25-point verification matrix; the inbound burst load test (gate 25) is operator-run via `tools/loadtest/inbound_v1_7.js` (k6) per the baselines documented in `docs/loadtest.md`.
+
+### Added -- Inbound API surface
+
+- **Five POST endpoints under `/api/v1/inbound/`** (#253, #254, #255, #256, #257). One per canonical resource (sales_orders, items, customers, vendors, purchase_orders). Shared 10-step handler covering external_id + external_version validation, advisory-lock on `(source_system, external_id)` to serialize concurrent upserts on the same key, stale-version 409, mapping-doc apply, canonical INSERT-or-UPDATE, cross_system_mappings registration, source_payload staging, and audit_log on terminal state. Every response carries the `X-Sentry-Canonical-Model: DRAFT-v1` header. 422 on Pydantic body validation failure (`extra='forbid'` rejects typo'd field names at the wire), 413 when `Content-Length` exceeds `SENTRY_INBOUND_MAX_BODY_KB`, 409 on stale_version / cross_system_lookup_miss / lock_held (with `Retry-After: 1` header).
+- **`GET /api/v1/inbound/mapping-schema`** (#251). Unauthenticated documentation aid that emits the JSON Schema (Draft 2020-12) consumers and tooling use to validate `db/mappings/<source_system>.yaml` offline. `Cache-Control: public, max-age=300` so the response is cacheable at any HTTP intermediary. Schema lives committed at `docs/api/inbound-openapi.yaml` alongside the live generator (`api/services/inbound_openapi.py`); a parity test (`test_inbound_openapi_parity.py`) and a CLI `--check` mode (`tools/scripts/regenerate-inbound-openapi.py`, #276) refuse drift in CI.
+- **Cross-direction + per-resource scope on `@require_wms_token`** (#252). Inbound POST routes use the new `inbound_resources` array (Decision-S; separate dimension from `event_types`). A token tried against a non-matching surface returns 401 with `error_kind=cross_direction_scope_violation`; an inbound token whose `inbound_resources` does not list the targeted resource returns 401 with `error_kind=inbound_resource_scope_violation`. Empty `inbound_resources` denies (matches `event_types` empty-deny semantics).
+
+### Added -- Mapping document format + boot validation
+
+- **`api/services/mapping_loader.py`** (#248, #249). Pydantic-strict (`extra='forbid'`) schema for the per-source_system YAML. JSONPath via the maintained `jsonpath-ng` fork; derived expressions via `simpleeval` with a function whitelist (`int`, `float`, `str`, `len`, `abs`, `min`, `max`, `round`); subscript / attribute access restricted; `__import__` / `eval` / `exec` rejected. Cross-system lookup misses on required-true fields raise 409 `cross_system_lookup_miss` carrying the `(source_system, source_type, source_id)` tuple. `version_compare` is required at the top level: `iso_timestamp` (parsed via `datetime.fromisoformat`), `integer` (numeric), or `lexicographic`. simpleeval pinned to 1.0.5 in api/requirements.txt (#249).
+- **`mapping_loader.boot_load`** (#250). Loads every `<source_system>.yaml` under `SENTRY_INBOUND_MAPPINGS_DIR` (default `/db/mappings` per #279); cross-checks against `inbound_source_systems_allowlist`; refuses boot when an allowlisted source has no doc on disk OR a doc has no allowlist row. Writes one `MAPPING_DOCUMENT_LOAD` audit_log row per loaded doc carrying `source_system`, `path`, `sha256`, `mapping_version`, `version_compare`, `resource_count`, and `git_sha_if_available` so investigators can trace which mapping doc was active when a given inbound POST was processed.
+- **Canonical-column boot validator** (#267). Cross-checks every mapping doc field's `canonical:` name against `information_schema.columns` for the target canonical table. A typo'd or stale field name fails boot loud with the file path, resource block, and offending field rather than 500'ing on the first inbound POST. Also adds `sales_orders.billing_address` and `shipping_address` (`text` columns; #266) so the gate-test mapping resolves cleanly.
+- **Eval-shape boot rejection** (#272). Static AST walker (`_validate_expression_shape`) rejects derived expressions whose AST contains `Name` nodes outside the function whitelist plus `source`, `Attribute` whose attr starts with `_`, or `Call` whose func is not a whitelisted callable. Single-sourced helper called from both `_eval_derived` (apply-time) and `boot_load` (boot-time) so a malicious expression in a never-reached `when_present`-gated branch cannot sit dormant in a loaded doc.
+- **Operator-facing mapping doc template** (#280). Annotated `db/mappings/example-template.yaml.template` covering all five resources with every required canonical column marked `required: true` + a comment naming the schema constraint, every supported `type:` (string / integer / decimal / boolean / uuid / iso_timestamp / enum), all three `version_compare` strategies, `cross_system_lookup` examples on `sales_orders.customer_id` and `purchase_orders.vendor_id`, and a footer block listing common pitfalls. The `.template` suffix is filtered out by `load_directory` so boot does not try to load it.
+
+### Added -- Admin panel inbound surface
+
+- **Token-create modal extensions** (#258). The admin token issuance surface gains `source_system` (dropdown sourced from `inbound_source_systems_allowlist`) and `inbound_resources` (multi-select) fields; existing `event_types`, `endpoints`, and `warehouse_ids` stay independent so a token can be outbound-only, inbound-only, or both. The `mapping_override` capability checkbox is present in the UI but the v1.7.0 handler rejects requests carrying `mapping_overrides` regardless of token capability (#269; see Reserved for v1.7.1 below).
+- **Inbound activity page** (#259). Read-only admin page listing recent inbound rows joined to the issuing token + source_system + canonical resource; filters by source_system, resource, status (`accepted` / `stale_version` / `lookup_miss`), and time range. Per-row drilldown shows the staged `source_payload` JSON, the resolved `canonical_payload`, and the audit_log entry from the upsert.
+
+### Added -- Retention + cleanup
+
+- **`source_payload` retention beat task** (#260). Celery beat task NULLs out the staged `source_payload` JSONB column past `SENTRY_INBOUND_SOURCE_PAYLOAD_RETENTION_DAYS` (default 90 days) so forensic context falls off on a documented schedule. `inbound_cleanup_runs` log table records every run's `resource`, `retention_days`, `rows_affected`, and `status` for operator audit. **7-day hard floor** at boot via `app.create_app()` validator (V-201 shape): a typo'd or zero retention refuses to start the api rather than silently wiping forensic context every cycle.
+- **Migration 045 makes `source_payload` nullable**. The retention beat task NULLs the column rather than DELETing rows so cross_system_mappings + canonical FKs stay intact and investigators can still see `external_id` / `external_version` / `canonical_payload` post-retention.
+
+### Added -- Hygiene + CI guardrails
+
+- **CI lint suite for v1.7.0 inbound** (#262). New `test_inbound_ci_lints.py` covers: no `eval` / `exec` / `compile` / `__import__` in `mapping_loader.py` source; every loaded mapping doc declares a valid `version_compare`; the mappings directory is reachable from CI's path resolution. OpenAPI parity test asserts `docs/api/inbound-openapi.yaml` matches the live `services.inbound_openapi.build_inbound_openapi()` output.
+- **`tools/scripts/regenerate-inbound-openapi.py` `--check` mode** (#276). Default writes the YAML in place; `--check` exits non-zero on drift with a unified-diff naming the regen command; `--stdout` for backward-compat. Wired into `.github/workflows/test.yml` as a fast-fail step before the database loads. Tolerates output paths outside the repo root (#276 follow-up) for tmp-path tests.
+- **k6 load test for the inbound burst (gate 25)** (#277). `tools/loadtest/inbound_v1_7.js` drives all five inbound endpoints with realistic payloads and unique `external_id` per VU iteration. Default profile: 5/20/0 VU ramp, 300ms p95, 1000ms p99, sub-0.1% 5xx rate. Stress profile: 10/50/0 ramp, 800ms p95, 2000ms p99. Operator-run via `docs/loadtest.md`; not wired into CI (GitHub Actions runner neighbor noise is too unstable for run-over-run trend tracking).
+
+### Fixed -- Pre-merge gate
+
+- **`mapping_overrides` capability disabled in v1.7.0** (#269). The v1.7.0 inbound handler rejects every request carrying `mapping_overrides` with 403 `feature_not_available_in_v1_7_0`, regardless of the token's `mapping_override` capability flag. The capability checkbox stays in the admin UI for forward-compatibility; the runtime behavior is reserved for v1.7.1 pending the semantics decision in #270 (source-path remap vs canonical-value-replacement).
+- **audit_log chain serialization under concurrent insert** (#271). Pre-#271 the V-025 chain trigger read `prev_hash` without serialization: two concurrent inserts both saw the same prev_hash, computed distinct row_hashes, and forked the strict-by-log_id chain. Two earlier iterations (`pg_advisory_xact_lock`, then `SELECT FOR UPDATE` on a sentinel) did not hold under READ COMMITTED snapshot semantics + BIGSERIAL DEFAULT timing. Final form (migration 047): drop the BIGSERIAL DEFAULT, add `audit_log_chain_head` sentinel table, replace the trigger to acquire `LOCK TABLE audit_log_chain_head IN EXCLUSIVE MODE` and assign `NEW.log_id := nextval('audit_log_log_id_seq')` inside the critical section. log_id-order matches trigger-execution-order; per-row tamper evidence + strict-by-log_id integrity both hold under concurrent insert. Regression coverage in `test_audit_log_chain_concurrency.py` (boot burst: 8 writers x 5 inserts; runtime burst: 4 concurrent inserts). Documented in `docs/audit-log.md`.
+- **Boot-time eval-shape rejection of mapping docs** (#272). See Added -- Mapping document format above.
+- **`SENTRY_INBOUND_MAX_BODY_KB` boot validator for [16, 4096] range** (#273). Pre-#273 `get_max_body_kb()` silently clamped to `[16, 4096]` and silently fell back to 256 on parse failure: a typo (e.g., `42096` vs `4096`) silently degraded with no signal at deploy time. Boot guard (V-201 shape) refuses to start on parse failure or out-of-range values; runtime helper trusts the boot guard rather than re-clamping silently.
+- **Direct-DB revoke propagates auth invalidation** (#274). AFTER UPDATE OF `revoked_at` trigger (migration 048) fires `pg_notify('wms_token_revocations', token_id::text)` on every NULL -> NOT NULL transition, regardless of whether the writer is the Flask admin handler or a direct `UPDATE wms_tokens SET revoked_at = NOW()`. New daemon thread in `services.token_cache` LISTENs on the channel via a dedicated AUTOCOMMIT psycopg2 connection and calls `_invalidate_token_id_local` on receipt. Independent of Redis: a deployment without Redis still gets sub-second cross-worker invalidation for direct-DB revokes.
+- **Auth-check gap on direct-revoke** (#278). #274 shipped infrastructure (cache invalidation works) but the auth gate still checked only `status == 'active'`; a row whose `revoked_at` was set by direct UPDATE (without `status='revoked'`) authenticated until the cache TTL expired. Mig 048's trigger now also issues `UPDATE wms_tokens SET status = 'revoked'` in lock-step (idempotent; skipped when status is already revoked). `auth_middleware.py` adds a defense-in-depth second 401 gate rejecting `revoked_at IS NOT NULL` regardless of status. Pre-merge gate 17 caught the original gap; the fix re-passes the gate.
+- **Allowlist TRUNCATE forensic trigger reachability documented** (#275). `tr_inbound_source_systems_allowlist_audit_truncate` is reachable only via `TRUNCATE inbound_source_systems_allowlist CASCADE`. Plain TRUNCATE raises `ForeignKeyViolation` before the trigger fires (six v1.7 inbound tables and `cross_system_mappings` declare NOT NULL FKs into `source_system`; `wms_tokens` declares a nullable FK). Schema and migration 037 carry comment blocks; `docs/audit-log.md` gains an operator-facing section. Regression test pins both paths plus the unconditional DELETE forensic path.
+- **`SENTRY_INBOUND_MAPPINGS_DIR` default points at canonical `/db/mappings`** (#279). Pre-fix the relative `"db/mappings"` default leaked the api container's CWD `/app` into the path; operators following the repo-root `db/mappings/.gitkeep` breadcrumb had their mapping docs silently ignored. Default changed to absolute `/db/mappings` matching the docker-compose `./db:/db` volume mount. Operator-facing template (#280) moved to `db/mappings/example-template.yaml.template`; the obsolete `api/db/mappings/` directory removed.
+- **`TEST_DATABASE_URL` hard-fail in conftest** (#265). Pre-v1.7 the test conftest connected to the application database via `DATABASE_URL` and TRUNCATEd 39 tables at session start; v1.7 added operator-managed state (`inbound_source_systems_allowlist`, `cross_system_mappings`) which made that wipe a real footgun. Conftest now refuses to proceed unless `TEST_DATABASE_URL` is set and distinct from `DATABASE_URL`; the test process overrides `DATABASE_URL` with the test value so all downstream code reaches the test DB.
+- **Three migration shape tests' source_payload nullability** (#261). Three pre-existing migration shape tests asserted `source_payload IS NOT NULL`; updated to match migration 045.
+
+### Migrations
+
+- **037** -- `wms_tokens` inbound columns (`source_system`, `inbound_resources`, `mapping_override`) + `inbound_source_systems_allowlist` table + DELETE / TRUNCATE forensic triggers. BEGIN/COMMIT-wrapped per V-213.
+- **038** -- `cross_system_mappings` table + audit + DELETE / TRUNCATE forensic triggers.
+- **039-043** -- One staging table per inbound resource (`inbound_sales_orders`, `inbound_items`, `inbound_customers`, `inbound_vendors`, `inbound_purchase_orders`) with `source_payload JSONB`, `canonical_payload JSONB`, `external_id` + `external_version` + `ingested_via_token_id` + `received_at` columns, partial indexes for stale-version lookups + cleanup. New canonical `customers` and `vendors` tables (UUID PK, denormalized address + contact columns) for resources that lacked a v1.5 canonical home.
+- **044** -- `inbound_cleanup_runs` log table for the retention beat task.
+- **045** -- `inbound_*.source_payload` made nullable so the retention beat task can NULL it out without losing the row's external_id / external_version / canonical_payload.
+- **046** -- `sales_orders.billing_address` + `shipping_address` columns (#266) so the gate-test mapping resolves cleanly.
+- **047** -- audit_log chain serialization fix (#271). Drops `audit_log.log_id BIGSERIAL DEFAULT`, adds `audit_log_chain_head` sentinel table, replaces the chain-hash trigger to acquire `LOCK TABLE audit_log_chain_head IN EXCLUSIVE MODE` and assign `NEW.log_id := nextval(...)` inside the critical section.
+- **048** -- `wms_tokens` AFTER UPDATE OF `revoked_at` trigger (#274, #278). Fires `pg_notify('wms_token_revocations', token_id::text)` on NULL -> NOT NULL transitions; flips `status` to `'revoked'` in lock-step (idempotent) so the auth-side `status=='active'` gate de-authenticates the token without waiting on cache TTL.
+
+All twelve migrations are small DDL operations against new or existing tables (one short backfill in 045 making the column nullable; no large rewrites). No long locks. Operators applying v1.7.0 to a v1.6.x deployment apply 037-048 in numeric order before bringing the new compose stack up; the api container's `boot_load()` and the inbound POST handlers will fail until those tables and triggers exist.
+
+### Breaking changes
+
+- **`TEST_DATABASE_URL` is now required for `pytest`** (#265). The conftest TRUNCATEs 39 tables at session start; running against the application DB is no longer permitted. Set `TEST_DATABASE_URL` to a dedicated database (e.g., `postgresql://sentry:sentry@localhost:5432/sentry_test`); the default docker-compose stack creates `sentry_test` in the db init scripts. CI workflow already provisions and forwards both env vars.
+- **`SENTRY_INBOUND_MAPPINGS_DIR` default changed** (#279). Default was `"db/mappings"` (relative); now `"/db/mappings"` (absolute, matching the docker-compose `./db:/db` volume mount). Deployments that explicitly set the env var are unaffected. Deployments relying on the default need no action when running the standard compose stack; deployments running outside docker should set the env var to the operator's intended path.
+- **`SENTRY_INBOUND_MAX_BODY_KB` is boot-validated** (#273). Pre-fix the helper silently clamped out-of-range values to `[16, 4096]` and fell back to 256 on parse failure. The api now refuses to boot on parse failure or out-of-range values; deployments with a typo'd value (e.g., `42096` vs `4096`) will see a clear error at startup rather than the silent degradation.
+
+### Reserved for v1.7.1
+
+- **`mapping_overrides` capability** (#269; see #270). The InboundBody schema accepts a top-level `mapping_overrides` dict, and the `wms_tokens.mapping_override` capability flag is present, but the v1.7.0 handler rejects every request carrying `mapping_overrides` with 403 `feature_not_available_in_v1_7_0` regardless of token capability. Reserved for v1.7.1 pending the source-path-remap-vs-canonical-value-replacement semantics decision tracked in #270.
+
+### Known limitations
+
+- **`sales_orders.billing_address` + `shipping_address` are DB-only in v1.7.0** (#268). Migration 046 adds the columns and the boot validator accepts mapping docs that target them, but rollout to CSV exports, the admin panel, and outbound webhook envelopes is tracked separately and lands in a follow-up release.
+- **No mapping-doc hot-reload.** Edits to `<source_system>.yaml` files take effect on api container restart. Every restart writes a fresh `MAPPING_DOCUMENT_LOAD` audit row carrying the file's sha256 so investigators can correlate which mapping doc was active when a given inbound POST was processed.
+- **Empirical inbound throughput / tail latency is operator-measured** (#277). Gate 25 (the inbound burst load test) is operator-run via `tools/loadtest/inbound_v1_7.js` against a staging stack. CI does not exercise this surface because GitHub Actions runner neighbor noise is too unstable for run-over-run trend tracking.
+
+### Changed -- licensing
+
+- **License changed from MIT to Apache 2.0.** Pre-v1.7.0 tagged releases remain MIT-licensed; v1.7.0 and later are Apache 2.0. See `LICENSE` and `NOTICE` for the canonical license text and project attribution. The legacy `NOTICES.md` (third-party font attributions) is renamed to `NOTICE` per Apache convention so a single file at the repo root carries both the project's Apache 2.0 attribution and the bundled third-party assets list. SPDX `Apache-2.0` identifier added at the project level in `admin/package.json`, `mobile/package.json`, and the `packages.""` blocks of both lockfiles.
+
+### Notes for operators
+
+- **`SENTRY_INBOUND_SOURCE_PAYLOAD_RETENTION_DAYS`** -- staging-row forensic retention. Default 90 days; hard floor 7 days enforced at boot. The retention beat task NULLs `source_payload` rather than DELETing rows so cross_system_mappings + canonical FKs stay intact.
+- **`SENTRY_INBOUND_MAX_BODY_KB`** -- per-request body cap. Defaults to 256; valid range `[16, 4096]`. Boot refuses out-of-range values rather than silently clamping (#273).
+- **`SENTRY_INBOUND_MAPPINGS_DIR`** -- mapping doc directory. Default `/db/mappings` (absolute, matches the docker-compose `./db:/db` mount per #279). Override only when running outside docker.
+- **api/version.py is intentionally not bumped in this commit**, mirroring the v1.6.0 / v1.6.1 release pattern. The runtime `check_build_version` compares `__version__` to the BUILD_VERSION file written by Dockerfile; a change there couples to the next image rebuild cycle.
+- **Pre-merge gate items the operator runs:** browser sweep against the new admin Inbound activity page (token-create modal with source_system + inbound_resources scope; activity page filters; per-row source_payload + canonical_payload drilldown); Chainway C6000 smoke test (existing receive / pick / pack / ship workflows still pass against a deployment with the new inbound surface enabled); k6 load test (`tools/loadtest/inbound_v1_7.js`) against a staging stack with at least one allowlisted source_system and a representative mapping doc.
+- **Upgrade procedure:** `git pull && docker compose down && docker compose build && docker compose up -d`. The BUILD_VERSION guard (#73) catches skipped rebuilds. **Existing v1.6.x deployments must apply migrations 037-048 in numeric order before bringing the new compose stack up;** the api container's `boot_load()` cross-check + the inbound POST handlers + the audit_log chain trigger + the wms_tokens revocation_notify trigger all assume the new shape. **For each source_system you intend to ingest from:** insert an `inbound_source_systems_allowlist` row with the matching `kind` (`connector` / `internal_tool` / `manual_import`); place a `<source_system>.yaml` mapping doc at `db/mappings/` (start from `db/mappings/example-template.yaml.template`); issue a token via the admin panel with the matching `source_system` + `inbound_resources` scope. Boot will fail loud on mismatch; the failure path is recoverable.
+- **No mobile APK ships with v1.7.0.** v1.7.0 has no mobile code changes beyond the version-string bumps for BUILD_VERSION-guard consistency (`mobile/package.json`, `mobile/app.json`, `mobile/package-lock.json` all 1.6.1 -> 1.7.0; `versionCode` 4 -> 5). The mobile dep tree is byte-for-byte identical to v1.6.1. Operators on the v1.5.1 APK (`sentry-wms-v1.5.1.apk`) should stay on it; v1.5.1 carries the dep-tree security overrides from #158 and #61.
+
+## [v1.6.1] - 2026-05-03
+
+Security patch release closing 22 findings (V-300 through V-321) from the post-v1.6.0 audit on the new outbound webhook surface. The audit applied a webhook-classes lens (SSRF, signature timing, retry-storm amplification, secret-rotation race windows, DLQ poisoning, replay-batch amplification, downstream consumer trust boundaries, cross-worker pubsub integrity) plus the v1.5.1 21-class regression check; 22 findings landed, every one fixed in this release. No deferrals.
+
+Three new migrations (034-036). Five new env vars (`SENTRY_PUBSUB_HMAC_KEY`, `DISPATCHER_HTTP_CONNECT_TIMEOUT_MS`, `DISPATCHER_HTTP_READ_TIMEOUT_MS`, `DISPATCHER_REPLAY_BATCH_GLOBAL_BUDGET`, `DISPATCHER_REPLAY_BATCH_GLOBAL_WINDOW_S`). No schema changes that block the rollout: every migration is small DDL on existing or new tables (column add + backfill on the tombstone canonicalization, two new audit-trigger tables, two CHECK constraints with defensive cleanup of any out-of-band rows).
+
+Mobile is unchanged. The cookie-auth admin surface is unchanged outside the response-body fields surfaced by the replay-batch breakdown and the new `hint` field on PATCH responses for paused-by-ceiling subscriptions. The polling endpoints from v1.5 are unchanged.
+
+### Fixed -- Tombstone gate (chained pair)
+
+- **Tombstone gate URL canonicalization (#218).** Pre-#218 the URL-reuse gate matched on the raw `delivery_url_at_delete` column. `https://victim/hook` and `https://Victim/hook`, `https://victim/hook/`, `https://victim:443/hook`, `https://victim/hook#fragment` were distinct keys; one-character casing or default-port mutations bypassed the gate without supplying `acknowledge_url_reuse`. New `canonicalize_delivery_url` helper is the single source of truth (lowercases scheme + host, strips default port for the scheme, strips fragment, collapses non-root trailing slash). Migration 034 adds `delivery_url_canonical` alongside the raw column, backfills via a PL/pgSQL twin of the helper, and swaps the partial unique index over to the canonical column. The raw column stays for forensic recall.
+- **PATCH endpoint runs the tombstone gate on `delivery_url` change (#219).** Pre-#219 the PATCH path validated a new URL against scheme + the dispatch-time SSRF guard but did NOT consult `webhook_subscriptions_tombstones`. A compromised admin (or CSRF target) could create a fresh subscription pointed at any URL, then PATCH it to a previously-tombstoned URL, taking over the deleted URL with no acknowledgement trail. Extracts a shared `_check_url_tombstone` helper called from both POST and PATCH so the lookup shape and 409 response body are identical across surfaces; `acknowledge_url_reuse` is now accepted on `UpdateWebhookRequest`. The acknowledgement UPDATE stamps the tombstone in the same transaction as the PATCH UPDATE.
+
+### Fixed -- HMAC + secret material
+
+- **`SecretMaterial` refuses pickle (#220).** The wrapper relies on `__slots__` + `__repr__` / `__str__` refusal to keep HMAC plaintext from leaking into logs and tracebacks. The default `__slots__` pickle path serializes the slot values via `copyreg.__reduce_ex__`, writing `_plaintext` into the pickle stream verbatim and silently bypassing every refusal the wrapper documents. Override `__reduce_ex__`, `__reduce__`, `__getstate__`, and `__setstate__` to raise `TypeError` naming the safe access path; the same constant message covers every protocol version (0 through HIGHEST), `copy.copy` / `copy.deepcopy`, and any future serialization layer (multiprocessing IPC, joblib, APM local-capture, shelve).
+- **Single-serialization runtime check raises `SingleSerializationViolation` instead of `assert` (#221).** Python `-O` and `PYTHONOPTIMIZE=1` strip assertions at compile time; a production deployment under those flags lost the `body == signed_body_for_assertion` defense silently, and a body mismatch introduced by logging middleware would ship unsigned. Replaced with an explicit `raise SingleSerializationViolation` (a `RuntimeError` subclass) so the check is part of the emitted bytecode regardless of optimization level. The dispatch loop catches the new class by name and re-raises (preserving the "surface loudly, do not reclassify as a generic delivery failure" behavior). CI lint sentinel pins the new shape so a downgrade-style reversion surfaces here too.
+- **Secret-rotation race closed via `SELECT FOR SHARE` (#225).** Pre-#225 `load_secret_for_signing` read `webhook_secrets` without a row lock; concurrent rotation could demote `gen=1` to `gen=2` between the dispatcher's read and its sign + send, so the wire stamped `X-Sentry-Signature-Generation: 1` while the actual key was now stored as `gen=2`. Add `FOR SHARE` to the dispatcher's SELECT so rotation's UPDATE/DELETE/INSERT on `webhook_secrets` blocks until the dispatcher commits its sign + stamp. Project the row's actual `generation` column into the returned `SecretMaterial` and stamp it onto `webhook_deliveries.secret_generation` before the HTTP send (committing in between releases the FOR SHARE lock so rotation wait is bounded by sign duration in microseconds, not the up-to-10s HTTP round-trip). Strict-generation consumers stay in sync with rotation.
+
+### Fixed -- Cross-worker pubsub integrity
+
+- **HMAC-signed `webhook_subscription_events` envelope (#227).** The pre-#227 channel accepted unauthenticated JSON. SECURITY.md explicitly assumes Redis may be compromised; an attacker with publish rights could forge `event="deleted"` (eviction storm; audit_log shows no DELETE), spam `event="secret_rotated"` (DB-read amplification), or `event="delivery_url_changed"` (forced TLS handshakes per delivery). New `pubsub_signing` module owns `load_key` / `sign` / `verify` / `build_envelope` / `parse_envelope` keyed on a new env var `SENTRY_PUBSUB_HMAC_KEY`; the wire envelope is `{"sig": "<hex>", "payload": "<inner-json>"}` with the inner payload sorted-keys-canonical so publisher and subscriber always agree. Subscriber verifies via `hmac.compare_digest` before enqueueing; unsigned, tampered, or wrong-keyed messages log at WARNING and drop. Boot guard refuses dispatcher (and api) boot on unset / placeholder / short keys; `DISPATCHER_ENABLED=false` keeps the kill switch usable without the key. Both api and webhook-dispatcher containers receive the var via docker-compose; CI workflow exports a 32-byte test key.
+
+### Fixed -- Replay-batch hardening
+
+- **Pre-INSERT `pending_ceiling` check on replay-batch (#222).** Auto-pause in `deliver_one` only fires AFTER a delivery attempt; replay-batch INSERTed N pending rows in one statement BEFORE any attempt, sidestepping the rail. A batch matching `pending_ceiling` rows could land at the ceiling and drain it without auto-pause ever firing. Compute `current_pending + impact > pending_ceiling` upfront and refuse 409 with structured `current_pending` / `impact_count` / `pending_ceiling` / `gap` fields. Not waivable: the `acknowledge_large_replay` flag covers the per-batch hard cap; the ceiling is the safety rail and stays independent.
+- **`SELECT FOR UPDATE` on the replay-batch subscription row (#223).** Pre-#223 the 60-second per-subscription throttle SELECT and the audit_log INSERT ran in the same transaction without a row-level lock against concurrent replay-batches. Two HTTP requests racing each other could both pass the throttle SELECT before either committed its audit row, so both batches landed within the same window. `FOR UPDATE` serializes concurrent replay-batches on the same subscription so the throttle SELECT becomes consistent within the locked window; mirrors the lock PATCH and rotate-secret already hold for the same TOCTOU reason.
+- **Aggregate (cross-subscription) replay-batch throttle (#224).** The 60-second per-subscription bucket was sized for the operator-double-click case. A compromised admin who creates N subscriptions all pointing at the same consumer URL bypasses it by a factor of N. New global throttle counts every `WEBHOOK_DELIVERY_REPLAY_BATCH` audit_log row across the deployment in a rolling window; refuses 429 once full. Defaults: 5 batches per 5 minutes, both tunable via env (operator-only). Same audit_log source-of-truth as the per-subscription throttle so a missed-trigger restart cannot reset either timer.
+- **Replay-batch reports matched-but-pruned count breakdown (#233).** The replay-batch impact COUNT used a LEFT JOIN to `integration_events` so rows whose underlying event was pruned (90-day retention beat task) silently disappeared from the count when an `e.*` predicate (event_type / warehouse_id) was in play. Operators got a smaller count than the real DLQ count and a forensic query against audit_log could not surface what was lost. Surface `matched_with_event_data` (replayable) + `matched_without_event_data` (pruned, cannot be re-dispatched) on both the response body and audit_log details. The response carries a `detail` field naming the pruned-row count when non-zero.
+
+### Fixed -- HTTP client
+
+- **Response body buffering capped at 64KB (#226).** `session.post` ran without `stream=True`, so requests buffered the entire response body into memory before returning. The dispatcher never inspects the body (error_detail comes from the server-owned catalog; consumer bodies are intentionally discarded to avoid making the DLQ viewer a credential-exfiltration channel). A malicious or misconfigured consumer that streamed a multi-GB 5xx body spiked the worker's RSS by gigabytes per delivery; with 16 concurrent workers, total RSS climbed proportionally. Pass `stream=True` and close the response in a finally block so the underlying connection returns to the urllib3 pool without draining the body. Refuse oversized advertised `Content-Length` up front: a header that promises more than 64KB reclassifies the response as a 5xx-class failure regardless of status code.
+- **Tuple HTTP timeouts + wall-clock watchdog (#237).** The pre-#237 `HttpClient` passed a single float to `session.post(..., timeout=...)`; requests interprets that as the per-operation idle cap, not a wall-clock total. A consumer that drips one byte every 9 seconds under a 10s read timeout could keep the connection alive forever; with 16 workers, an attacker could pin every worker on a slow consumer. Pass timeout as `(connect, read)` and wrap the call with a thread watchdog enforcing a hard wall-clock cap on the entire send. The orphaned request thread continues until the per-op read timeout fires (or process exit). Two new env vars `DISPATCHER_HTTP_CONNECT_TIMEOUT_MS` (default 5000) + `DISPATCHER_HTTP_READ_TIMEOUT_MS` (default 8000); `DISPATCHER_HTTP_TIMEOUT_MS` keeps its 10000 default but is now the wall-clock cap. env_validator boot guard refuses configurations where either per-op cap exceeds the wall-clock cap.
+
+### Fixed -- Subscription state propagation + filter validation
+
+- **PATCH publishes `subscription_filter_changed` on filter mutation (#229).** `_VALID_SUBSCRIPTION_EVENT_KINDS` gains the new kind; PATCH appends it to the audit-row events list and the cross-worker channel when the filter actually mutates. The fanout's existing fall-through covers the new kind without further wiring. Filter changes stay non-retroactive: the cursor never rewinds, so events committed before the PATCH that match the new filter but not the old do NOT re-deliver. Operators backfilling reach for the replay-batch endpoint. Documented in `docs/api/webhooks.md`.
+- **PATCH publishes `ceiling_changed` and surfaces a non-resume hint (#230).** Adds `ceiling_changed` to the cross-worker kinds; one publish per PATCH regardless of which ceiling(s) changed. When the operator lifts the ceiling that paused the subscription but does NOT also flip `status=active`, the response carries a `hint` field naming the follow-up step. Resume stays an explicit operator decision; ceiling changes never auto-resume.
+- **Empty `subscription_filter` array refusal (#231).** Pre-#231 `subscription_filter={"event_types": []}` looked like "deliver no events" but actually meant "deliver every event": the dispatcher's filter clauses are truthy-gated on each list field, so an empty list emits no SQL clause. The subscription_filter module's docstring acknowledged the gap; the rejection was never implemented. New `_reject_empty_filter_arrays` helper called from POST and PATCH refuses any of `event_types`, `warehouse_ids`, `aggregate_external_id_allowlist` set to `[]` with a 400 `empty_filter_array` response naming the field; operators who want "no events" use `status='paused'`, operators who want "all values" omit the field.
+- **Malformed `subscription_filter` fails closed (#232).** Pre-#232, a Pydantic parse failure on the JSONB column logged a WARNING and fell back to `SubscriptionFilter()` (empty filter, matches every event). For an authorization-shaped column this was fail-OPEN: a row that goes bad (legacy migration, manual SQL corruption, future schema gap) flipped the dispatcher from "deliver only the operator's documented scope" to "deliver everything" with no audit-log surface. Now fail closed: `_select_next_fresh_event` catches the parse error and calls a new `_auto_pause_for_malformed_filter` helper that flips status to `paused` with `pause_reason='malformed_filter'`, writes a `WEBHOOK_SUBSCRIPTION_AUTO_PAUSE` audit_log row capturing the parse error, and returns None so deliver_one backs off. Idempotent: subsequent calls hit the status-check early-return before re-entering the parse path.
+
+### Fixed -- Cleanup beat task
+
+- **`cleanup_webhook_deliveries` chunked deletes (#228).** The 6-hour beat task issued a single DELETE that could span tens of millions of rows in one transaction at sustained 50 events/sec, holding a long lock and starving autovacuum on `webhook_deliveries`. Switched to the standard `DELETE FROM webhook_deliveries WHERE delivery_id IN (SELECT delivery_id FROM webhook_deliveries WHERE status IN (...) AND completed_at < cutoff ORDER BY delivery_id LIMIT N)` shape with COMMIT between batches. Default chunk size 1000; default 10-minute wall-clock cap so a beat-misfire backlog cannot compound into a multi-hour cleanup that monopolizes the table.
+
+### Fixed -- DB-level forensic + CHECK
+
+- **`webhook_deliveries` DELETE/TRUNCATE forensic triggers (#235).** Migration 035 mirrors the V-157 / migration 032 shape on `webhook_deliveries` (the cleanup beat task and the cascade in the hard-delete admin path both DELETE here, but the dispatcher's least-privilege role only has SELECT/INSERT/UPDATE). New `webhook_deliveries_audit` table with the same 8-column shape (audit_id, event_type, rows_affected, sess_user, curr_user, backend_pid, application_name, event_at). Statement-level AFTER DELETE trigger with `REFERENCING OLD TABLE AS deleted_rows` so a chunked cleanup run produces one audit row per chunk; statement-level AFTER TRUNCATE trigger with `rows_affected NULL`. Brings v1.6 to parity with the v1.5.1 forensic posture.
+- **`webhook_subscriptions.status` + `pause_reason` CHECK constraints (#236).** Migration 036 adds `webhook_subscriptions_status_enum` (`status IN ('active', 'paused', 'revoked')`) and `webhook_subscriptions_pause_reason_enum` (`pause_reason IS NULL OR pause_reason IN ('manual', 'pending_ceiling', 'dlq_ceiling', 'malformed_filter')`). Asymmetric pre-#236: migration 030 had CHECK enums on `webhook_deliveries.status`; migration 029 left the same column on `webhook_subscriptions` to application validation. Direct DB UPDATE could write any 16-char string; the dispatcher's `status='active'` gate would silently stop dispatching with no audit_log surface. The malformed_filter value lands in this CHECK because V-314's auto-pause writes it; migration 036 ships AFTER V-314 so the value is already in use. Step 1 in the migration cleans up any out-of-band rows via defensive UPDATE so the ALTER TABLE ADD CONSTRAINT applies cleanly.
+
+### Fixed -- Retry storm mitigation
+
+- **+/-10% jitter on every retry slot (#234).** Pre-#234 the retry schedule was deterministic: every retry slot fired at exactly its documented offset. N subscriptions whose first delivery to the same consumer URL failed at the same minute then retried at the same minute on every retry slot, presenting the consumer with a coordinated retry storm at attempt boundaries indistinguishable from a DoS. Apply +/-10% jitter per call in `retry_delay` using `secrets.SystemRandom` (non-predictable across processes). Cumulative worst-case `1.1 ** 7 * sum(slots)` is still under 17h so consumer-side incident-response budgeting is unchanged. Test fixtures that monkey-patch the schedule to `(0,) * 8` are preserved: a `base==0` short-circuit returns 0 directly so the loop tests do not gain 8s of waits.
+
+### Fixed -- API boot validation
+
+- **API container runs `dispatcher_env.validate_or_die` (#238).** Pre-#238, validate_or_die ran ONLY in the dispatcher container. The api container reads the same dispatcher env vars (`DISPATCHER_MAX_PENDING_HARD_CAP`, `DISPATCHER_MAX_DLQ_HARD_CAP`, `DISPATCHER_REPLAY_BATCH_HARD_CAP`, `SENTRY_PUBSUB_HMAC_KEY`, the SSRF / HTTP opt-out pair) for admin-endpoint enforcement and the cross-worker pubsub publisher, but a typo'd or out-of-range value never tripped a boot guard there. The two containers could disagree silently. Wire validate_or_die into `create_app()` after `validate_pepper_config` and before blueprint registration; helpers re-read os.environ on every call and the validator has no side effects, so running it twice (api + dispatcher) is safe. `DISPATCHER_ENABLED=false` bypasses the required-env check so an api container on a kill-switched deployment boots even without REDIS_URL / SENTRY_PUBSUB_HMAC_KEY wired.
+
+### Fixed -- Documentation
+
+- **Consumer secret-handling guidance in `docs/api/webhooks.md` (#239).** The pre-#239 dual-accept rotation example showed pseudocode that holds both generations of the shared secret in a Python dict; the doc did not call out that serializing that dict via pickle, joblib, multiprocessing's default IPC, or any reflection-based serializer leaks the plaintext. Symmetric with the server-side gap V-302 closed. New "Handling the secret bytes" subsection: secret-manager storage (Vault / AWS / GCP); never commit / log; pickle / shelve / joblib / APM local-capture / debugger snapshots are leak surfaces consumers commonly do not think about; reload per-process boot rather than caching in state that might be serialized; consequence is forged signed deliveries until rotation.
+
+### Migrations
+
+- **034** -- `webhook_subscriptions_tombstones.delivery_url_canonical` column add + PL/pgSQL backfill function + partial unique index swap from raw column to canonical column. BEGIN/COMMIT-wrapped per V-213.
+- **035** -- `webhook_deliveries_audit` table + statement-level DELETE / TRUNCATE forensic triggers. Mirror of migration 032.
+- **036** -- CHECK constraints on `webhook_subscriptions.status` (`active|paused|revoked`) and `pause_reason` (`NULL|manual|pending_ceiling|dlq_ceiling|malformed_filter`). Defensive UPDATE in step 1 cleans any out-of-band rows so the ADD CONSTRAINT applies cleanly. Ships AFTER V-314 so `malformed_filter` is in use before the constraint locks it down.
+
+All three migrations are small DDL operations against new or existing tables (one short backfill in 034 driven by a helper function). No long locks, no large rewrites, no required ordering against operational state beyond the V-314-before-V-318 sequencing already shipped in this branch.
+
+### Notes for operators
+
+- **`SENTRY_PUBSUB_HMAC_KEY` is required when the dispatcher is enabled.** Generate with `python -c "import secrets; print(secrets.token_hex(32))"`. Both api and webhook-dispatcher containers must receive the same value (docker-compose forwards it). Rotating requires restarting both containers in lockstep. `DISPATCHER_ENABLED=false` bypasses the boot guard so a kill-switched deployment can come up without the key.
+- **`DISPATCHER_HTTP_CONNECT_TIMEOUT_MS` + `DISPATCHER_HTTP_READ_TIMEOUT_MS`.** Per-operation caps on connect / read; both must be `<= DISPATCHER_HTTP_TIMEOUT_MS` (the wall-clock cap). Defaults: 5000 / 8000 / 10000 ms. The wall-clock watchdog is the dominant cap; the per-op caps still bound individual TLS handshakes and socket reads.
+- **`DISPATCHER_REPLAY_BATCH_GLOBAL_BUDGET` + `DISPATCHER_REPLAY_BATCH_GLOBAL_WINDOW_S`.** Aggregate (cross-subscription) replay-batch throttle. Defaults: 5 batches per 300 seconds across the deployment. Operator-only (env var, not a per-subscription override) so a compromised admin cannot raise the safety rail.
+- **api/version.py is intentionally not bumped in this commit**, mirroring the v1.6.0 release pattern. The runtime `check_build_version` compares `__version__` to the BUILD_VERSION file written by Dockerfile; a change there couples to the next image rebuild cycle.
+
+## [v1.6.0] - 2026-04-30
+
+"Outbound Push" release. External systems no longer have to poll `integration_events` to consume Sentry's outbox: a new dispatcher daemon POSTs each visible event to admin-registered consumer URLs over HMAC-signed HTTPS, with exponential-backoff retries, a 1,000-row dead-letter lane, and admin-panel CRUD + DLQ triage + replay. Builds on the v1.5.0 outbox + v1.5.1 hardening pattern: every architectural choice that drove a v1.5.1 audit finding is pre-empted here at the top of the branch (strict-typed filter Pydantic, env-var combination guards, Redis-pubsub cross-worker invalidation, dedicated least-privilege DB role, audit_log writes at every admin mutation, DELETE/TRUNCATE statement-level forensic triggers, BEGIN/COMMIT-wrapped migrations).
+
+Five new migrations (029-033). One new docker-compose service (`sentry-dispatcher`). Dispatcher reads `DISPATCHER_DATABASE_URL` (falls back to `DATABASE_URL`) so dev and single-role deployments are unchanged; production sets up a dedicated role with the narrow grant set via `db/role-dispatcher.sql`. Admin panel gains a Webhooks page with subscription CRUD, secret rotation, DLQ viewer, replay-one + replay-batch, per-subscription stats, and a cross-subscription error log with server-owned categorical descriptions. Admin TopBar gains the global search bar that was a non-functional stub since v1.4 (#163).
+
+Mobile is unchanged. The cookie-auth admin surface is unchanged outside the new pages. The polling endpoints from v1.5 are unchanged.
+
+### Added -- Webhook subscription data model + forensic triggers
+
+- **`webhook_subscriptions` + `webhook_secrets` tables** (migration 029). UUID PK on subscriptions so admin URLs are not enumerable via sequential integers; JSONB `subscription_filter` for the strict-typed Pydantic model in §Added -- Dispatcher; per-subscription `rate_limit_per_second` + `pending_ceiling` + `dlq_ceiling` columns with `CHECK` bounds enforcing the lower-bound floor (admin endpoint enforces the upper bound against deployment hard caps; admins can shrink, never grow). `webhook_secrets` is `(subscription_id, generation)` PK with `generation IN (1, 2)` for the dual-accept rotation pattern; `secret_ciphertext BYTEA` is Fernet-encrypted with `SENTRY_ENCRYPTION_KEY` so plaintext only exists in the dispatcher's `signing.py` local stack.
+- **`webhook_deliveries` table** (migration 030). Append-only per attempt with one exception: the terminal `dlq` transition flips the same row that was last `in_flight`. `BIGSERIAL delivery_id`, `ON DELETE RESTRICT` from `subscription_id` so a hard delete with live deliveries fails (soft-delete is the supported path). Four partial indexes cover the dispatcher's hot paths: `(subscription_id, scheduled_at) WHERE status='pending'` for the wake loop; `(subscription_id, event_id, delivery_id DESC)` for the cursor advance; `(subscription_id, completed_at) WHERE status='dlq'` for the admin DLQ viewer; `(subscription_id) WHERE status IN ('pending','in_flight')` for the pending-count auto-pause check. `error_kind VARCHAR(32)` is the categorical enum (`timeout`, `connection`, `tls`, `4xx`, `5xx`, `ssrf_rejected`, `unknown`); `error_detail VARCHAR(512)` is the server-owned catalog short_message (see §Fixed -- Dispatcher).
+- **`integration_events` NOTIFY trigger** (migration 031). The v1.5 deferred-constraint trigger sets `visible_at = clock_timestamp()` at COMMIT; this migration adds an AFTER UPDATE trigger that fires `pg_notify('integration_events_visible', event_id)` so the dispatcher's LISTEN thread wakes within 100ms of commit. 2-second fallback poll runs always so a missed NOTIFY costs at most one poll cycle. Migration self-test asserts the deferred-trigger -> UPDATE -> AFTER-UPDATE-trigger -> pg_notify chain holds under a single outer commit.
+- **`webhook_subscriptions_audit` + `webhook_secrets_audit` + DELETE/TRUNCATE statement-level triggers** (migration 032). Inherits the V-157 wms_tokens forensic-trail pattern from day one: every DELETE / TRUNCATE on either table appends a row capturing `event_type`, `rows_affected`, `sess_user`, `curr_user`, `backend_pid`, `application_name`, `event_at (clock_timestamp)`. A repeat of the v1.5.0 mystery-deletion incident is immediately bindable to a specific role + backend.
+- **`webhook_subscriptions_tombstones`** (migration 033). Hard-delete writes a tombstone capturing `delivery_url_at_delete`, `connector_id`, `deleted_by`. A subsequent CREATE under the same `delivery_url` returns 409 `url_reuse_tombstone` with the tombstone_id; the admin acknowledges by re-submitting with `acknowledge_url_reuse: true`, which clears the tombstone in the same transaction. Mirrors the v1.5.1 V-207 pattern for consumer-groups.
+- **`db/role-dispatcher.sql`** (idempotent, `\gexec`-driven). Provisions a least-privilege Postgres role with explicit grants: `SELECT` on `integration_events`, `SELECT`/`UPDATE` on `webhook_subscriptions`, `INSERT`/`SELECT`/`UPDATE` on `webhook_deliveries`, `SELECT` on `webhook_secrets`, `LISTEN` on `integration_events_visible` and `webhook_subscription_events`. Operators set `DISPATCHER_DATABASE_URL` to point at this role; dev / single-role deployments leave it unset and the dispatcher falls back to `DATABASE_URL`. A compromise of the dispatcher cannot read `users`, `wms_tokens`, or any other table outside its narrow grant set.
+
+### Added -- Dispatcher daemon
+
+- **New `sentry-dispatcher` Compose service.** Synchronous psycopg2 + ThreadPoolExecutor + `requests` library; mirrors v1.5's snapshot-keeper shape. One worker thread per active subscription, refreshed every 60s. Per-worker `requests.Session` with `verify=True` always and `allow_redirects=False` so a malicious consumer cannot bounce traffic to an internal target via 3xx; cert verification is non-negotiable at the HTTP layer regardless of `SENTRY_ALLOW_HTTP_WEBHOOKS`.
+- **LISTEN/NOTIFY wake + 2-second fallback poll + Redis pubsub subscriber.** Dedicated psycopg2 connection in autocommit holds `LISTEN integration_events_visible`; a second thread drives the fallback poll; a third subscribes to `webhook_subscription_events` for cross-worker invalidation events (`paused`, `resumed`, `deleted`, `delivery_url_changed`, `rate_limit_changed`, `secret_rotated`). The §2.9 action table in the implementation plan documents which combination of subscription-list eviction, session teardown, DB refresh, and rate-limit-bucket re-init each event triggers; tested per row.
+- **Per-subscription delivery loop.** One pass = SELECT next pending row, INSERT a fresh row if a fresh event is available and matches the strict-typed filter, flip to `in_flight`, build envelope, sign, POST, classify response. Cursor (`webhook_subscriptions.last_delivered_event_id`) advances strictly on terminal state (`succeeded` or `dlq`); in-progress states do not advance. Head-of-line blocking is intentional: a stuck consumer auto-pauses via the pending or DLQ ceiling, which is observable; skip-ahead is silent consumer confusion.
+- **Retry schedule hard-coded `[1s, 4s, 15s, 60s, 5m, 30m, 2h, 12h]`.** Eight attempts, DLQ on the eighth failure (no ninth row inserted; the terminal `dlq` transition flips the eighth in place). Cumulative ~15h retry window. No jitter in v1.6 (one consumer, one dispatcher); revisit if v1.9 introduces fan-out.
+- **Per-subscription pending and DLQ ceilings.** Default 10,000 pending and 1,000 DLQ. When the count reaches the ceiling, the dispatcher flips the subscription to `paused` with `pause_reason='pending_ceiling'` or `'dlq_ceiling'` atomically with the ceiling-th write. Per-subscription override is constrained at the admin endpoint to the deployment-wide hard cap (`DISPATCHER_MAX_PENDING_HARD_CAP` default 50,000; `DISPATCHER_MAX_DLQ_HARD_CAP` default 5,000). Hard caps are env-var-only so an admin who can pause cannot also disable the safety ceiling.
+- **Per-subscription token-bucket rate limiter.** Keyed on `subscription_id`; default 50 req/s with `CHECK (rate_limit_per_second BETWEEN 1 AND 100)`. `set_rate` reconciles in-place so a `rate_limit_changed` pubsub event takes effect immediately on every worker.
+- **Per-worker SSRF guard with DNS-rebinding mitigation invariant.** Admin-time validation (advisory) refuses URLs that resolve to private ranges at registration; dispatch-time check is the security boundary, resolving via `socket.getaddrinfo` on every POST and rejecting any address in `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16` (covers IMDS), IPv6 ULA `fc00::/7`, `::1/128`, `fe80::/10`, plus `fd00:ec2::/32` for AWS IMDSv2. The DNS-rebinding mitigation invariant: subscription mutations that change the resolved network destination MUST force DNS resolution to re-occur on the next dispatch. Implemented as session teardown on `delivery_url_changed`. `SENTRY_ALLOW_INTERNAL_WEBHOOKS=true` bypasses the dispatch-time check in dev / CI; refuses to boot in production. `SENTRY_ALLOW_HTTP_WEBHOOKS=true + SENTRY_ALLOW_INTERNAL_WEBHOOKS=true` refuses to boot regardless of `FLASK_ENV` (the combination is the SSRF-into-VPC surface; mirrors v1.5.1 V-206).
+- **Strict-typed `subscription_filter` Pydantic model with `extra="forbid"`.** Mirrors v1.5.1 V-204 pattern. Unknown keys (`__proto__`, typos, etc.) and wrong-typed values (string where array expected) fail 400 at the admin endpoint. Belt-and-suspenders: the dispatch-time filter parse wraps legacy bad rows in try/except and surfaces a recoverable error rather than a 500.
+- **Env-var validators with combination guards.** Boot-time validation rejects out-of-range values for every dispatcher env var (`DISPATCHER_HTTP_TIMEOUT_MS`, `DISPATCHER_FALLBACK_POLL_MS`, `DISPATCHER_SHUTDOWN_DRAIN_S`, `DISPATCHER_MAX_CONCURRENT_POSTS`, `DISPATCHER_MAX_PENDING_HARD_CAP`, `DISPATCHER_MAX_DLQ_HARD_CAP`). Dangerous combinations (HTTP + INTERNAL together; INTERNAL + production) refuse boot. Mirrors v1.5.1 V-201 + V-206 patterns.
+- **Graceful shutdown drain.** SIGTERM flips an in-process `shutting_down` flag; new wake signals stop enqueuing; `DISPATCHER_SHUTDOWN_DRAIN_S` (default 30s) bounds the wait for in-flight POSTs. On startup, every `in_flight` row is unconditionally reset to `pending` with `scheduled_at=NOW()`; the dispatcher is the sole writer for `in_flight`, no age-threshold heuristic needed.
+- **`DISPATCHER_ENABLED=false` kill switch.** Boots the container as a no-op: logs CRITICAL on every boot, sleeps with the heartbeat file still touched so docker-compose does not restart-loop. Operator can disable the dispatcher without a code rollback.
+
+### Added -- HMAC signing + 24-hour dual-accept rotation
+
+- **HMAC-SHA256 over `f"{timestamp}.{body}"`.** Headers: `X-Sentry-Signature: sha256=<hex>`, `X-Sentry-Signature-Generation: 1|2`, `X-Sentry-Delivery-Id: <event_id>:<timestamp>`, `X-Sentry-Event-Type`, `X-Sentry-Timestamp`. Documented replay-protection window: consumer rejects if `|now - timestamp|` exceeds 5 minutes.
+- **Single-serialization invariant.** The dispatcher serializes the envelope to bytes ONCE via `json.dumps(envelope, separators=(',', ':'), sort_keys=True).encode('utf-8')` and signs / sends the same buffer. Three layers of enforcement: (1) CI lint scans `webhook_dispatcher/` for more than one `json.dumps` call on the envelope; (2) runtime assertion at the HTTP-client boundary (`assert request_body == signed_body`); (3) integration test that fires the assertion if any code path introduces a transformation between sign and send.
+- **Constant-time signature comparison.** Every comparison uses `hmac.compare_digest`; lint forbids `==` on signature bytes anywhere under `webhook_dispatcher/`.
+- **24-hour dual-accept rotation.** Each subscription has two secret slots: `generation=1` (primary, dispatcher signs with this), `generation=2` (previous, consumer accepts until `expires_at = NOW() + 24h`). Rotation deletes any older gen=2, demotes the current gen=1 to gen=2, and inserts a fresh gen=1. Plaintext returned exactly once at issuance and rotation; never echoed in `repr()`; never written to `audit_log.details`. A second rotation within the 24h window overwrites gen=2 and shortens the cutover; the runbook documents waiting the full window.
+- **Cross-worker secret refresh.** Rotate publishes `secret_rotated` on `webhook_subscription_events`; peer workers refresh their cached signing key from DB before the next dispatch. 60-second subscription-list refresh remains as the backstop when Redis is unavailable.
+
+### Added -- Admin webhooks surface
+
+- **`/api/admin/webhooks` CRUD** with one-shot plaintext secret on create, server-side validation that `connector_id`, every `event_types` entry, and every `warehouse_ids` entry exists (mirrors v1.5.1 V-210), HTTPS-only `delivery_url` policy with the documented `SENTRY_ALLOW_HTTP_WEBHOOKS` opt-out, ceiling enforcement against the deployment hard caps, URL-reuse tombstone gate, and `audit_log` writes at every mutation site (`WEBHOOK_SUBSCRIPTION_CREATE`, `WEBHOOK_SUBSCRIPTION_UPDATE`, `WEBHOOK_SUBSCRIPTION_DELETE_SOFT`, `WEBHOOK_SUBSCRIPTION_DELETE_HARD`, `WEBHOOK_SECRET_ROTATE`, `WEBHOOK_DELIVERY_REPLAY_SINGLE`, `WEBHOOK_DELIVERY_REPLAY_BATCH`). Mirrors the v1.5.1 V-208 / V-221 admin-mutation forensic-trail pattern. Audit_log entity_id is INT but `subscription_id` is UUID; writes use `entity_id=0` and carry the UUID under `details.subscription_id`.
+- **`PATCH /api/admin/webhooks/<id>`** publishes the matching cross-worker pubsub event after commit (`paused`, `resumed`, `delivery_url_changed`, `rate_limit_changed`) per the §2.9 action table. Status transitions out of `revoked` are refused; the supported path is to create a new subscription.
+- **`DELETE /api/admin/webhooks/<id>`** soft-deletes by default (flips status to `revoked`); `?purge=true` hard-deletes with tombstone, blocked by live deliveries (`pending` / `in_flight` rows fail 409 `live_deliveries_block_hard_delete` so the FK RESTRICT is not the failure surface).
+- **`POST /api/admin/webhooks/<id>/rotate-secret`** runs the dual-accept rotation; refused on `revoked` subscriptions.
+- **`GET /api/admin/webhooks/<id>/dlq`** paginated DLQ viewer joined to `integration_events` so the operator reads what payload failed without a second round-trip.
+- **`POST /api/admin/webhooks/<id>/replay/<delivery_id>`** single replay, INSERTs a fresh `pending` row pointing at the original `event_id`. URL-tampering check (`delivery_id` must belong to the subscription in the URL path) returns 400 `delivery_subscription_mismatch` rather than echoing the actual owner.
+- **`POST /api/admin/webhooks/<id>/replay-batch`** bulk replay with filter (status, event_type, warehouse_id, completed_at window). Server-computed impact estimate; 10,000-row hard cap (override `DISPATCHER_REPLAY_BATCH_HARD_CAP`) requires `acknowledge_large_replay: true`. 60-second per-subscription throttle tracked through `audit_log` so a missed-trigger restart cannot reset the timer.
+- **`GET /api/admin/webhooks/<id>/stats?window=...`** rollups (attempts / succeeded / failed / dlq / in_flight / pending) with p50/p95/p99 response_time_ms, top 5 error_kinds, current cursor lag. 30-second in-process cache; window options `1h`, `6h`, `24h`, `7d`.
+- **`GET /api/admin/webhook-errors`** cross-subscription error log. Returns delivery failures (status in `failed` / `dlq`) joined to the server-owned error catalog at response time so the description and triage hint travel with each row. Filters: `subscription_id`, `error_kind`, `from`, `to`. Standard limit/offset pagination.
+- **React admin page at `/webhooks`** with subscription list (status badge, last-24h success rate, current pending count, delivery URL), create wizard (connector picker fed by `/api/admin/connector-registry`, HTTPS-validated URL, scope-catalog checkbox filter builder, rate-limit / pending-ceiling / DLQ-ceiling sliders, one-shot secret reveal modal with saved-secret acknowledgement, URL-reuse warning modal), per-row actions (edit / pause-resume / rotate / DLQ / stats / revoke / purge), DLQ panel with replay-one + replay-batch (server-computed impact estimate surfaces inline; 429 throttle response surfaces the countdown), stats panel (six-counter grid + percentile card + top-error-kinds table + current lag), and a cross-subscription "View errors" panel with row expansion showing the catalog description and triage hint. Mirrors the existing `Tokens.jsx` / `ConsumerGroups.jsx` flat-file convention.
+
+### Added -- Admin global search bar (#163)
+
+- **`GET /api/admin/search?q=&warehouse_id=`.** First half of the carry-forward (#163). Single endpoint that fans out across items, bins, purchase_orders, sales_orders, and the denormalized customer columns on sales_orders. Per-type cap of 10 rows; total cap of 50; minimum query length 2 to avoid the worst-case wildcard scans. Items are global; bins / POs / SOs / customers are filtered to the supplied warehouse_id. Customer is a denormalized field on sales_orders, not a first-class table; the search projects DISTINCT `customer_name` within the warehouse and the frontend routes customer selections to the SO list filtered by that name.
+- **TopBar dropdown wiring + list-page `?q=` prefill.** The TopBar input that has been a non-functional placeholder since v1.4 now drives the new endpoint with a 250ms debounce. Dropdown follows the existing warehouse-picker shape (click-outside dismisses, Arrow keys + Enter + Esc). Selection routes to `/items`, `/bins`, `/purchase-orders`, or `/sales-orders` with the result label as `q=`; the list page reads the param via `useSearchParams` on mount and re-fetches its rows server-side. Items, bins, POs, and SOs all gained `?q=` ILIKE support on their list endpoints (Items already had it). Bins / POs / SOs gained a search input next to their existing filters.
+
+### Added -- Hygiene + CI guardrails
+
+- **Celery beat cleanup.** `cleanup_webhook_deliveries` enforces 90-day retention on terminal `webhook_deliveries` rows; runs every 6 hours. `cleanup_expired_webhook_secrets` drops gen=2 rows past their 24h `expires_at`; runs hourly. Beat failures log loudly so a stalled cleanup is visible.
+- **CI guardrails consolidation.** Single workflow gate covers: no `verify=False` keyword anywhere under `api/services/webhook_dispatcher/` (extended in this release to include `http_client.py`); no double `json.dumps` on the envelope object; sentinel grep that the `body == signed_body` runtime assertion stays present at the HTTP-client boundary; sentinel grep that `ssrf_guard.assert_url_safe(url)` stays present at dispatch-time; audit_log coverage check asserting every webhook admin mutation writes a `WEBHOOK_*` row.
+- **Audit_log coverage guardrail.** New `test_admin_webhooks_audit_coverage.py` registry-style test maps every admin mutation route to its expected `action_type` and fails if a future route forgets to write its row.
+- **Integration matrix end-to-end.** New `test_v160_integration_matrix.py` maps each of the 26 verification-plan points to a real test function (or to an operator-manual gate logged via `caplog`). The Chainway C6000 smoke test is point 26 and is the one operator-manual gate; everything else is automated.
+
+### Fixed -- Dispatcher
+
+- **Consumer response body capture removed from `webhook_deliveries.error_detail` (#204).** The dispatcher previously stored the consumer's HTTP response body (first 512 chars) on every non-2xx delivery. The DLQ admin viewer rendered that field directly. A misconfigured consumer endpoint can echo upstream credentials (database connection strings, API tokens, session cookies, stack traces with deploy paths) into a 5xx page; persisting that body would make the DLQ viewer a credential-exfiltration channel for the consumer's secrets. v1.6.0 closes the surface structurally: a new `api/services/webhook_dispatcher/error_catalog.py` static module owns a server-controlled description for every `error_kind` the dispatcher emits (`timeout`, `connection`, `tls`, `ssrf_rejected`, `4xx`, `5xx`, `unknown`), and `http_client.py` populates `error_detail` from the catalog `short_message` keyed on the classified kind. `classify_exception` likewise drops `str(exc)` in favor of the catalog string; library exception messages can echo URL fragments and hostnames the consumer's stack dumped. The new `/api/admin/webhook-errors` endpoint joins the catalog at response time so operators read the description and triage hint without ever loading consumer-controlled bytes. Re-rank record for the deferred V-105 / V-106 / V-113 carry-forwards (#52, #53, #55): the `api/connectors/base.py` and `api/utils/log_sanitize.py` paths are unchanged, the deferred ConnectorError refactor still applies there, and the carry-forwards remain Low against unchanged surfaces; the v1.6.0-specific shape is closed structurally by this commit.
+
+### Migrations
+
+- **029** -- `webhook_subscriptions` (UUID PK, JSONB filter, ceiling columns with CHECK bounds, partial index on active status) + `webhook_secrets` (composite PK on subscription_id+generation, Fernet-encrypted ciphertext, 24h `expires_at` for the demoted slot). BEGIN/COMMIT-wrapped per v1.5.1 V-213 discipline.
+- **030** -- `webhook_deliveries` (BIGSERIAL PK, RESTRICT FK on subscription_id, four partial indexes covering the dispatcher and admin hot paths). BEGIN/COMMIT-wrapped.
+- **031** -- AFTER UPDATE trigger on `integration_events.visible_at` that fires `pg_notify('integration_events_visible', event_id)`. Self-test asserts the deferred-trigger -> UPDATE -> AFTER-UPDATE-trigger -> NOTIFY chain holds under a single outer commit.
+- **032** -- `webhook_subscriptions_audit` + `webhook_secrets_audit` tables with AFTER DELETE (statement-level, counts transition rows) and AFTER TRUNCATE (statement-level) triggers on both parent tables.
+- **033** -- `webhook_subscriptions_tombstones` table for the URL-reuse acknowledgement gate.
+
+Production-sized deployments do not need to consult a per-migration runbook for this set; all five are small DDL operations against new tables (no backfill, no lock on existing data). The dispatcher container will not deliver against subscriptions that do not exist yet, so applying the migrations before flipping `DISPATCHER_ENABLED=true` is the safe sequence.
+
+### Changed
+
+- **`docker-compose.yml`** gains the `sentry-dispatcher` service (shares the api image, runs `python -m services.webhook_dispatcher`, restart `unless-stopped`, healthcheck on heartbeat file freshness). The new env var `DISPATCHER_DATABASE_URL` is forwarded with no `:?` hard-fail (defaults to `DATABASE_URL` when unset). `DISPATCHER_ENABLED`, `DISPATCHER_HTTP_TIMEOUT_MS`, `DISPATCHER_FALLBACK_POLL_MS`, `DISPATCHER_SHUTDOWN_DRAIN_S`, `DISPATCHER_MAX_CONCURRENT_POSTS`, `DISPATCHER_MAX_PENDING_HARD_CAP`, `DISPATCHER_MAX_DLQ_HARD_CAP`, `SENTRY_ALLOW_HTTP_WEBHOOKS`, and `SENTRY_ALLOW_INTERNAL_WEBHOOKS` all forwarded with sensible defaults.
+- **`.env.example`** documents every new dispatcher env var with the boot-guard rationale inline. `SENTRY_ALLOW_INTERNAL_WEBHOOKS` carries an explicit "production refuses to boot with this set" warning.
+- **Admin TopBar search input** is wired (was a non-functional placeholder since v1.4); see §Added -- Admin global search bar.
+- **Admin sidebar** gains a Webhooks entry under System next to Consumer groups.
+- **`api/api.js` admin client** gains a `patch` method for the new admin webhooks PATCH endpoint.
+- **Admin Bins, PurchaseOrders, SalesOrders pages** gain a search input next to their existing filters; backend list endpoints honor `?q=` ILIKE on the canonical operator-facing fields.
+
+### Tests
+
+The full integration matrix at `api/tests/test_v160_integration_matrix.py` is the operator's release-time checklist; 25 of 26 points are automated and one (Chainway C6000 smoke test) is operator-manual. New dispatcher test files cover the wake path, retry slots, DLQ on the eighth attempt, head-of-line blocking, graceful shutdown, LISTEN/NOTIFY miss path, cross-worker invalidation timing, pending and DLQ ceiling auto-pause, SSRF reject at admin time and dispatch time, DNS-rebinding catch on the next dispatch, secret rotation propagation, body-equals-signed-body assertion, and the self-signed-cert TLS rejection. New admin test files cover every CRUD route, audit_log coverage on every mutation, replay-one and replay-batch (idempotency, throttle, hard cap, audit), DLQ pagination, stats rollups + cache TTL, and the URL-reuse tombstone gate. New error-catalog tests assert the catalog covers every `error_kind` `classify_exception` and `classify_status_code` produce; a future error class added without a catalog entry fails CI loudly.
+
+### Notes for operators
+
+- **`SENTRY_ENCRYPTION_KEY` is now used by the dispatcher.** Same Fernet key the v1.3 connector vault uses; no new env var required. Rotating the Fernet key requires re-encrypting `webhook_secrets.secret_ciphertext` alongside `connector_credentials`; see `docs/connectors.md` for the rotation procedure.
+- **`SENTRY_TOKEN_PEPPER` is NOT forwarded to the dispatcher.** That env var is for inbound v1 token hashing; the dispatcher signs HMAC over a per-subscription secret loaded from `webhook_secrets`, not over a peppered token.
+- **`DISPATCHER_DATABASE_URL` is optional.** Dev and single-role deployments leave it unset. Production deployments should set up a dedicated least-privilege role via `db/role-dispatcher.sql` and point `DISPATCHER_DATABASE_URL` at it; a compromise of the dispatcher container then cannot read `users`, `wms_tokens`, or any other table outside the narrow grant set.
+- **`DISPATCHER_ENABLED=false` is the kill switch.** Container boots, logs CRITICAL, sleeps with the heartbeat file still touched. Use it to stop dispatch globally without a code rollback; admin can still create / pause / rotate subscriptions while disabled, but no POSTs go out until the flag flips back.
+- **`SENTRY_ALLOW_INTERNAL_WEBHOOKS=true` refuses to boot in production.** It is dev / CI only. The combination `SENTRY_ALLOW_HTTP_WEBHOOKS=true + SENTRY_ALLOW_INTERNAL_WEBHOOKS=true` refuses to boot regardless of `FLASK_ENV` (the combination is the SSRF-into-VPC surface).
+- **Pre-merge gate items the operator runs:** browser sweep against the new admin Webhooks page (CRUD, secret rotation modal, DLQ viewer, replay-one + replay-batch with impact estimate, stats panel, cross-subscription errors panel) and the global search bar; Chainway C6000 smoke test (receive, pick, pack, ship; events flow through the dispatcher to a scratch consumer within the latency budget).
+- **Upgrade procedure:** `git pull && docker compose down && docker compose build && docker compose up -d`. The BUILD_VERSION guard (#73) catches skipped rebuilds. **Existing v1.5.x deployments must apply migrations 029, 030, 031, 032, and 033 in numeric order before bringing the new compose stack up;** the dispatcher container's startup queries against `webhook_subscriptions`, `webhook_secrets`, and `webhook_deliveries` will fail until those tables exist. Fresh installs run the migrations automatically on the first `db/seed.sh` invocation. CI verification of the upgrade path lands in v1.7 (#217); until then the operator runs the migration sequence manually as part of the upgrade.
+- **No mobile APK ships with v1.6.0.** v1.6.0 has no mobile code changes beyond the version-string bumps for BUILD_VERSION-guard consistency (`mobile/package.json`, `mobile/app.json`, `mobile/package-lock.json` all 1.5.1 -> 1.6.0; `versionCode` 2 -> 3). The mobile dep tree is byte-for-byte identical to v1.5.1. Operators already on the v1.5.1 APK (`sentry-wms-v1.5.1.apk`) should stay on it - it carries the dep-tree security overrides from #158 (`@xmldom/xmldom`) and #61 (`minimatch`, `node-forge`). Operators still on older v1.4.1 / v1.4.3 APKs continue to authenticate and dispatch but lack those security fixes; install v1.5.1 if you have not already. The Chainway C6000 smoke-test gate for v1.6.0 was run against a v1.5.1-installed device and passed without re-installing the APK.
+
+## [v1.5.1] - 2026-04-27
+
+Security patch release. Closes findings from the v1.5.1 post-v1.5.0 audit.
+
+### Dependency bumps (deferred from v1.4)
+
+- **cryptography 44.0.3 -> 46.0.7 (#59).** Closes two pip-audit advisories carried over from v1.4: GHSA-r6ph-v2qm-q3c2 and GHSA-m959-cc7f-wv43. The 44 -> 46 major bump was deferred from the v1.4 audit's dep-hygiene pass so it could travel with a dedicated backend-suite run; Fernet compatibility was verified against the 45.x / 46.x release notes on issue #59 (no breaking changes to the Fernet / MultiFernet token format across the entire 45.x and 46.x series; existing encrypted `connector_credentials` rows remain decryptable after the bump). The two `--ignore-vuln` lines for these GHSAs are removed from `.github/workflows/audit.yml`.
+
+- **eas-cli dev-tree highs resolved via minimatch + node-forge overrides (#61).** The v1.4 audit deferred the eas-cli dev-tree advisories to a breaking-CLI-line shift; npm's published `latest` for eas-cli turned out to have stayed on the 18.x trunk (18.8.1 now), with the same transitive minimatch + node-forge highs still present. Rather than hold out for an upstream line change that is not on the horizon, v1.5.1 pins the two culprits via the existing `overrides` block: `minimatch ^5.1.9` (fixes ReDoS cluster GHSA-3ppc-4f35-3m26 + GHSA-7r86-cg39-jmmj + GHSA-23c5-xmqv-rm74; staying in the 5.x line avoids the minimatch 5 -> 10 API break that eas-cli's tree still assumes) and `node-forge ^1.4.0` (fixes the seven-GHSA ASN.1 / signature-forgery / DoS cluster against `<=1.3.3`). Eas-cli bumped from `^18.5.0` to `^18.8.1` at the same time to pull in its own patch-level fixes. After the overrides land, `npm audit --audit-level=high` on the full mobile tree reports zero highs; `npm-audit-mobile-dev` drops its `continue-on-error: true` and becomes a proper gating job matching `npm-audit-mobile` (prod).
+
+- **V-109 CSP report sink (#54).** The v1.4-shipped CSP policy had no `report-uri` / `report-to` directive; successful XSS probes were silently blocked AND silently unnoticed. v1.5.1 adds `report-uri /api/csp-report` to the CSP header and a matching unauthenticated endpoint that logs every violation at WARNING level on the server's stdout, rate-limited to 60/min per IP so a hostile page cannot flood structured logs. Legacy `report-uri` only; the modern `report-to` / Reporting-Endpoints API is deferred until we need the fan-out to an external collector. Operators can grep `docker compose logs api | grep csp_violation` to find probes.
+
+- **pytest 8.3.4 -> 9.0.3 + pytest-cov 6.0.0 -> 7.1.0 (#60).** Closes the remaining pip-audit advisory (GHSA-6w46-j5rx-g56g) carried over from v1.4 -- a dev-only advisory that never reached runtime but kept the ignore list alive. pytest-cov pulled forward at the same time because 6.0.0 predates pytest 9 support and bundling the two bumps avoids an intermediate install state that would fail. pip-audit now runs with NO allowlist; CHANGELOG note on `.github/workflows/audit.yml` documents the clean state.
+
+### Investigation instrumentation
+
+- **v1.5.0 post-mortem guardrail (#157) -- wms_tokens DELETE / TRUNCATE forensic trail.** The v1.5.0 pre-merge gate (#135) saw `wms_tokens` unexpectedly emptied between Gate 11 and Gate 12; root cause was never established because no trail captured who issued the deletion. v1.5.1 adds migration 028 + schema.sql mirror: a new `wms_tokens_audit` table plus AFTER DELETE (statement-level, counts transition rows) and AFTER TRUNCATE (statement-level) triggers on `wms_tokens`. Every deletion now lands a row with `event_type`, `rows_affected`, `sess_user`, `curr_user`, `backend_pid`, `application_name`, `event_at (clock_timestamp)`. A repeat of the incident is immediately bindable to a specific role + backend. The #157 acceptance criteria require the instrumentation to run for at least 10 cycles before closing; the trigger ships here and the analysis window opens with the v1.5.1 release.
+
+### Security fixes
+
+- **V-200 (#140) -- `wms_tokens.endpoints` scope is now enforced.** Pre-v1.5.1 the column was stored and surfaced in the admin UI as a scope boundary, but `@require_wms_token` never consulted it; every token with any-or-no endpoint list could hit every `/api/v1/*` route the warehouse / event-type scope allowed. v1.5.1 closes the gap: the decorator maps the Flask endpoint to a user-facing slug (`events.poll`, `events.ack`, `events.types`, `events.schema`, `snapshot.inventory`) and returns `403 endpoint_scope_violation` when the token's slug list does not include the current route. Empty list denies every v1 route (plan Decision S: empty = no access; matches `warehouse_ids` / `event_types` semantics).
+  - `CreateTokenRequest` now requires a non-empty `endpoints` list and rejects unknown slugs with a 400 that names the offending value.
+  - Admin UI `Tokens.jsx` gains helper text listing valid slugs and a "Grant all v1 endpoints" one-click preset so the common-case "unrestricted" token still takes one click.
+  - Migration 026 backfills existing tokens whose `endpoints = '{}'` with the full slug set so pre-v1.5.1 tokens keep authenticating after the upgrade.
+  - Endpoint-scope enforcement is covered by four new decorator tests + three admin validation tests + one migration-backfill test.
+
+- **V-208 (#141) -- Admin token CRUD now writes the `audit_log` hash chain.** Pre-v1.5.1 `POST /api/admin/tokens`, `POST /tokens/<id>/rotate`, `POST /tokens/<id>/revoke`, and `DELETE /tokens/<id>` all mutated `wms_tokens` without appending to `audit_log`. Post-incident forensics on a compromised admin account had no way to determine which tokens existed, who issued or rotated them, or what scope was erased on delete. v1.5.1 adds one audit row per call at every mutation site. Entity type is `WMS_TOKEN`; action types are `TOKEN_ISSUE`, `TOKEN_ROTATE`, `TOKEN_REVOKE`, `TOKEN_DELETE`. The issue row captures the full granted scope; delete captures a `previous_scope` snapshot so the trail survives the row's removal. Plaintext token values are never written to `details`. The v1.4 hash-chain trigger keeps the new rows tamper-evident; `verify_audit_log_chain()` still passes with the extra writes.
+
+- **V-201 (#142) -- `SENTRY_TOKEN_PEPPER` boot guard rejects weak values.** The v1.5.0 guard rejected only unset / empty peppers; a 1-byte value like `SENTRY_TOKEN_PEPPER=x` passed silently and produced weakly-peppered hashes. v1.5.1 adds a shared `validate_pepper_config` helper used by the `create_app` boot check, the request-time `_load_pepper`, and the admin issuance `_hash_for_storage`. The helper rejects: unset, empty string, whitespace-only, the literal `.env.example` placeholder (`replace-me-with-secrets-token-hex-32`), and any value shorter than 32 characters. Valid bytes are returned verbatim (not normalised) so any deployment that configured a well-formed pepper keeps hashing to the same value; weak peppers now fail boot with a clear message pointing to the generator command.
+
+- **V-202 (#143) -- `/api/v1/events/ack` now enforces cursor horizon + token-scope on every advance.** Pre-v1.5.1 the ack handler had no upper bound on the cursor value and no event-level scope check; a token with `connector_id=NULL` (legacy admin-issued shape) could ack an arbitrary cursor on any consumer_group, jumping the cursor past every future event and causing silent data loss at the downstream consumer. v1.5.1 rejects two classes of advance: (1) `cursor_beyond_horizon` (400) when the requested cursor exceeds the greatest `event_id` in `integration_events`; (2) `ack_scope_violation` (403) when any event in `(last_cursor, cursor]` falls outside the token's `warehouse_ids` or `event_types` scope. Backwards acks (`cursor <= last_cursor`) remain pure no-ops and skip both checks so retried idempotent acks do not pay the query cost. The `AckBody.cursor` schema also gains `le=9_223_372_036_854_775_807` so an int64-overflow cursor (2**63) returns 400 at the schema layer instead of surfacing a 500 from the DB (this incidentally closes V-220 from the hardening umbrella).
+
+- **V-203 (#144) -- Per-token concurrent-scan cap on `/api/v1/snapshot/inventory`.** Pre-v1.5.1 the keeper pool (4 slots, 5-minute idle timeout) could be fully pinned by a single token holding four in-flight scans; every other token saw `503 snapshot_keeper_unavailable` until the idle timeout elapsed. v1.5.1 enforces `MAX_CONCURRENT_SCANS_PER_TOKEN = 1` at the first-page INSERT site: if the token already has a `pending` or `active` row in `snapshot_scans`, the endpoint returns `429 snapshot_in_flight` with a message explaining that the client must page the existing scan to completion before starting a new one. Cursor requests (all non-first-page requests) are exempt so partial-page flows keep working. `'done'` / `'expired'` / `'aborted'` scans do not count. The cap is per-token; two different tokens can still each hold one active scan. Pool exhaustion now requires parallel attack across distinct credentials, which is the harder-to-achieve shape.
+
+- **V-204 (#145) -- Consumer-group subscription JSON is strict-typed.** Pre-v1.5.1 `ConsumerGroupCreateRequest.subscription` was `Dict[str, Any]`; the admin UI only client-side validated JSON-object-ness. An admin could save `{"warehouse_ids": "abc"}` and the next poll handler iterated over the string's characters, crashed on `int("a")`, and returned 500 indefinitely until an admin edited the row. v1.5.1 introduces `SubscriptionFilter` (Pydantic, `extra="forbid"`, `event_types: Optional[List[str]]`, `warehouse_ids: Optional[List[int]]`) and uses it for both `ConsumerGroupCreateRequest` and `ConsumerGroupUpdateRequest`. Unknown keys (`__proto__`, typos, etc.) and wrong-typed values (string where array expected, non-int warehouse_id) fail 400 at the admin endpoint. Belt-and-suspenders: the poll handler wraps the legacy-row parse in try/except and returns `409 subscription_invalid` instead of 500 so pre-v1.5.1 bad rows surface a recoverable contract error.
+
+- **V-205 (#146) -- Token-cache revocation is now cross-worker via Redis pubsub.** Pre-v1.5.1 `token_cache.clear()` only flushed the handling gunicorn worker's dict; every other worker retained its stale entry until the per-entry TTL expired (up to 60s). A compromised token therefore kept working on N-1 workers for the full 60-second window after the admin clicked revoke. v1.5.1 adds a `wms_token_events` Redis channel: every worker starts a daemon subscriber thread at `create_app` time and evicts the matching entry on receipt. `admin_tokens.py` replaces the legacy `token_cache.clear()` calls with `token_cache.invalidate(token_id)` on rotate / revoke / delete; the new helper evicts locally AND publishes. Revocation latency drops from up to 60s to sub-second in the Redis-available path; the 60s TTL remains as the backstop when Redis is down. The publisher failure path is swallowed with a warning log so admin mutations never block on Redis availability. The admin UI revoke modal copy is updated to match the new guarantee.
+
+- **V-206 (#147) -- Boot guard refuses TRUST_PROXY=true + API_BIND_HOST=0.0.0.0.** Pre-v1.5.1 the `.env.example` defaults were safe (`TRUST_PROXY=false`, `API_BIND_HOST=127.0.0.1`) but an operator who copied a dev `.env` to prod could end up with a deployment that trusts `X-Forwarded-*` from any caller AND binds port 5000 on every interface. Combined, an attacker who reached the api port directly (cloud misconfig, Security Group hole, bastion misroute) could spoof `X-Forwarded-For` and poison every rate-limit bucket, audit attribution, and any downstream IP allowlist. v1.5.1 refuses to boot on this combination: `create_app` raises `RuntimeError` naming the fix. The documented escape hatch is `SENTRY_ALLOW_OPEN_BIND=1` for deployments that apply network-level protection elsewhere (e.g. a VPC lock-down); setting it logs a CRITICAL message on every boot so the acknowledgement stays visible. `API_BIND_HOST` is now forwarded into the api container via `docker-compose.yml` so the Flask boot guard can see it. `.env.example` gains a prominent "NEVER SET BOTH" warning block.
+
+- **V-207 (#148) -- Consumer-group recreate requires explicit replay acknowledgement.** Pre-v1.5.1 an admin could DELETE a consumer_group at `last_cursor=N`, then POST a new group with the same `consumer_group_id` and the new row defaulted to `last_cursor=0`. The connector using that group then replayed every event since the outbox dawn; downstream ERPs that treat the stream as authoritative for inventory movement saw every event twice. v1.5.1 records a tombstone on DELETE (new migration 027: `consumer_groups_tombstones` with `last_cursor_at_delete`, `connector_id`, `deleted_at`, `deleted_by`) and, on a later CREATE under the same id, returns `409 replay_would_skip_history` with the pre-delete cursor in the body. Admins who genuinely want the replay send `{"acknowledge_replay": true}` to proceed; the acknowledgement clears the tombstone so subsequent delete cycles behave the same way. A CREATE with a fresh id is unaffected.
+
+- **V-209 (#149) -- `@require_wms_token` returns a uniform 401 body for every auth failure.** Pre-v1.5.1 the decorator returned three distinct bodies: `{"error":"missing_token"}` (no header), `{"error":"invalid_token"}` (wrong hash / revoked), `{"error":"token_expired"}` (expired row). An attacker who captured or guessed a plaintext could distinguish "this was once a valid token" from "this was never a valid token" by observing whether the response said `token_expired` vs `invalid_token`; the differential narrows the search space when paired with an adjacent leak (old backup, partial shoulder-surf, etc.). v1.5.1 collapses every 401 path into a single `{"error":"invalid_token"}` body. The specific reason (missing header, unknown hash, revoked, expired) stays in a DEBUG log on `sentry_wms.auth.wms_token` for operator forensics. Timing partially flattened: the missing-header path now performs the same cache lookup a real token would trigger, so the cache-hit / cache-miss latency gap is smaller. Endpoint-scope violations (403) stay distinct because 403 and 401 are different HTTP semantics.
+
+- **V-210 (#150) -- Admin token issuance validates that warehouse_ids + event_types point at real entities.** Pre-v1.5.1 `CreateTokenRequest` accepted `warehouse_ids=[99999999]` or `event_types=["nonexistent.type"]` without complaint; the token stored that scope and polled empty forever. Audit intent was destroyed (an admin who typo'd `33` instead of `3` got silent-empty instead of an error, and token logs showed a scope indistinguishable from "valid warehouse that was later deleted"). v1.5.1 adds two existence checks at `POST /api/admin/tokens`: warehouse_ids is matched against the `warehouses` table and event_types against `V150_CATALOG`. Unknown values fail 400 with `unknown_warehouse_ids` or `unknown_event_types` and the offending entries enumerated in the response body so the admin can fix the input without reading server logs. Empty arrays bypass the existence check (empty = no access per Decision S, consistent with the runtime enforcement).
+
+- **V-212 (#151) -- `GET /api/v1/events/types` now filters the catalog by token scope.** Pre-v1.5.1 the endpoint returned every entry in `V150_CATALOG` regardless of the caller's `event_types` scope; a token scoped to `receipt.completed` could still see that `ship.confirmed`, `adjustment.applied`, `cycle_count.adjusted`, etc. existed, aiding reconnaissance for a later pivot ("if I can get a broader token, these are worth mining"). v1.5.1 narrows the response to the intersection of `V150_CATALOG` and the token's `event_types` list. Empty scope returns an empty list (Decision S: empty = no access). `events_schema_registry.known_types(event_types_filter=...)` accepts None to return the full catalog so admin / internal callers can still enumerate it if a parallel admin-only endpoint is ever added.
+
+- **V-213 (#152) -- Migrations 020 and 025 are now wrapped in a single transaction.** Both migrations issue ten `ALTER TABLE` statements back-to-back (020 adds `external_id` across ten aggregate / actor tables, 025 drops the DEFAULT across the same ten). Pre-v1.5.1 each ALTER committed on its own, so a failure on table 4 of 10 (lock timeout, disk full, unexpected schema drift) left a half-applied state. An operator who then skipped ahead to migration 025 produced an asymmetric shape where "old" tables still had the DEFAULT and "new" tables did not; insert sites that forgot `external_id` worked against some tables and failed against others, a miserable-to-debug bug. v1.5.1 wraps both migration bodies in `BEGIN` / `COMMIT` so the whole set is all-or-nothing.
+
+- **V-214 (#153) -- Snapshot-keeper supports a dedicated least-privilege DB role.** Pre-v1.5.1 the `snapshot-keeper` container shared `DATABASE_URL` with the api and ran under the full `sentry` role; a compromise of either side gave the attacker everything the other could do. v1.5.1 adds `SNAPSHOT_KEEPER_DATABASE_URL`: the keeper reads that first and falls back to `DATABASE_URL` when unset so dev and single-role deployments are unchanged. Operators running production set up a dedicated role with the narrow grant set (`SELECT` on `integration_events`, `SELECT`/`UPDATE`/`DELETE` on `snapshot_scans`, `EXECUTE` on `pg_export_snapshot`) via the new `db/role-snapshot-keeper.sql` (operator-driven, idempotent, password supplied as a psql variable) and point `SNAPSHOT_KEEPER_DATABASE_URL` at it. `docker-compose.yml` forwards the new var; `.env.example` documents the setup.
+
+- **V-221 (#154) -- Admin consumer-groups + connector-registry CRUD now writes the `audit_log` hash chain.** Structurally identical to V-208's fix for `wms_tokens` CRUD, scoped to the adjacent admin surface. Pre-v1.5.1 `POST /api/admin/connector-registry`, `POST /api/admin/consumer-groups`, `PATCH /api/admin/consumer-groups/<id>`, and `DELETE /api/admin/consumer-groups/<id>` mutated their tables without appending to `audit_log`; a rogue admin could delete + recreate a group with a tampered subscription (V-204) and leave no forensic trail. v1.5.1 writes one audit row per call: action types `CONNECTOR_REGISTRY_CREATE`, `CONSUMER_GROUP_CREATE`, `CONSUMER_GROUP_UPDATE`, `CONSUMER_GROUP_DELETE`. Consumer-group create records whether the call was an acknowledged replay (V-207 path), so investigators can spot replays without cross-referencing tombstones. Delete captures a full `subscription_at_delete` snapshot so the trail survives row removal. Entity-id convention: consumer_group_id + connector_id are VARCHAR so they cannot fit `audit_log.entity_id INT NOT NULL`; writes use `entity_id=0` as a sentinel and carry the real string id in `details`.
+
+- **V-219 (umbrella #156) -- ProxyFix `x_prefix=0` is the intentional value; plan reconciliation.** The audit plan listed `x_prefix=1` as the expected setting; the code ships `x_prefix=0`. v1.5.1 resolves the drift in favour of the code: `x_prefix=0` is safer for the current deployment shape (no sub-path deploys; `X-Forwarded-Prefix` has no functional benefit and would hand a proxy-adjacent caller control over `request.script_root`). The comment block around the ProxyFix wiring now spells out the trade-off so a future contributor who reads the plan does not flip the value back. If sub-path support ships, the correct change is to flip to `x_prefix=1` behind an explicit config flag.
+
+- **V-218 (umbrella #156) -- `docker-compose.proxied.yml` + `proxy/nginx.conf` carry dev-only warning banners.** Both files are documented as dev-only in CHANGELOG v1.5.0 but the files themselves had no comment banner stating so. An operator grepping "proxy" to set up prod could copy them and ship a broken stack (mkcert certs do not chain to any public CA; the `sentry.fruxh.local` server_name relies on hosts-file resolution). v1.5.1 prepends a bold "DEV-ONLY. DO NOT DEPLOY TO PRODUCTION" block to both files that names the specific breakage shape and points at `docs/deployment.md` for the production reverse-proxy setup.
+
+- **V-217 (umbrella #156) -- `SENTRY_VALIDATE_EVENT_SCHEMAS` is no longer frozen at module import.** Pre-v1.5.1 `_VALIDATION_ENABLED` was a module-level constant evaluated once when `services.events_service` first imported; flipping the env var at runtime (test fixtures, an operator hot-toggling during an incident) had no effect because the constant was already resolved. v1.5.1 replaces the constant with a `_validation_enabled()` helper that reads `os.getenv` on every emit, so a change to the env var takes effect on the next call without a worker restart. New test asserts that toggling the var mid-process flips validation without a module reload.
+
+- **V-216 (umbrella #156) -- External-id CI guardrail now covers `db/**/*.sql`.** Pre-v1.5.1 `api/tests/test_external_id_inserts.py` only walked the `api/` tree (Python sources), so a seed script or migration that INSERTed into one of the ten UUID-retrofitted tables without `external_id` passed CI and failed at migration time with a `NOT NULL` violation. v1.5.1 extends the walk to every `.sql` file under `db/` (seeds, migrations, operator-driven helpers like `db/role-snapshot-keeper.sql`). Current files are clean so the check stays green on the v1.5.1 branch; the coverage closes the blind spot for future changes.
+
+- **V-215 (umbrella #156) -- `/api/health` no longer exposes `proxy_fix_active` to anonymous callers.** The field moved to a new admin-only `/api/admin/system-info` endpoint gated on `@require_auth` + `@require_role("ADMIN")`. Pre-v1.5.1 the unauthenticated health endpoint told any caller whether the deployment was behind a trusted proxy -- useful recon for deciding whether `X-Forwarded-For` spoofing would stick. Anonymous `/api/health` now returns only `{status, service}` and is byte-for-byte identical whether TRUST_PROXY is true or false. `docs/deployment.md` is updated to route operators at the new admin endpoint; Docker healthcheck behaviour is unchanged.
+
+- **V-211 (#155) -- Consumer-contract dedupe rule documented.** `source_txn_id` on the event envelope is a Sentry-internal idempotency key exposed on the wire for tracing; an authenticated caller can set it to an arbitrary UUID via the `X-Request-ID` header. A downstream consumer that dedupes on `source_txn_id` alone is trusting an attacker-controllable value -- one legitimate caller with a deterministic X-Request-ID pattern is enough to poison dedupe for future events on the same aggregate. `docs/events/README.md` gains a new "Consumer contract" section stating explicitly: consumers MUST dedupe on `event_id` (server-side `BIGSERIAL`, monotonic in commit order via the `visible_at` trigger), not on `source_txn_id`. The `@before_request` hook's code comment is updated to point at the new doc so future contributors do not reintroduce the attack surface in an expanded form. Passthrough retained for the distributed-tracing use case; dropping it entirely is a v1.6 consideration once the consumer ecosystem has received the contract notice.
+
+### Dependency hygiene
+
+- **`@xmldom/xmldom` override to `^0.9.10`** (#158). Four newly-disclosed GHSAs against `@xmldom/xmldom <= 0.8.12` (GHSA-2v35-w6hq-6mfw DoS via recursion, GHSA-f6ww-3ggp-fr8h XML injection via DocumentType, GHSA-x6wf-f3px-wcqx + GHSA-j759-j44w-7fr8 XML node injection) reachable at 5 transitive paths under Expo 54. Same override pattern as the pre-existing `tar` pin. xmldom is build-time only (Expo config plugins), not runtime on the device.
+
+### Migrations
+
+- **Migration 026** -- `UPDATE wms_tokens SET endpoints = ARRAY['events.poll', ..., 'snapshot.inventory'] WHERE endpoints = '{}'`. Idempotent. Fresh installs have no pre-existing empty arrays to backfill so the migration is a no-op there; upgrade deployments get grandfathered for every token created before v1.5.1.
+
+## [v1.5.0] - 2026-04-22
+
+"Outbound Poll" release. External systems can now consume every inventory-changing write Sentry performs via a cursor-paginated REST read. Introduces a transactional outbox (`integration_events`) populated by seven emission sites in the same DB transaction as the state change that caused it, a visibility gate that keeps the poll in commit order even when BIGSERIAL allocates `event_id` out of commit order, a bulk-snapshot endpoint for the initial load, X-WMS-Token inbound auth with hash-only storage, and admin-panel CRUD for both the connector registry and consumer groups. 170 new backend tests (910 passing, up from 740 at v1.4.5).
+
+No mobile behaviour changes. Admin panel gains two new pages (API tokens, Consumer groups) and a sidebar entry each; existing flows unchanged. Five new migrations (020-024) plus 025 to drop the `external_id` DEFAULT after the retrofit. One new docker-compose service (`snapshot-keeper`) and one new required env var (`SENTRY_TOKEN_PEPPER`).
+
+### Added -- Outbox + emission
+
+- **`integration_events` transactional outbox** (migration 020). `BIGSERIAL event_id`, `JSONB payload`, denormalized `aggregate_external_id` per Decision J so the poll query never joins back to the aggregate table, four btree indexes covering the v1.5.0 query shapes (warehouse, type, visibility gate). BRIN deferred to v2.1 partitioning per Decision O.
+- **Deferred-constraint `visible_at` trigger.** Sets `visible_at = clock_timestamp()` at COMMIT so readers ordering on `(visible_at, event_id)` see events in commit order even when BIGSERIAL assigned `event_id` values in a different order. Structural invariant, not discipline at each call site.
+- **External UUID retrofit across ten aggregate / actor tables** (`users`, `items`, `bins`, `sales_orders`, `purchase_orders`, `item_receipts`, `inventory_adjustments`, `bin_transfers`, `cycle_counts`, `item_fulfillments`). Every insert site across `api/routes/*`, `api/services/picking_service.py`, test fixtures, and `db/seed-apartment-lab.sql` retrofitted to supply `uuid.uuid4()` explicitly. Migration 025 drops the `DEFAULT gen_random_uuid()` after the retrofit so a new handler that forgets the column fails loudly. CI grep guardrail at `api/tests/test_external_id_inserts.py` catches regressions.
+- **Per-aggregate `SELECT ... FOR UPDATE` retrofit** at the seven emission sites (receiving, review_adjustments, direct_adjustment, packing, shipping, complete_batch via `FOR UPDATE OF so`). Correctness strengthening that gives per-aggregate FIFO on the outbox without behaviour change for users. `transfers.move` delegates to `move_inventory`'s V-030 source-inventory lock; `putaway.confirm` does not emit (Decision K: internal movement only).
+- **Seven event emissions pinned to the framework catalog.** `receipt.completed`, `adjustment.applied` (approval + direct), `cycle_count.adjusted` (approval with non-null `cycle_count_id`), `transfer.completed`, `pick.confirmed` (one per SO in a pick batch), `pack.confirmed`, `ship.confirmed`. JSON Schema files at `api/schemas_v1/events/<type>/1.json` validated Draft 2020-12. Runtime validation gated by `SENTRY_VALIDATE_EVENT_SCHEMAS` (default true in CI, default false in prod).
+- **`emit_event` helper** in `api/services/events_service.py`. Shape mirrors `write_audit_log`; lives in the caller's transaction; uses `INSERT ... ON CONFLICT (aggregate_type, aggregate_id, event_type, source_txn_id) DO NOTHING RETURNING event_id` for idempotent replay. Request-scoped `g.source_txn_id` set by a `before_request` hook that prefers `X-Request-ID` when it parses as a UUID.
+- **Schema registry + CI validation.** `api/services/events_schema_registry.py` loads every schema at `create_app` time; boot fails on a malformed or missing file. New CI step in `.github/workflows/test.yml` imports the registry on a fresh checkout so a broken schema fails the job before the test step runs.
+
+### Added -- Polling endpoints
+
+- **`GET /api/v1/events`** -- cursor + consumer-group polling. Plain `int64` cursor (Decision G: not base64, not opaque), no `has_more` field (full page implies more; partial implies caught up). Mutual exclusion of `after` + `consumer_group` returns 400. Strict-subset scope enforcement (Decision H): a request whose `warehouse_id` or `types` filter asks for anything outside the token's scope returns 403, never a silent intersection. Visibility gate is hardcoded `visible_at <= NOW() - INTERVAL '2 seconds'`.
+- **`POST /api/v1/events/ack`** -- consumer-group cursor advance. Atomic `UPDATE consumer_groups SET last_cursor = :cursor WHERE consumer_group_id = :id AND last_cursor <= :cursor`; an out-of-order ack is a no-op. 404 on unknown group, 403 on cross-connector cursor reuse (token's `connector_id` must match the group's when set).
+- **`GET /api/v1/events/types`** -- catalog listing with `(event_type, versions, aggregate_type)` per entry. **`GET /api/v1/events/schema/<type>/<version>`** -- raw JSON Schema body served as `application/schema+json`. Both served from the in-process registry, no DB round-trip.
+- **Per-token rate limits.** 120 req/min on polling routes, 2 req/min on the snapshot endpoint. Bucket key prefers `g.current_token.token_id` over `g.current_user.user_id` over remote IP so a noisy connector cannot starve interactive cookie users.
+- **Consumer-group heartbeat throttling.** `last_heartbeat` UPDATEs throttled to once per 30 seconds via a per-process in-memory dict (Decision T). Cuts write amplification on the hot poll path without a material loss of freshness for the admin panel's heartbeat column.
+
+### Added -- Auth + token vault
+
+- **`wms_tokens` hash-only vault** (migration 023). `CHAR(64)` `token_hash` UNIQUE, typed-array scope columns (`warehouse_ids BIGINT[]`, `event_types TEXT[]`, `endpoints TEXT[]`) per Decision S, nullable FK to `connectors`, default `expires_at = NOW() + INTERVAL '1 year'` per Decision R. No `encrypted_token` column -- lost plaintext means rotate, matching the GitHub / Stripe / AWS standard (Decision P).
+- **`SENTRY_TOKEN_PEPPER` env var.** `token_hash = SHA256(pepper || plaintext).hex()` per Decision Q. Pepper is env-only (never in the DB), required at boot. Rotating it is an emergency-only control that invalidates every issued token at once; runbook at `docs/runbooks/token-pepper-rotation.md`.
+- **`@require_wms_token` decorator + per-worker 60s TTL cache.** Applied only to `/api/v1/events*` and `/api/v1/snapshot/*`; cookie-auth routes keep `@require_auth`. Cache keyed on `token_hash`, guarded by `threading.Lock`; revocation is visible within 60 seconds across every API worker.
+- **Admin token CRUD** under `/api/admin/tokens`. Plaintext returned exactly once at issuance and rotation; never listable after. Rotation-age badge computed server-side at the 75/90 day thresholds so the UI is declarative. `docker-compose.yml` forwards `SENTRY_TOKEN_PEPPER` with the standard `:?` hard-fail; `.env.example` documents the env var with a `secrets.token_hex(32)` generation command.
+
+### Added -- Bulk snapshot
+
+- **`snapshot_scans` coordination table** (migration 024) + `AFTER INSERT` trigger that fires `pg_notify('snapshot_scans_pending', scan_id)` only for pending-status inserts. Keeper wake-up latency is sub-millisecond in the LISTEN path.
+- **`snapshot-keeper` daemon** at `api/services/snapshot_keeper.py` (new docker-compose service). Holds REPEATABLE READ transactions that export a `pg_snapshot_id` via `pg_export_snapshot()` so the API tier can import the same snapshot on short-lived connections via `SET TRANSACTION SNAPSHOT '<id>'`. Pool cap 4, 5-minute idle timeout, boot-time orphan cleanup flips dead `active` rows to `aborted`, graceful SIGTERM, heartbeat file for Compose healthcheck.
+- **`GET /api/v1/snapshot/inventory`**. Base64-encoded cursor of `{scan_id, warehouse_id, item_id, bin_id}` (Decision G), keyset-paginated by `(warehouse_id, item_id, bin_id)` so the page query cost is O(limit) regardless of scan size. Partial page flips the scan to `status='done'` so the keeper reaps it. Cursor tamper protection runs before `SET TRANSACTION SNAPSHOT`: `created_by_token_id` must match and the cursor's `warehouse_id` must match the request query param; mismatch returns 403 `cursor_scope_violation`. Expired / aborted scans return 410 Gone. Keeper unavailable returns 503 with the orphan pending row cleaned up.
+- **Handoff invariant verified.** After a scan completes, polling `after=snapshot_event_id` returns events whose `event_id > snapshot_event_id` with no gap and no overlap. Proven at two levels: (1) `test_snapshot_keeper.test_exported_snapshot_is_importable_and_matches` asserts two separate connections importing the same `pg_snapshot_id` see identical `pg_current_snapshot()`; (2) `test_snapshot.test_poll_after_snapshot_event_id_excludes_pre_skips_to_post` asserts the HTTP-level boundary.
+
+### Added -- Admin panel
+
+- **API tokens page** (`/api-tokens`). List with rotation badges + per-row rotate / revoke / delete actions. Create modal with typed scope editors (comma-separated warehouse IDs, event types, endpoint slugs). One-time plaintext reveal modal with copy-to-clipboard and a "I have saved this token" checkbox gating the Close button.
+- **Consumer groups page** (`/consumer-groups`). List with subscription preview + heartbeat freshness. Create modal with `connector_id` dropdown populated from the new registry endpoint. Subscription editor is a JSON textarea validated client-side before submit. Edit modal patches subscription only; last_cursor and connector_id are not operator-editable in v1.5.0.
+- **Connector registry endpoints** under `/api/admin/connector-registry`. Distinct path from the existing `/api/admin/connectors` which serves the v1.3 `connector_credentials` vault; the two concepts converge in v1.9. POST returns 409 on duplicate `connector_id`; GET lists every connector with timestamps.
+
+### Migrations
+
+- **020**: `integration_events` table, `external_id UUID` columns on ten tables with `DEFAULT gen_random_uuid()` so existing inserts keep working, deferred `visible_at` trigger. Runs without downtime on apartment-lab seed.
+- **021**: `connectors` (minimal PK + display_name; v1.9 expands) and `consumer_groups` (FK to connectors, `last_cursor`, `last_heartbeat`, `subscription JSONB`).
+- **022**: `credential_type` column on `connector_credentials` (default `connector_api_key`, covers existing v1.3 rows; future values `outbound_oauth`, `outbound_api_key`, `outbound_bearer` for v2+).
+- **023**: `wms_tokens` hash-only vault with typed-array scope columns and 1-year default expiry.
+- **024**: `snapshot_scans` table + `snapshot_scans_pending` NOTIFY trigger.
+- **025**: drops the `external_id` DEFAULT on all ten retrofitted tables after the emission + insert retrofit lands, so a future handler that forgets the column gets a NOT NULL violation instead of a random UUID.
+
+Production-sized deployments should consult `docs/runbooks/v1.5.0-migration.md` before applying 020: the `DEFAULT gen_random_uuid()` backfill is fast on apartment-lab but does hold an `ACCESS EXCLUSIVE` lock briefly per table; the runbook covers the two-step "add nullable column, batch backfill, then add UNIQUE + NOT NULL" alternative for multi-million-row tables.
+
+### Changed
+
+- **`docker-compose.yml`** gains the `snapshot-keeper` service (shares the api image, runs `python -m services.snapshot_keeper`, restart `unless-stopped`, healthcheck on heartbeat file freshness). The `api` service environment now forwards `SENTRY_TOKEN_PEPPER` with the standard `:?` hard-fail; without the var, Compose refuses to start the stack.
+- **`.env.example`** documents `SENTRY_TOKEN_PEPPER` with a `secrets.token_hex(32)` generator.
+- **`api/app.py`** gains a `@before_request` hook that mints `g.source_txn_id` (prefers a valid inbound `X-Request-ID` UUID, else `uuid.uuid4()`) and a boot guard that fails `create_app()` without `SENTRY_TOKEN_PEPPER`.
+- **`api/services/rate_limit.py`** preference chain: `token:<id>` > `user:<id>` > `ip:<addr>`.
+- **Conftest** `ALL_TABLES` extended with `integration_events`, `snapshot_scans`, `wms_tokens`, `consumer_groups`, `connectors` in FK-safe TRUNCATE order.
+
+### Developer experience
+
+- Added `docker-compose.proxied.yml` for local TLS reverse-proxy testing (#138). Run with `docker compose -f docker-compose.yml -f docker-compose.proxied.yml up -d` to reproduce reverse-proxy deployment behavior locally without remote infrastructure. Requires mkcert.
+
+### Tests
+
+- **Backend: 910 passing (up from 740 at v1.4.5).** +170 new cases across: migration self-tests (020, 021, 022+023, 024), emit_event unit tests, seven per-handler emission integration tests, per-aggregate FIFO + visible_at trigger concurrency, polling contract (12 cases: empty, single event, cursor advance, limit bounds, types filter, warehouse filter, scope 403, visibility gate, mutual exclusion, plain-int cursor, no has_more, direct aggregate_external_id), consumer-group ack (monotonic, out-of-order no-op, equal-cursor idempotent, 404, cross-connector 403), types + schema endpoints, admin token CRUD, admin consumer-groups CRUD, wms_tokens decorator, token cache TTL + revocation window, rate-limit key preference, boot guard, snapshot-keeper subprocess handoff, snapshot endpoint (cursor tamper, 410 expired, 503 unavailable, keyset paging, handoff invariant).
+- **Admin: 58 passing, unchanged**. New React pages ride on the existing DataTable / Modal / PageHeader primitives; no new test coverage this release.
+- **Mobile: 32 passing, unchanged**. v1.5.0 has no mobile code changes.
+
+### Notes for operators
+
+- **`SENTRY_TOKEN_PEPPER` is required.** Before `docker compose up -d`, generate a pepper with `python -c "import secrets; print(secrets.token_hex(32))"` and set it in `.env`. The api container refuses to boot without it. Rotating the pepper invalidates every issued token; see `docs/runbooks/token-pepper-rotation.md` for the procedure.
+- **New `snapshot-keeper` service.** After the v1.4.5 → v1.5.0 upgrade `docker compose up -d` starts four containers (`db`, `redis`, `api`, `celery-worker`, `admin`, plus the new `snapshot-keeper`). The keeper is required for `GET /api/v1/snapshot/inventory`; a downed keeper surfaces as 503 `snapshot_keeper_unavailable` on the first page of a scan.
+- **`SENTRY_VALIDATE_EVENT_SCHEMAS` defaults to false in production.** CI and tests run with it on. Flipping it on in production fails-closed on a schema bug, which would block every mobile emit; only enable it transiently during incident investigation.
+- **Upgrade procedure:** `git pull && docker compose down && docker compose build && docker compose up -d`. The BUILD_VERSION guard (#73) catches skipped rebuilds. Five migrations (020-024) + migration 025 apply automatically on the next `db/seed.sh` invocation for fresh installs; existing deployments should run them via their usual migration runner in numeric order.
+- **No mobile APK ships with v1.5.0.** Existing v1.4.1 / v1.4.3 APKs on Chainway C6000 devices continue to work; v1.5.0 has no mobile code changes beyond the version-string bump.
+
+## [v1.4.5] - 2026-04-21
+
+Reverse-proxy hotfix follow-up. v1.4.4 (#107) wired Werkzeug `ProxyFix` into `api/app.py` behind a `TRUST_PROXY` env var, but `docker-compose.yml` was never updated to pass `TRUST_PROXY` into the `api` service environment. Compose does not auto-forward arbitrary host env vars; variables must be declared in the service's `environment:` block. Operators who set `TRUST_PROXY=true` in `.env` saw no effect because the value stopped at the Compose shell and never reached Flask: `os.getenv("TRUST_PROXY")` returned `None` inside the container, `ProxyFix` stayed off, and the CSRF-403-behind-proxy bug from v1.4.0-v1.4.3 kept firing on nginx / Caddy / Traefik / ALB deployments. Fruxh hit this after installing v1.4.4 fresh. api + Compose + docs change; admin panel and mobile unaffected at the code level.
+
+### Fixed -- Core
+- **`TRUST_PROXY` now reaches the api container.** `docker-compose.yml` `services.api.environment` gains `TRUST_PROXY: ${TRUST_PROXY:-false}`, same pattern as `FLASK_ENV`. Default `false` preserves the direct-connect posture from v1.4.0-v1.4.3; operators opt in by setting `TRUST_PROXY=true` in `.env` when Sentry sits behind a TLS-terminating reverse proxy. Without this single line, v1.4.4's `ProxyFix` wiring was cosmetic for every Compose-deployed install: the Flask check `os.getenv("TRUST_PROXY")` returned `None` because Compose never forwarded the var. Baked into the same service-environment block as `JWT_SECRET` / `SENTRY_ENCRYPTION_KEY` / `REDIS_PASSWORD` so it follows the same upgrade procedure (`docker compose up -d` after pulling). (Closes #136, refs #107 -- #107 closes once Fruxh confirms the v1.4.5 build resolves his production repro.)
+- **ProxyFix state is now logged at Flask startup.** `api/app.py` emits either `ProxyFix active: trusting X-Forwarded-* headers (TRUST_PROXY=true)` or `ProxyFix inactive: not trusting proxy headers (TRUST_PROXY not set)` via the module logger at WARNING level (matching the `check_build_version` pattern already in that file so the line clears the default gunicorn stderr threshold). Operators can verify the middleware state with `docker compose logs api | grep ProxyFix` without having to exec into the container or inspect app internals. One line per gunicorn worker, so on the default 4-worker pool there are four copies of the log line -- expected, not a duplication bug.
+- **`/api/health` now returns `proxy_fix_active`.** The response shape extends from `{"status": "ok", "service": "sentry-wms"}` to `{"status": "ok", "service": "sentry-wms", "proxy_fix_active": <bool>}`. Existing callers that only read `status` continue to work unchanged. A reverse proxy or external monitor can now confirm the wiring end-to-end with a single HTTPS `GET`: a green health response with `"proxy_fix_active": false` behind an nginx deployment is the exact signature of this bug (`TRUST_PROXY` set in `.env`, `ProxyFix` still off because the var never reached the container). This also serves the v1.5+ observability minimum for operator-visible app state.
+
+### Documentation
+- **`.env.example` gains a `TRUST_PROXY` entry with the security warning inline.** Placed under a new "Reverse proxy (HTTPS termination)" section separator so it is scannable. The block defaults to `false`, explains when to enable, and carries the header-forgery warning from `docs/deployment.md` so operators cannot miss it even if they copy `.env.example` to `.env` without reading the deployment guide front-to-back. Before v1.4.5, `TRUST_PROXY` did not appear in `.env.example` at all, so a fresh install had no signal that the knob existed.
+- **`docs/deployment.md` "Reverse Proxy (HTTPS)" section gains `.env`-location and verification clarifications.** Three footguns called out inline: (1) `TRUST_PROXY` goes in `.env` at the repo root, NOT `api/.env` -- the Compose deployment path reads the project-root `.env`, while `api/.env` is only consulted by a direct `flask run` from inside `api/`; (2) after editing `.env`, use `docker compose up -d` (which recreates the container and re-reads `.env`), NOT `docker compose restart api` (which keeps the container and bounces the process inside it without re-reading `.env`); (3) verification commands -- `docker compose exec api env | grep TRUST_PROXY` for the Compose side, `docker compose logs api | grep ProxyFix` for the Flask side, `curl /api/health` for the external view. Each check is independent so a failure on any one narrows the diagnosis to that layer.
+
+### Thanks
+Thanks again to **Fruxh** for catching that the v1.4.4 build did not actually deliver the #107 fix on his install. v1.4.4 shipped the Flask-side wiring and the deployment docs but silently missed the Compose wiring that carries the env var into the container; Fruxh set `TRUST_PROXY=true` in `.env`, ran `docker compose up -d`, saw the same CSRF-403 wall as on v1.4.3, and reported back within a day. The one-line Compose diff plus the operator-visibility work (log line + `/api/health` field) in this release exists because of that follow-up report.
+
+### Tests
+- Backend: 740 passing (up from 738 at v1.4.4). `api/tests/test_proxy_fix.py` gains a new `TestHealthEndpointReportsProxyFixState` class with two cases: (1) without `TRUST_PROXY`, `GET /api/health` returns `proxy_fix_active: false`; (2) with `TRUST_PROXY=true`, the same endpoint returns `proxy_fix_active: true`. Both reuse the existing `unproxied_client` / `proxied_client` fixtures, so the contract rides on the same env-var-scoped `create_app()` the other four cases in the file already exercise. The original 4 cases (opt-in invariant, scheme/host/is_secure rewrite, Secure CSRF + auth cookies, change-password behind proxy not blocked by CSRF) are unchanged and still green.
+- Admin: 58 passing, unchanged (v1.4.5 has no admin code changes).
+- Mobile: 32 passing, unchanged (v1.4.5 has no mobile code changes).
+
+### Notes for operators
+- **Upgrade v1.4.4 -> v1.4.5 if you deploy behind a reverse proxy.** `git pull && docker compose down && docker compose build && docker compose up -d`. The BUILD_VERSION guard (#73) catches skipped rebuilds. After the container is up, verify the wiring with `docker compose exec api env | grep TRUST_PROXY` (expect `TRUST_PROXY=true`) and `docker compose logs api | grep ProxyFix` (expect `ProxyFix active: ...`). Or from outside the container, `curl https://sentry.yourcompany.com/api/health` should return `"proxy_fix_active": true`.
+- **`docker compose restart api` does NOT re-read `.env`.** This is the most common way to set `TRUST_PROXY=true` correctly in `.env` and still see `ProxyFix` stay off: Compose picks up `.env` changes on container *creation*, not on restart. Always use `docker compose up -d` after editing `.env`.
+- **Direct-connect (no proxy) deployments:** no action needed. `TRUST_PROXY` defaults to `false` in both `docker-compose.yml` and `.env.example`, which is the correct posture. Setting `TRUST_PROXY=true` without a trusted proxy in front remains a header-forgery vector.
+- **No mobile APK ships with v1.4.5.** Existing v1.4.1 / v1.4.3 APKs on Chainway C6000 devices continue to work; the v1.4.5 tag on GitHub does not attach a new APK. Mobile version strings bumped only to keep the BUILD_VERSION guard consistent across packages.
+
+## [v1.4.4] - 2026-04-21
+
+Reverse-proxy hotfix. Every production deployment that fronts Sentry with a TLS-terminating reverse proxy (nginx, Caddy, Traefik, AWS ALB, etc.) was returning `403 CSRF token missing or invalid` on every `POST` / `PUT` / `PATCH` / `DELETE`. Fixed by wrapping `app.wsgi_app` in Werkzeug `ProxyFix` behind a `TRUST_PROXY` env var, so Flask's `request.scheme` / `request.host` / `request.is_secure` reflect the browser's view of the request instead of the internal `127.0.0.1` hop. Found and root-caused by Fruxh from his production install. api-only code change; admin panel and mobile unaffected.
+
+### Fixed -- Core
+- **Flask now honours `X-Forwarded-*` headers from a trusted reverse proxy when `TRUST_PROXY=true`.** Without this, Sentry behind nginx / Caddy / Traefik / ALB issued cookies scoped to the internal `127.0.0.1:<port>` host; the browser on the public hostname treated them as cross-origin garbage and never resubmitted, so the CSRF double-submit cookie was absent on every mutation and the middleware 403'd. Root cause: `app.wsgi_app` was never wrapped in `werkzeug.middleware.proxy_fix.ProxyFix`. `api/services/cookie_auth.py` already checked `X-Forwarded-Proto` defensively when setting the `Secure` flag, but Flask's `request.host` / `request.scheme` / `request.is_secure` stayed stuck on the internal view. Fixed by wiring `ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=0)` in `api/app.py`, gated behind `TRUST_PROXY=true / 1 / yes`. Opt-in only because honouring `X-Forwarded-*` when the app is NOT behind a trusted proxy lets any client forge its own scheme / hostname / client IP (the classic ProxyFix footgun). The `_cookie_secure()` header fallback stays as belt-and-suspenders with a comment noting ProxyFix is now the primary mechanism. (Closes #107, refs Fruxh's #98 -- #98 closes once Fruxh confirms the v1.4.4 build resolves his production repro.)
+
+### Documentation
+- **`docs/deployment.md` "Reverse Proxy (HTTPS)" section expanded with `TRUST_PROXY` guidance, annotated snippets, and a multi-hop note.** The prior doc had a single minimum nginx config block and no mention of `TRUST_PROXY`, which meant every v1.4.0-v1.4.3 operator who deployed behind a reverse proxy hit the #107 CSRF-403 wall without a doc trail to follow. New content covers: (1) when and why to set `TRUST_PROXY=true`, with the explicit security warning that trusting `X-Forwarded-*` without a proxy in front of the app is a header-forgery vector; (2) an annotated nginx config explaining what ProxyFix reads each `proxy_set_header` line for; (3) Caddy `reverse_proxy` and Traefik v2+ dynamic-config snippets (both set `X-Forwarded-*` automatically); (4) a one-line note that AWS ALB / GCP HTTPS LB / Azure Application Gateway / Cloudflare Tunnels / Fly.io / Render all work the same way under `TRUST_PROXY`; (5) a multi-hop section explaining that CDN -> nginx -> Sentry needs `x_for=2, x_proto=2, x_host=2` with links to the upstream Werkzeug docs for the full theory.
+
+### Build / CI
+- **`python-dotenv` bumped `1.0.1` -> `1.2.2` to clear `GHSA-mf9w-mj56-hr94`.** OSV published the advisory between the 2026-04-21 08:08 UTC scheduled `main` audit (green) and the 17:17 UTC initial v1.4.4 branch push (red). Same commit SHA, different audit outcome -- advisory data refreshed, not a code regression. `python-dotenv` is only used for `load_dotenv()` at app import; the `1.0.x` -> `1.2.x` line is drop-in compatible, no code changes needed. Riding along on v1.4.4 rather than deferring via `--ignore-vuln` because the one-line bump strictly improves the release; an ignore line would kick the can and add noise to `audit.yml`. (Closes #106)
+
+### Thanks
+Thanks to **Fruxh** for filing #98 from his production v1.4.3 install and following through to the root cause with a detailed reproduction: nginx terminating TLS at `https://sentry.fruxh.example`, forwarding to Flask on `http://127.0.0.1:8080` with the standard `X-Forwarded-*` headers, browser refusing to resubmit the cookie that Flask issued against the internal host. The diagnostic work turned what would have been a days-long triage into a one-commit fix.
+
+### Tests
+- Backend: 738 passing (up from 734 at v1.4.3). New file `api/tests/test_proxy_fix.py` (4 cases): (1) opt-in invariant -- without `TRUST_PROXY`, forged `X-Forwarded-*` headers cannot spoof `scheme` / `host` / `is_secure`; (2) `TRUST_PROXY=true` rewrites `request.scheme` to `https`, `request.host` to the `X-Forwarded-Host` value, and `request.is_secure` to `True`; (3) login behind proxy headers returns CSRF + auth cookies that both carry `Secure`, with CSRF still `SameSite=Strict` and auth still `HttpOnly`; (4) change-password behind proxy headers does NOT 403 on the CSRF gate when the client echoes the cookie value in `X-CSRF-Token` (Fruxh's exact repro path, asserting the fix).
+- Admin: 58 passing, unchanged (v1.4.4 has no admin code changes).
+- Mobile: 32 passing, unchanged (v1.4.4 has no mobile code changes).
+
+### Notes for operators
+- **New required env var for reverse-proxy deployments.** If you run Sentry behind nginx / Caddy / Traefik / ALB / any other TLS-terminating proxy, set `TRUST_PROXY=true` in the API container's environment after pulling v1.4.4. Without it, the `ProxyFix` middleware stays off and the CSRF-403 bug from v1.4.0-v1.4.3 continues. See `docs/deployment.md` "Reverse Proxy (HTTPS)" for the full writeup.
+- **Direct-connect (no proxy) deployments:** do NOT set `TRUST_PROXY`. The default-off posture is correct for any install where Sentry is reachable directly from the browser / mobile client. Setting `TRUST_PROXY=true` without a trusted proxy in front allows clients to forge origin / scheme / client IP by sending `X-Forwarded-*` themselves.
+- **Upgrade procedure unchanged** from v1.4.2: `git pull && docker compose down && docker compose build && docker compose up -d` for the API + admin host. The BUILD_VERSION guard (#73) continues to catch skipped rebuilds.
+- **No mobile APK ships with v1.4.4.** Existing v1.4.1 / v1.4.3 APKs on Chainway C6000 devices continue to work; the v1.4.4 tag on GitHub does not attach a new APK. Mobile version strings bumped only to keep the BUILD_VERSION guard consistent.
+
+## [v1.4.3] - 2026-04-20
+
+Mobile patch release. Two fixes from the v1.4.3 mobile bug bash, plus a follow-up for the regression surfaced during Chainway C6000 verification of the second fix. Zero backend or admin code changes; tests and docs only elsewhere. Closes the keyboard-fallback half of Fruxh's #70 report; the camera-scanner half remains tracked under #70 for v2.x.
+
+### Fixed -- Mobile
+- **Put-away "done" screen no longer overlays the success checkmark on the title.** The done phase was rendered inside `doneStyles.section` (`flex: 1, justifyContent: 'center', alignItems: 'center'`) but the container also holds the session-history list, which grows with each put-away. Once history exceeded the viewport, content overflowed and `justifyContent: 'center'` pushed the large check glyph visually into the title below it. Swapped to a ScrollView with natural top-down flow, matching the CountScreen done-phase pattern. Visual regression only; no functional impact. (Closes #103)
+- **Scan input fields now allow keyboard fallback for manual entry and copy/paste.** `mobile/src/components/ScanInput.js` had `showSoftInputOnFocus={false}` and `contextMenuHidden`, so tapping a scan field on the Chainway C6000 did nothing (no soft keyboard) and long-press did not expose the context menu (no copy/paste). Removed both flags. Broadcast-intent scans still route through `ScanSettingsContext`'s `activeScanHandlerRef` and bypass the TextInput entirely; keyboard-mode scans still land in `onChangeText` the same way manual typing does. Every scan screen inherits this fix via the shared component. (Closes #104, refs #70)
+- **Scan input soft keyboard now only opens on user tap, not on auto-refocus.** The #104 fix removed the unconditional `showSoftInputOnFocus={false}`, but the 1-second refocus loop that keeps the field ready for hardware scans then re-popped the soft keyboard on every tick on the C6000. Track a `softInput` state that is false by default and flipped to true only on `onPressIn`; force a blur/refocus cycle on tap so the updated prop applies and the keyboard actually opens. Reset to false on blur and after submit so the auto-refocus loop, mount autofocus, and post-submit refocus all stay silent. Net behavior: tap opens the keyboard for manual entry, every other focus path leaves it hidden. (Closes #105)
+
+### Tests
+- Mobile: 32 passing (up from 24 at v1.4.2). New file `mobile/src/components/__tests__/ScanInput.test.js` locks the exact props and handlers that encode the tap-to-open, hidden-during-hardware-scan contract and the absence of `contextMenuHidden`. Source-level regression gate because the mobile vitest harness has no RN runtime (see `mobile/src/auth/__tests__/forcedChangePersistence.test.js` for the pattern note). User-visible behaviour verified on a Chainway C6000 before release.
+- Backend: 734 passing, unchanged (v1.4.3 has no backend code changes).
+- Admin: 58 passing, unchanged (v1.4.3 has no admin code changes).
+
+### Thanks
+Thanks to **Fruxh** for the original #70 report that asked for both an in-app camera scanner and a keyboard fallback. v1.4.3 ships the keyboard half; the camera-scanner half stays open under #70 for v2.x scope.
+
+### Notes for operators
+- **Mobile APK rebuild.** v1.4.3 has real mobile code changes (unlike v1.4.2, which did not ship a new APK). The new `sentry-wms-v1.4.3.apk` is attached to the GitHub release and installs over v1.4.1 / v1.4.2 on Chainway C6000 devices without a data wipe.
+- **No backend or admin redeploy needed for mobile operators.** `api/version.py` and all package manifests still bump to 1.4.3 so the BUILD_VERSION guard (#73) stays consistent, but the API and admin images have no source changes in this release. Pulling and rebuilding is safe but not required if you only operate the mobile fleet.
+- **Upgrade procedure unchanged** from v1.4.2: `git pull && docker compose down && docker compose build && docker compose up -d` for the API + admin host; `adb install sentry-wms-v1.4.3.apk` on each scanner.
+
+## [v1.4.2] - 2026-04-20
+
+Admin panel patch release. Headline is an operator safeguard against upgrades-without-rebuild; everything else is either a real bug reported externally by Fruxh from a production deployment or surfaced during an internal admin bug bash on 2026-04-19 plus the pre-merge gate on 2026-04-20. Zero mobile code changes; a v1.4.3 will follow for mobile-side reports.
+
+### Fixed -- Deployment / Operations
+- **CRITICAL: Upgrade path fails with `ModuleNotFoundError: flask_limiter` when the Docker image is not rebuilt.** v1.4.0 added Flask-Limiter (V-041); users upgrading from v1.3.x with cached Docker images were running v1.3-era containers against v1.4 code, and the worker crashed on `from flask_limiter import Limiter`. The API now bakes the source `__version__` into the image at build time and checks it against the code version at startup. If they drift, the container logs a clear "run docker compose build" message and exits 2 instead of crashing a worker with a dependency error. `docs/deployment.md` gains an "Upgrading" section spelling out the correct `git pull && docker compose build && docker compose up -d` procedure. (Closes #73)
+
+### Fixed -- Admin Panel: Form Validation (V-017 cluster)
+Seven admin create / edit forms returned `validation_error` on submit because V-017's `extra="forbid"` rejected fields the frontend was sending but the pydantic schemas did not declare. Each form fixed independently; a consolidated integration test file (`api/tests/test_admin_payload_alignment.py`) now locks the payload shape for every fixed endpoint so a future drift surfaces in CI before a user.
+- **Bin create payload alignment** -- `barcode` renamed to `bin_barcode`, stale `rack` / `shelf` / `position` / `is_active` fields dropped from the POST body, `pick_sequence` defaults to 0 when empty. (Closes #74)
+- **Zone create payload alignment** -- `is_active` stripped (belongs on `UpdateZoneRequest`, not `CreateZoneRequest`); `ZONE_TYPES` dropdown list corrected to match the backend validator (dropped `QUALITY` / `DAMAGE`, added `PICKING`). (Closes #75)
+- **PreferredBin create payload alignment** -- bin dropdown bound to `b.bin_id` instead of a non-existent `b.id`, so the submitted `bin_id` is a real integer instead of `null`. (Closes #76)
+- **InventoryAdjustment create payload alignment** -- reason is required client-side now; the backend schema declares `reason: str = Field(..., min_length=1)` for audit traceability. (Closes #77)
+- **Inter-Warehouse Transfer create payload alignment** -- four field names renamed from `source_*` / `destination_*` to `from_*` / `to_*` to match `InterWarehouseTransferRequest`. (Closes #78)
+- **Manual PO create payload alignment** -- `vendor_address` folded into `notes` (the PO table has no vendor_address column), PO lines use `quantity_ordered` instead of `quantity_expected`. (Closes #79)
+- **Manual SO create payload alignment** -- `warehouse_id` falls back to the current warehouse context on first open (prior null-on-first-attempt bug), SO lines use `quantity_ordered`. Fallback also applied to the manual PO path. (Closes #80)
+- **Zone edit payload alignment and EDIT-endpoint audit** -- zone edit was tripping on a `zone.id` vs `zone.zone_id` URL-construction bug; fixed, and every other admin PUT endpoint audited for the same pattern. (Closes #81)
+- **Bin create Zone dropdown commits the selected zone_id** -- pre-merge gate finding; the `.map()` that feeds the zone `<select>` inside the Bin form bound key / value to `z.id` instead of `z.zone_id`, so no selected zone ever reached the POST. Same `.id` vs `.<entity>_id` pattern the #81 audit flagged; single remaining instance now closed. Regression test asserts the POST body carries a numeric `zone_id`. (Closes #99)
+
+### Fixed -- Admin Panel: Data Management
+- **Inventory search bar wired to fire on Enter.** Backend GET `/api/admin/inventory` gains the `q` query parameter the frontend was already sending (ILIKE match on SKU or item name, whitespace-only input ignored). Frontend input binds to a separate `searchInput` buffer and only commits on Enter or blur. (Closes #82)
+- **Cycle Count bin selection state isolation.** Checkbox `key` / `checked` / `toggle` bound to `bin.bin_id` instead of the non-existent `bin.id`; picking one bin no longer highlighted every bin, and picking a second no longer unselected every bin. (Closes #83)
+- **Bin detail view opens on row click + delete with confirmation.** Row click was building `/api/admin/bins/${bin.id}` and 404ing because the list endpoint returns `bin_id`; fixed. New `DELETE /api/admin/bins/{id}` endpoint with a 409 guard when inventory-on-hand or preferred-bin references remain. (Closes #85)
+- **Zone edit modal includes delete button with confirmation.** New `DELETE /api/admin/zones/{id}`; 409 with `"Zone cannot be deleted because N bin(s) are assigned to it. Reassign or delete the bins first."` when any bin still references the zone. (Closes #86)
+- **Purchase Orders list rows gain an edit affordance.** PO edit modal is bound to the header fields `UpdatePurchaseOrderRequest` accepts; lines are read-only after PO create to preserve the procurement record. (Closes #87)
+- **Close / Reopen Purchase Order from edit modal.** PO records are permanent procurement history; delete is replaced with reversible state transitions. `POST /purchase-orders/{id}/close` tightened to 409 on already-CLOSED; new `POST /purchase-orders/{id}/reopen` reverses a close. Edit modal footer swaps button text based on current state. (Closes #88)
+- **Sales Orders admin list page** (new `admin/src/pages/SalesOrders.jsx`). SOs previously only appeared inside Picking / Packing / Shipping workflow views, each filtered to a single status; now there is a dedicated admin list with a status filter, detail modal, and edit modal (header fields while status is OPEN, read-only afterwards). (Closes #89)
+- **Cancel Sales Order from edit modal.** One-way terminal transition; Cancel Order button visible only on OPEN orders. Preserves existing inventory-release behaviour for ALLOCATED / PICKING cancellations via the existing endpoint. (Closes #90)
+- **Import CSV templates include all required fields.** PO / SO templates now carry `warehouse_id`; Items template gains `category` and `weight`; Bins template gains `bin_barcode`, `warehouse_id`, `putaway_sequence`. Alignment tests lock template headers against `api/schemas/csv_import.py`. (Closes #91)
+- **Create PO / SO modals reset on Cancel.** Click Cancel (or the X corner) then reopen; the form starts empty instead of carrying stale fields from the previous attempt. (Closes #92)
+- **PO / SO manual entry accepts SKU instead of Item ID.** Operators memorize SKUs, not autoincrement integers. Native `<datalist>` autocomplete sources SKUs from `/api/admin/items`; unknown SKU surfaces as `"Unknown SKU: <value>"` before the POST. (Closes #93)
+- **Audit Log column headers trigger sort.** Whitelisted `sort_by` (`created_at`, `action_type`, `user_id`, `entity_type`) with `sort_direction=asc|desc` accepted on the backend; injection-safe. Frontend resets to page 1 on each new sort. (Closes #95)
+- **DataTable CSV export serializes status columns correctly.** Any column whose `render` returned a React element (e.g. `<StatusTag>`) was coercing to the literal string `[object Object]` in exported CSVs. DataTable now prefers an explicit `csvValue(row)`, falls back to a primitive render result, and otherwise uses the raw `row[col.key]`. (Closes #84)
+- **Admin list pages use consistent pencil / trash row actions.** Every admin list page (Items, Warehouses, Zones, Users, Bins, Purchase Orders, Sales Orders) now surfaces edit via a `&#9998;` pencil icon. Items, Warehouses, Zones, Users, and Bins also expose delete via a `&#128465;` trash icon (Users preserves the self-delete guard). PO / SO are pencil-only; Close and Cancel remain state transitions in the edit modal per the #88 / #90 design. Duplicate Delete buttons inside edit modal footers were removed for single-source-of-truth. (Closes #102)
+
+### Fixed -- Admin Panel: UX
+- **Settings page stops crashing (P0 regression caught at the pre-merge gate).** `useDirtyFormGuard` initially shipped with `useBlocker` from react-router, which requires a data-router setup the admin panel does not run under; the hook threw "useBlocker must be used within a data router" on every Settings mount and the ErrorBoundary caught it. The hook now uses `beforeunload` only. (Closes #94, #100)
+- **Settings page warns on browser close / refresh when it has unsaved changes.** This is the actual behaviour that ships in v1.4.2 -- the `beforeunload` listener fires on close, reload, or URL-bar navigation. Intra-SPA sidebar-click guarding was attempted via `useBlocker`, found to require a router migration out of v1.4.2 scope, and is deferred to v1.5 for proper design (#101).
+- **change-password redirects to /login with a success banner.** Fruxh reported first-time setup appeared to fail with "Your session is out of sync." The password change had already succeeded server-side, but the frontend refreshed `/auth/me` with the now-invalidated token, hit 401, left `must_change_password=true` in context, and the router guard bounced the operator back to `/change-password`. The frontend now reuses the existing `logout()` helper, writes a flash message to `sessionStorage`, and navigates to `/login`, which renders the banner and lets the operator sign in with the new password cleanly. (Closes #98)
+
+### Build / CI
+- **Lockfile version drift check** (new `.github/workflows/lockfile-check.yml`). Fails CI whenever `admin/` or `mobile/` `package.json` and `package-lock.json` disagree on the top-level project version. Prevents recurrence of the v1.4.1 "lockfiles stuck at 1.4.0" bug this release fixes. (Closes #96)
+- **admin/package-lock.json and mobile/package-lock.json regenerated** to match `package.json` v1.4.1. They had been stuck at `1.4.0` since the v1.4.0 release because 818617a bumped the manifests but not the lockfiles.
+- **api/BUILD_VERSION gitignored** so the file the #73 startup guard reads from a prod image cannot accidentally leak into a dev host via the bind mount (observed once during v1.4.2 work; would have tripped the guard on every dev restart after a version bump).
+
+### Security
+Three bugs reported directly by external user Fruxh from a production deployment:
+- **#72** -- the flask_limiter upgrade crash; closed by the #73 headline fix and the new "Upgrading" docs section.
+- **#71** -- the full V-017 `validation_error` cluster across Bin / Zone / PreferredBin / Transfer create forms (Fruxh hit four of the seven; the internal bug bash surfaced the other three); closed alongside the #74-#81 cluster plus #85 (bin detail). Also the DataTable CSV export [object Object] bug (#84) which Fruxh reported separately on PO exports.
+- **#98** -- the first-time-setup "Your session is out of sync" false failure; closed by the `/login` redirect + flash banner.
+
+All three close on v1.4.2 merge via their respective commits' `Closes` keyword.
+
+### Thanks
+Thanks to **Fruxh** for filing three external bug reports (#71, #72, #98) from a production v1.4.1 deployment, with clear reproductions and a screenshot. Those reports drove v1.4.2's priorities and shaped the Phase 1 / Phase 2 split.
+
+### Tests
+- Backend: 734 passing (up from 690 at v1.4.1). New coverage: V-017 payload alignment for every fixed form, bin delete, zone delete, PO close / reopen state machine, SO double-cancel guard, audit log sort whitelist, inventory `q` parameter, #73 build-version check.
+- Admin: 58 passing (up from 42). New test files: `bins-zone-dropdown.test.jsx`, `DataTable.csv-export.test.jsx`, `imports.test.jsx`, `settings-router-mount.test.jsx`, `useDirtyFormGuard.test.jsx` (rewritten against the non-useBlocker hook), `forced-change-flow.test.jsx` gains a post-change redirect suite.
+- Mobile: 24 passing, unchanged (v1.4.2 has no mobile code changes).
+- New CI workflow: Lockfile Version Check runs alongside Tests and Dependency Audit on every push and PR.
+
+### Notes for operators
+- **Upgrading from v1.3 or v1.4.0 / v1.4.1:** run `git pull && docker compose down && docker compose build && docker compose up -d`. If you skip the build step, the API exits with code 2 on startup and logs the correct remediation command (the #73 guard).
+- **Fresh installs:** unchanged from v1.4.1. The forced-password-change flow still applies. Post-change now redirects to `/login` with a success banner instead of trying to refresh the session with an already-invalidated token.
+- **No mobile APK ships with v1.4.2.** Existing v1.4.1 APKs on Chainway C6000 devices continue to work; the v1.4.2 tag on GitHub does not attach a new APK. A v1.4.3 is planned for mobile-side reports.
+- **Settings unsaved-changes guard** currently only covers browser-level exits (close tab, reload). Clicking a sidebar link with unsaved draft settings discards them silently; proper design for an intra-SPA guard is captured in #101 and will ship in v1.5.
+
+## [v1.4.1] - 2026-04-18
+
+Patch release bundling two bug fixes deferred from v1.4.0.
+
+### Added
+- **Forced password change on first login.** Fresh installs seed admin as `admin/admin` with a `must_change_password` flag set. Auth middleware blocks every endpoint except `/api/auth/me`, `/api/auth/change-password`, and `/api/auth/logout` until the admin changes the password. Eliminates the "docker compose up, then grep logs for the random password" onboarding paper-cut carried from v1.0 through v1.4.0. (#69)
+- **Migration 019** adds `must_change_password BOOLEAN NOT NULL DEFAULT FALSE` on the `users` table. Existing users get the default FALSE on ALTER, so pre-existing deployments are never force-flagged by this migration.
+- **Distinct audit_log action** `forced_password_change_completed` for the first-time flow, separate from voluntary `password_change` on subsequent rotations. Greppable apart from normal rotations.
+- **Admin panel change-password page** (new in `admin/src/pages/ChangePassword.jsx`). Router guard redirects to `/change-password` whenever `must_change_password` is true; brand-red banner, hidden Cancel button, and a sidebar-less layout enforce the forced-mode UI. The page also serves voluntary changes (Cancel visible, no banner, full shell).
+- **Mobile `ChangePasswordScreen`** with the matching banner, Android hardware back-handler and iOS swipe-back both disabled, and a "Log out" escape. `AppNavigator` registers the screen only in the forced-mode branch so the rest of the app is literally unreachable while the flag is set.
+
+### Fixed
+- **Mobile HomeScreen and LoginScreen version display.** Both hardcoded `v1.2.0` and were never bumped during v1.3.0 or v1.4.0. Now read `v1.4.1`. Issue #67 tracks the v1.5 refactor that eliminates this class of bug permanently via build-time injection. (#68)
+- **Forced-mode navigator stuck spinner.** React Navigation native-stack was preserving the `ChangePassword` route across the `must_change_password` flip because the screen was registered in both the forced and non-forced branches. The non-forced branch no longer registers it, so the route ceases to exist when the flag clears and native-stack falls through to Home. (#69)
+
+### Security
+- **`admin` rejected as a new password** (case-insensitive, whitespace-stripped). `validate_password` refuses `admin`, `ADMIN`, `Admin`, `aDmIn`, ` admin `, `\tadmin\n`, etc. Prevents "changing" the seeded default back to itself.
+- **Middleware exception list is exactly three endpoints.** Anything else returns 403 `password_change_required` while the flag is set. Matched by Flask endpoint (blueprint.view_fn), not URL path, so query strings and method variants cannot slip past.
+- **Force-kill-and-reopen bypass closed on mobile.** `must_change_password` lives inside the persisted `user_data` dict in SecureStore, so a relaunch rehydrates the forced state and the navigator re-renders `ChangePasswordScreen`. `completePasswordChange` write-throughs the cleared flag to SecureStore so a resume after a successful change lands on Home.
+
+### Tests
+- Backend: 25 new tests (`api/tests/test_forced_password_change.py`), 690 total passing.
+- Admin: 10 new tests (`admin/src/test/forced-change-flow.test.jsx`), 42 total passing.
+- Mobile: 11 new tests (`mobile/src/auth/__tests__/forcedChangePersistence.test.js`), 24 total passing. React Navigation and hardware-back behaviour verified manually on a Chainway C6000 since mobile vitest has no RN runtime.
+
+### Notes for operators
+- **Fresh installs:** log in with `admin/admin`; you will be prompted to set a new password before any other route becomes accessible.
+- **Existing installs:** no change in behaviour. Migration 019 sets the column to FALSE for all existing rows; your admin user flows through login exactly as before.
+- **Dev / demo workflow:** `docker compose down -v && docker compose up -d` resets to `admin/admin` plus the forced-change flow.
+- **`ADMIN_PASSWORD` env override** still bypasses the forced flow for CI, automation, and deterministic dev environments. When set, the provided password ships with `must_change_password = FALSE` and the legacy banner.
+
+## [v1.4.0] - 2026-04-18
+
+Pure security and hardening release. No new features. Closes the remaining High-severity items from the v1.3.0 audit backlog, every finding from a fresh audit of the v1.4 work (V-100 through V-111), and the most impactful Medium / Low items.
+
+### Security -- v1.3 backlog (Priority 1)
+- **V-045** -- Admin JWT moved out of `localStorage` into an HttpOnly cookie. CSRF double-submit pattern (`X-CSRF-Token` header cross-checked against a non-HttpOnly companion cookie) protects all mutating methods on admin endpoints. Mobile continues using bearer tokens; the cookie + CSRF path and the bearer path resolve to the same server-side auth middleware.
+- **V-047** -- Mobile JWT migrated from plaintext AsyncStorage to the Android Keystore via `expo-secure-store`. One-shot migration on app launch copies any existing AsyncStorage token into SecureStore and then wipes the AsyncStorage copy; `clearAllAuth` wipes both backends.
+- **V-048** -- Cleartext HTTP stays allowed in all build profiles (warehouse LANs require it). Risk is accepted and documented in `SECURITY_BACKLOG.md` with revisit condition: the hosted / cloud deployment option.
+- **V-050** -- Strict Content-Security-Policy set by the API and mirrored by nginx on the admin container. `default-src 'self'`, `script-src 'self'` with per-build SRI hashes, `style-src 'self' 'unsafe-inline'`, `img-src 'self' data:`, `font-src 'self'`, `connect-src 'self'`.
+
+### Security -- v1.3 backlog (Priority 2)
+- **V-006** -- Fernet cache held in module state. Python cannot reliably zero memory; threat model assumes local-read adversary. Accepted, documented in `SECURITY_BACKLOG.md`.
+- **V-007** -- `scrub_secrets()` applied to Celery task error strings so decrypted credentials cannot leak through traceback payloads.
+- **V-008** -- Closed via the v1.3 V-001 hard `RuntimeError` on missing `SENTRY_ENCRYPTION_KEY`. No new code change; verification only.
+- **V-010** -- Connector registry rejects duplicate registration of the same connector name with a `ValueError` at import time rather than silently overwriting.
+- **V-012** -- Stale `running` sync_state recovery. New `running_since` and `run_id` columns (migrations 017 and 018). A fresh worker whose state is older than the 1-hour takeover threshold claims the row with a new `run_id`; any late write from the stale worker is dropped on UUID mismatch.
+- **V-016** -- `Content-Type: application/json` now required on POST / PUT / PATCH; non-JSON requests return `415 Unsupported Media Type`.
+- **V-017** -- Pydantic schemas use `model_config = ConfigDict(extra="forbid")` so unknown request body fields return `validation_error` instead of silently dropping.
+- **V-020** -- ErrorBoundary console output goes through a scrub helper that redacts bearer tokens and cookie values before log emission.
+- **V-021** -- Admin UI surfaces operator-friendly messages on common failures (403, 404, 409, 429, validation) instead of raw `response.error`.
+- **V-024** -- `login_attempts` table now has a periodic cleanup (`delete_stale_login_attempts()`) and a 254-char cap on the username column to bound storage.
+- **V-031** -- Last-admin delete race closed by SELECT FOR UPDATE on the count query inside the delete transaction. Two concurrent deletes can no longer both pass the "one admin remains" check.
+- **V-033** -- URL-path `warehouse_id` is now the authoritative value; middleware rejects any request whose body or query-string `warehouse_id` disagrees with the path.
+- **V-040** -- API and admin containers default to `127.0.0.1` bind (parametrized via `API_BIND_HOST` and `ADMIN_BIND_HOST`). Production deployments behind a reverse proxy are unaffected. LAN-dev workflows set both to `0.0.0.0` in a local `.env`.
+- **V-041** -- Flask-Limiter enabled globally (300 / minute per client) and tightened per-route on auth, sync-reset, and connector test-connection. Backed by the existing `REDIS_PASSWORD`-authenticated Redis broker.
+- **V-042** -- `pip-audit` and `npm audit` gate every push. `.github/workflows/dependency-audit.yml` runs both on the hardened prod deps and fails the run on any non-ignored advisory.
+- **V-046** -- Subresource Integrity hashes generated at admin build time and written into the nginx-served `index.html` for the Vite bundle `<script>` and `<style>` tags.
+- **V-051** -- HSTS header set on the API when the request is served over HTTPS; `Strict-Transport-Security: max-age=63072000; includeSubDomains`. Nginx mirror added in V-111 below.
+
+### Security -- v1.4 audit findings (V-100 through V-111)
+- **V-100** -- Logout endpoint gated by CSRF. Previously the cookie-only logout path could be triggered cross-origin.
+- **V-101** -- `POST /api/admin/connectors/<name>/sync-reset` writes an `audit_log` row and is rate-limited; it was the only admin-mutation without either.
+- **V-102** -- Sync state write race. The `run_id` UUID from V-012 plus a `WHERE run_id = :expected` clause prevents a stale worker from clobbering a fresh run's progress even after the takeover threshold.
+- **V-103** -- Coverage extension of V-033 to the remaining admin endpoints that still read `warehouse_id` from the body.
+- **V-104** -- Mobile SecureStore migration hardening. The migration step always clears AsyncStorage (even when the migration source is empty) so an abandoned pre-1.4 token cannot resurface. `clearAllAuth` wipes both backends on logout.
+- **V-107** -- Rate limiter docstring was inaccurate about storage URI precedence; corrected. Added `rediss://` (TLS) URI support for deployments with a TLS-fronted Redis.
+- **V-108** -- DNS rebinding pin on connector outbound requests. The SSRF guard resolves the hostname once, validates the address against the blocklist, then connects to the pinned IP while preserving the original `Host` header. A rebind between validate and connect no longer bypasses the guard.
+- **V-110** -- Self-hosted Instrument Sans and JetBrains Mono under `admin/public/fonts/`, SIL Open Font License. Removes the last third-party origin; lets `font-src 'self'` stay strict.
+- **V-111** -- Nginx CSP and HSTS headers mirror the API's values so admin responses that are served straight out of nginx carry the same policy.
+
+### Fixes -- collateral
+- **#56** -- `test_compose_admin_listens_on_8080` updated for the V-040 loopback binding; the assertion now matches either `127.0.0.1:8080` or `0.0.0.0:8080` depending on `ADMIN_BIND_HOST`.
+- **#57** -- Mobile npm audit scoped to production dependencies. `tar` pinned to clear two GHSA path-traversal advisories in the dev toolchain.
+- **#58** -- Bumped `flask`, `flask-cors`, `pyjwt`, and `requests` to clear pip-audit advisories.
+- **#62** -- Deferred-advisory ignore pattern for pip-audit and npm audit so the job does not page on findings tracked as known-accepted in `SECURITY_BACKLOG.md`.
+- **#63** -- Admin Users edit form no longer sends `username` in the PUT body. The `UserUpdate` schema rejects it with `extra="forbid"` per V-017, which the form was tripping.
+- **#64** -- `API_BIND_HOST` and `ADMIN_BIND_HOST` parametrized so LAN-dev can override the V-040 loopback binding without forking the compose file.
+- **#65** -- `/api/admin/inter-warehouse-transfers` removed a `bt.notes` SELECT + response field that referenced a column the `bin_transfers` schema never had. Endpoint returned 500 on every call; now returns 200.
+
+### Accepted risks
+- **V-048** -- Cleartext HTTP in all build profiles. Profile-gating was tried in v1.1 and reverted in v1.1.1 because warehouse LAN deployments require HTTP. Revisit when the hosted / cloud deployment option ships.
+- **V-006** -- Fernet cache in module state. Python cannot reliably zero memory; threat model assumes a local-read adversary already has process memory access.
+
+### Deferred to v1.5
+Open issues with `v1.5` labels: **#52** (V-105 broaden `scrub_secrets` to non-URL credential fragments), **#53** (V-106 scrub `ConnectionResult.message` content), **#54** (V-109 CSP `report-to` endpoint), **#55** (V-113 drop carriage return from `ConnectionResult` allowlist), **#59** (bump `cryptography` 44.0.3 -> 46.0.x), **#60** (bump `pytest` 8.3.4 -> 9.0.3), **#61** (bump `eas-cli` to 0.52.0).
+
+### Tests
+- 647 backend tests passing (up from 570), 54 skipped inside the api container for infrastructure-config assertions.
+- 32 admin frontend tests passing.
+- 8 mobile tests passing.
+- All CI workflows green on tag (`Tests`, `Dependency Audit`, `Deploy Docs`).
+
+### Notes for operators
+- Admin panel now authenticates via HttpOnly cookie + CSRF. On upgrade, clear `localStorage` and cookies for the admin origin and log in fresh.
+- Mobile JWT migrated to SecureStore on first launch. Users may need to log in once after upgrade.
+- API and admin containers default to `127.0.0.1` bind. Production behind a reverse proxy is unaffected. LAN-dev with a scanner on the same network must set `API_BIND_HOST=0.0.0.0` and `ADMIN_BIND_HOST=0.0.0.0` in a local `.env`.
+- Migrations `017_sync_state_running_since.sql` and `018_sync_state_run_id.sql` must be applied before running v1.4.0 against an existing v1.3 database.
+
+## [v1.3.0] - 2026-04-16
+
+### Added -- connector framework (Phases 1-5)
+- Connector interface contract and registry with auto-discovery (`api/connectors/`)
+- Celery + Redis background job runner with JSON serialization
+- Encrypted credential vault (Fernet) with per-connector + per-warehouse scoping
+- Sync state tracking with consecutive-error threshold and admin health dashboard
+- Rate limiter, circuit breaker, and `make_request` helper inherited by every connector
+
+### Security (Phase 6 -- audit findings triaged and fixed in Phase 7)
+- **V-001** -- Removed hardcoded `SENTRY_ENCRYPTION_KEY` default from `docker-compose.yml`. Key is now required via strict `${... :?}` form. The auto-generation + logging path in `credential_vault.py` is gone; missing key is a `RuntimeError`. See `SECURITY.md` `SA-2026-001` for remediation if your deployment used the previous default.
+- **V-002** -- Documented historical `JWT_SECRET` defaults that remain in git history (`dev-secret-change-in-production`, `dev-jwt-secret-do-not-use-in-production-b7e2f`). Current compose uses the strict `${... :?}` form. See `SA-2026-002` for rotation steps.
+- **V-003** -- Admin panel rebuilt as a production nginx multi-stage image. Vite dev-server no longer runs in production; dev-mode hot reload is available via `docker-compose.dev.yml`. Admin container runs as `USER nginx`; source tree bind-mount removed from default compose.
+- **V-004** -- Redis broker now requires `--requirepass ${REDIS_PASSWORD}`. Celery broker and result backend URLs use the authenticated form. Healthcheck authenticates with `redis-cli -a`.
+- **V-005** -- No credential-vault code path logs key material. Any missing `SENTRY_ENCRYPTION_KEY` raises `RuntimeError` rather than silently generating and printing a replacement.
+- **V-009** -- SSRF allowlist on every connector outbound request. The guard rejects non-http(s) schemes, internal docker service hostnames, and any URL that resolves to loopback / private / link-local / reserved / multicast / unspecified addresses (IPv4 or IPv6). Applies uniformly via `BaseConnector.make_request`.
+- **V-014** -- `ConnectionResult.message` is capped at 500 characters and stripped of non-printable bytes so connectors cannot smuggle response bodies or control sequences back through the admin UI.
+- **V-015** -- CSV import (`/api/admin/import/<type>`) now runs every row through a per-entity pydantic schema. Text-field validators reject leading characters that a spreadsheet treats as a formula prefix (`=`, `+`, `-`, `@`, tab, CR). Numeric coercion is handled by pydantic; a non-numeric value skips its row instead of crashing the whole import.
+- **V-023** -- Login lockout is now IP-scoped. An attacker at one IP can no longer DoS a known username by exhausting its per-username counter: the real user at a different IP keeps working.
+- **V-025** -- `audit_log` is append-only. `BEFORE UPDATE` / `BEFORE DELETE` triggers reject DML, and every row carries a SHA-256 chain hash. The operational helper `verify_audit_log_chain()` returns the first broken `log_id` or NULL when intact. Cancel-receiving audit rows now derive warehouse_id from the receipt rows themselves rather than from the request body.
+- **V-026** -- Lookup endpoints (receiving, packing, shipping, lookup) scope `warehouse_id` in the SELECT for non-admin users. A record in another warehouse produces the same 404 as a missing barcode; no existence oracle.
+- **V-027** -- `/api/lookup/item/search` for non-admin users returns only items present as inventory or preferred-bin entries in their assigned warehouses. Admins keep the full catalogue.
+- **V-028** -- `/api/putaway/update-preferred` refuses to target a bin outside the caller's assigned warehouses. Admins bypass as usual.
+- **V-029** -- Receive over-receipt TOCTOU closed via `SELECT ... FOR UPDATE` on the PO line. Two concurrent receives against the same line can no longer both pass the remaining-quantity check.
+- **V-030** -- Inventory move, pick allocation, and wave allocation acquire row locks (`FOR UPDATE` / `FOR UPDATE OF inv`) before reading and writing. `add_inventory` serializes NULL-lot upserts with a transaction-scoped advisory lock so concurrent callers never create duplicate rows.
+- **V-069** -- Removed the hardcoded bcrypt hash of `admin` from `db/seed-apartment-lab.sql`. Seed SQL now inserts a placeholder; `seed.sh` must run to install a random password. Running the SQL directly leaves the admin account unable to authenticate (safe failure).
+
+### Security -- infrastructure defaults
+- `api/` and `admin/` services are rebuilt with production settings (nginx runtime for admin, non-root user in both). Dev reload moved to `docker-compose.dev.yml`.
+- `SECURITY.md` reorganized into Authentication, Data protection, Tenant isolation, Connector framework, Input validation, Infrastructure, Response headers, and Backlog sections.
+- `SECURITY_BACKLOG.md` (new) catalogues every Phase 6 finding not fixed in v1.3 with suggested fixes and target versions.
+
+### Tests
+- Security-oriented tests across 6 new files: `test_security_config.py`, `test_url_guard.py`, `test_idor_scope.py`, `test_concurrency.py`, `test_audit_tamper.py`, `test_csv_import_security.py`, plus additions to existing `test_auth.py`, `test_connectors.py`, `test_credential_vault.py`.
+- Replaced the test JWT secret with a 32-byte value to silence PyJWT's `InsecureKeyLengthWarning` across the suite.
+- Total: 570 backend tests passing.
+
+### Notes for operators
+- If you ever deployed this repo with the default compose file, read `SA-2026-001` and `SA-2026-002` in `SECURITY.md` and rotate `SENTRY_ENCRYPTION_KEY` and `JWT_SECRET` accordingly.
+- The new `REDIS_PASSWORD` variable is required. See `.env.example`.
+- The admin panel now listens on port 8080. Update reverse-proxy configs if applicable.
+- The `db/migrations/016_audit_log_tamper_resistance.sql` migration must be applied on existing deployments before running v1.3.
+
+## [v1.2.0] - 2026-04-16
+
+### Added
+- Pydantic v2 input validation schemas on every API endpoint that accepts a JSON body (17 schema files in `api/schemas/`)
+- `@validate_body` decorator for consistent request validation across all routes (`api/utils/validation.py`)
+- Standardized `validation_error` response format: `{error: "validation_error", details: [{type, loc, msg}]}`
+- React error boundaries on all 21 admin panel page routes - each section fails independently with retry button and brand-colored fallback UI
+- Mobile app handles `validation_error` responses - extracts first detail message for operator-friendly display
+
+### Changed
+- All API request payloads strictly validated before reaching the service layer
+- Admin panel sections fail independently rather than white-screening the entire app
+- 5 existing tests updated for new `validation_error` response format (putaway, transfers, shipping)
+
+### Tests
+- 75 new backend validation tests (unit tests for all schema files + integration tests for the decorator)
+- 4 new ErrorBoundary frontend tests (catch, fallback message, reset/retry)
+- Total: 382 backend + 10 frontend (was 307 backend + 6 frontend)
+
+## [v1.1.1] - 2026-04-15
+
+### Security
+- **CSV formula injection on export (M9)** - cell values starting with `=`, `+`, `-`, `@`, `\t`, `\r` are now prefixed with a single quote in CSV exports (DataTable and PreferredBins)
+- **DATABASE_URL hardcoded fallback removed (M7)** - app raises RuntimeError on startup if DATABASE_URL is not set, same pattern as JWT_SECRET
+- **Login attempt count hidden** - failed login response no longer reveals remaining attempts before lockout
+
+## [v1.1.0] - 2026-04-14
+
+### Security - Backlog Audit (12 fixes)
+- **Token invalidation on password change (M1)** - added `password_changed_at` column to users table; auth middleware rejects tokens issued before the last password change
+- **JWT iat/jti claims (L10)** - tokens now include `iat` (issued-at, unix seconds) and `jti` (UUID) for revocation and replay detection
+- **DB-backed rate limiting (M8)** - replaced in-memory `_login_attempts` dict with `login_attempts` table; persistent across restarts, per-username and per-IP tracking (5 attempts, 15 min lockout)
+- **Password complexity (L1)** - `validate_password()` enforces minimum 8 characters, at least one letter, at least one digit; applied on user creation, admin password update, and self-service password change
+- **Self-service password change (L2)** - `POST /api/auth/change-password` endpoint; mobile UI added as modal in user dropdown (current password, new password, confirm)
+- **Warehouse listing auth (L7)** - `GET /api/warehouses/list` now requires JWT; mobile warehouse selection moved from pre-login to a blocking post-login modal on HomeScreen
+- **suggest_bin warehouse scope (L8)** - preferred bin and default bin queries filtered to user's allowed warehouses; admins bypass the filter
+- **CSV import limit (M10)** - import endpoint rejects payloads with more than 5000 records
+- **Cycle count self-approval check (M3)** - configurable `require_count_approval_separation` app setting; when enabled, the counter cannot approve their own cycle count adjustments (403); when disabled, self-approvals are logged as `SELF_APPROVED_COUNT` in the audit log
+- **Pagination (M6)** - added `page`/`per_page` query params with `LIMIT`/`OFFSET` to warehouses, zones, bins, and users list endpoints (default 50, max 1000)
+- **Cleartext HTTP disabled for production (L5)** - `usesCleartextTraffic` set to false in app.json; `with-cleartext-traffic` plugin now checks `EAS_BUILD_PROFILE` and only enables cleartext for non-production builds
+- **Production docker-compose (L6)** - `docker-compose.prod.yml` omits source volume mounts and requires all credentials via env vars
+
+### Admin Panel
+- New "Inventory" settings section with "Require separate approver for cycle count adjustments" checkbox
+- Version updated to 1.1.0
+
+### Mobile
+- Warehouse selection moved from login screen to post-login blocking modal
+- "Change Password" option added to user dropdown on home screen
+- Auto-selects warehouse if only one is available
+- Version updated to 1.1.0
+
+### Infrastructure
+- Migration 014: `password_changed_at TIMESTAMPTZ` column on users table
+- Migration 015: `login_attempts` table with key, attempts, locked_until, last_attempt columns
+
+### Bug Fixes
+- Change-password endpoint returns 403 (not 401) for wrong current password, preventing the mobile client's auto-logout interceptor from firing
+
+### Tests
+- 19 new tests (307 total, 0 regressions)
+- Warehouse list auth test (401 without JWT, 200 with JWT)
+- CSV import limit test (5001 records returns 400)
+- Cycle count self-approval tests (both modes)
+- Password complexity tests (short, no digit, no letter)
+- Self-service password change tests (success, wrong current, weak new, requires auth)
+- JWT iat/jti claim tests (presence, uniqueness)
+- Token invalidation tests (old token rejected, new token works after password change)
+- Per-IP lockout test
+- Pagination tests (zones, bins)
+
+## [v1.0.0] - 2026-04-14
+
+### Security - Full Code Audit
+- **Default admin password eliminated** - seed script generates random 16-char password at runtime via `/dev/urandom`, prints to docker logs. Set `ADMIN_PASSWORD` env var to override.
+- **Password minimum 8 characters** - enforced on user creation and password updates via admin panel
+- **Over-pick prevention** - `quantity_picked` capped at `quantity_to_pick` in pick confirmation; prevents inventory drain via API manipulation
+- **Inventory floor protection** - picking decrements use `GREATEST(0, ...)` to prevent negative inventory from race conditions
+- **Short pick quantity cap** - `quantity_available` validated against task requirement
+- **Packing quantity validation** - verify endpoint rejects zero and negative quantities
+- **PO/SO line quantity validation** - `quantity_ordered` must be greater than zero on order creation
+- **Receiving bin-warehouse validation** - bin must belong to PO's warehouse; prevents cross-warehouse inventory corruption
+- **Lookup endpoint warehouse isolation** - item locations, bin contents, SO details, and bin search filtered by user's assigned warehouses (IDOR fix)
+- **Security response headers** - X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy on all responses
+- **Stack trace suppression** - global 500 error handler returns generic error instead of leaking internals
+- **Debug mode disabled** - `debug=False` hardcoded; Werkzeug interactive debugger no longer activatable via env var
+- **Login lockout** - 5 failed attempts locks the account for 15 minutes (per-username tracking, resets on successful login)
+- **PostgreSQL port bound to localhost** - `127.0.0.1:5432:5432` prevents network exposure
+
+### Infrastructure
+- **Gunicorn in production** - Dockerfile CMD switched from `python app.py` (single-threaded Flask dev server) to `gunicorn -w 4` (4 workers)
+- **Non-root container** - Dockerfile creates and runs as `appuser` instead of root
+
+### Tests
+- 5 new login lockout tests
+- Test passwords updated to meet 8-character minimum
+- 288 tests passing, 0 regressions
+
+### Version
+- All version numbers bumped to 1.0.0 across API, admin, mobile, README
+
+## [v0.9.9] - 2026-04-13
+
+### Security
+- **SQL parameterization** - 30+ SQL queries converted from f-string constant interpolation to parameterized bindings across all route and service files (admin_orders, admin_users, packing, picking, receiving, shipping, picking_service)
+- **Warehouse authorization middleware** - non-admin users blocked at the request level from accessing unassigned warehouses (checks both query params and JSON body, returns 403)
+- **JWT_SECRET required** - app raises `RuntimeError` on startup if missing; `docker-compose.yml` uses `${JWT_SECRET:?}` syntax to error if not set
+- **JWT payload includes warehouse_ids** - enables middleware enforcement without DB lookup
+- **DB credentials configurable** - PostgreSQL user/password/database use env vars with defaults instead of hardcoded values
+- **Debug mode conditional** - Flask debug mode tied to `FLASK_ENV` instead of always-on
+- CORS origins now include port 5000 and are logged on startup
+
+### Performance
+- **17 FK indexes** added to `schema.sql` - PostgreSQL does not auto-index foreign key columns; these improve JOIN performance and cascading delete efficiency across zones, orders, PO/SO lines, pick tasks, fulfillments, transfers, cycle counts, and audit log
+
+### Mobile
+- **First-run setup screen** - detects if no server URL has been saved and shows a dedicated connect screen with health check validation before accepting the URL
+- **Chainway scanner plugin fix** - config plugin now detects Kotlin vs Java `MainApplication` and uses correct patterns for package registration (fixes "Native module not available" on standalone APK)
+- **Cleartext traffic plugin** - new `with-cleartext-traffic.js` Expo config plugin for Android 9+ HTTP support
+- **API client improvements** - `hasStoredApiUrl()` helper, full URL in debug logs, server URL modal validates connectivity before saving
+
+### Admin
+- **Auth reload loop fixed** - 401 handler now clears both token and user from localStorage
+- **Warehouse fetch gated behind auth** - `WarehouseProvider` waits for authenticated user before fetching warehouses
+- **Vitest config** added for frontend testing
+
+### Config
+- `.env.example` expanded with all variables, organized with comments, proper `JWT_SECRET` generation instructions
+
+### Tests
+- 6 new warehouse authorization tests
+- 283 tests passing (was 277)
+
+## [v0.9.8] - 2026-04-11
+
+### Security
+- **JWT_SECRET required**  -  app raises `RuntimeError` on startup if `JWT_SECRET` env var is missing (was silently falling back to hardcoded default)
+- **CORS restricted**  -  `CORS(app)` wildcard replaced with explicit origin whitelist (`CORS_ORIGINS` env var, defaults to `localhost:3000,localhost:8081`)
+- **Explicit allowed-field sets**  -  all admin update endpoints (items, POs, SOs, users, warehouses, zones, bins) now use `ALLOWED_FIELDS` sets instead of iterating arbitrary request keys
+- **Dead code removed**  -  unused `_paginate()` helper deleted from admin `__init__.py`
+
+### Admin Panel
+- Dark theme overhaul  -  header (#2a2520), sidebar, copper accents, cream text, 48px header with 192px sidebar
+- Warehouse picker dropdown in header  -  admin users switch warehouse context from the topbar
+- `WarehouseContext` provider persists selection in sessionStorage, auto-selects first warehouse on login
+- All pages use dynamic `warehouseId` from context instead of hardcoded `warehouse_id=1`
+- All pages re-fetch data automatically when warehouse selection changes
+- **Adjustments page**  -  direct inventory add/remove with searchable bin/item pickers, recent adjustments table
+- **Inter-Warehouse Transfers page**  -  cross-warehouse inventory moves with cascading warehouse/bin/item selects, transfer history
+- **Imports page**  -  merged import type selector and file upload into single card with download template buttons
+- Settings: removed import tools (moved to Imports page), added address fields to SO modal, vendor address to PO modal
+- Audit log: batch-resolves entity IDs to human-readable names (bins, items, SOs, POs)
+- Sidebar: added Adjustments and Transfers nav items under Warehouse group
+- 4 new API endpoints: `POST /admin/adjustments/direct`, `GET /admin/adjustments/list`, `POST /admin/inter-warehouse-transfer`, `GET /admin/inter-warehouse-transfers`
+
+### Mobile
+- PutAwayScreen: compressed spacing for suggest/item/confirm cards
+- TransferScreen: tightened step dots, labels, info cards, quantity row
+- PickWalkScreen: reduced bin/item/next card padding and margins
+- CountScreen: reduced bin header, turbo card, count input spacing
+- ReceiveScreen: reduced PO header and receive card spacing
+- LoginScreen: server URL moved to modal popup (was inline toggle), render guard for duplicate mount prevention
+- ActiveBatchBanner: layout fixes for C6000 small screen
+- Mobile version updated to v0.9.8
+
+### Code Quality
+- New `constants.py` with named constants for all status strings (PO, SO, batch, task, count, adjustment, audit action, bin type, role)
+- All 12 route files + `picking_service.py` refactored from hardcoded string literals (`'OPEN'`, `'PICKED'`, `'PENDING'`, etc.) to imported constants  -  eliminates typo risk across 100+ status comparisons
+
+### Data
+- Renamed 11 branded items to generic descriptions (e.g. "Orvis Clearwater Rod 9ft" → "9ft 5wt Fly Rod"); fly pattern names kept as-is (not trademarked)
+- Added `SKIP_SEED` environment variable: `SKIP_SEED=true` creates only admin user + default warehouse + default bins (no demo data); seed script converted to shell wrapper (`db/seed.sh`)
+
+## [v0.9.7] - 2026-04-10
+
+### Repeat Offender Fixes (8 bugs, 14 new tests)
+- Admin login: 401 handler no longer redirects during login attempt, preserving username field (#12)
+- Item weight: `save()` now sends `weight_lbs` correctly to API (#19)
+- Audit log: batch-resolves bin_id/item_id/so_id/po_id to human-readable names (bin codes, SKUs, SO/PO numbers) (#20)
+- Receiving bin filter: added `bin_type` query param to `/admin/bins` endpoint (#21)
+- Settings unsaved warning: `useBlocker` from react-router-dom v7 replaces manual navigation guard (#22)
+- Warehouse delete: hard DELETE with safety checks (bins, zones, inventory) replaces soft-deactivate (#23)
+- Login version pin: absolute positioning pinned to bottom of screen (#26)
+- Splash double title: removed splash image from app.json (#27)
+
+### Handheld Functional (5 bugs, 2 new tests)
+- Cancel receiving: new `/api/receiving/cancel` endpoint reverses receipts, PO line quantities, and inventory; ReceiveScreen tracks session receipt IDs (#2)
+- Put-away quantity tracking: remaining qty updates per item instead of removing from queue, green checkmark when fully put away (#3)
+- PagedList scroll: changed container from View to ScrollView (#4)
+- Over-receive popup: shows warning only once per item per session (#5)
+- PICKED SO routing: scanned PICKED orders now navigate to Ship screen (#10)
+
+### Handheld UI (7 bugs)
+- Settings menu: centered overlay with scrollable scan config (#1)
+- Renamed "Wave picking" to "Pick orders" on home screen (#6)
+- Double pick confirmation: auto-submits batch when all tasks complete, eliminated intermediate "Round Complete" view (#7)
+- Replaced all 9 `Alert.alert` calls with styled React Native modals across HomeScreen and ReceiveScreen (#8)
+- Warehouse selector: `TouchableOpacity` → `Pressable` for single-tap selection on Android, added overlay dismiss (#9)
+- Removed badge numbers from home screen operation cards (#11)
+- Scroll position: added `useScrollToTop` from React Navigation to all 7 scrollable screens (#14)
+
+### Admin Panel (8 bugs)
+- Cycle count approval: per-bin Submit/Approve All/Reject All buttons replace single global submit (#13)
+- User management: Delete (hard) replaces Deactivate, with styled confirmation modal (#15)
+- Create SO: full form on Picking page with so_number, warehouse, customer name/phone/address, ship method/address, order lines with item picker (#16)
+- Item management: view modal is read-only, edit modal now has Delete/Archive buttons (#17)
+- Delete item: styled confirmation popup replaces `confirm()` (#18)
+- SO clickable: row click on Picking/Packing/Shipping pages opens customer detail modal (#24)
+- Customer fields: added customer_phone and customer_address to sales order list API response (#25)
+
+### EAS Build
+- AsyncStorage URL: new `initApiUrl()` preloads saved server URL before any screens render; AuthProvider awaits it during loading phase
+
+### Stats
+- 277 tests passing (16 new)
+- 29 files changed, +1,105 / -212 lines
+
+## [v0.9.6] - 2026-04-09
+
+### Fixed
+- Scan hardening, cycle count approval, put-away reorder, manual picking, admin UX overhaul, CSV templates, role simplification
+
+## [v0.9.5] - 2026-04-08
+
+### Admin Panel
+- Cycle count approval page: review pending adjustments per item, approve/reject individually, apply approved changes to inventory
+- Inventory page: sortable columns by clicking headers (SKU, item name, bin, zone, quantities)
+- Item edit: Delete button (hard delete with confirmation, blocked if order history) and Archive button (soft delete, restorable)
+- Items page: filter dropdown for Active, Archived, or All items
+- Purchase orders: dedicated page showing all POs with status filter, clickable rows with Ordered/Received line detail
+- User creation: warehouse checkbox list (multi-warehouse assignment), simplified roles (Admin/User), mobile module access checkboxes (Pick, Pack, Ship, Receive, Put-Away, Count, Transfer)
+- User role enforcement: USER role shows "Not authorized, contact admin" on admin panel login
+- Warehouse management page: create, edit, delete warehouses
+- Settings: batch Save button replaces auto-save, "Unsaved changes" indicator, browser beforeunload warning
+- Admin panel version updated to 0.9.5
+
+### Mobile (Batch 1  -  Scan Debug)
+- Added `[SCAN_DEBUG]` logging to every scan handler across all screens
+- Added `[API_DEBUG]` request/response logging to API client
+- ScanInput: removed 300ms auto-submit timer (caused partial barcodes on C6000), added processing lock, improved whitespace/CR sanitization
+- All scan handlers: process only on Enter/Submit, trim `\r\n\s`, ignore empty, disable during processing
+
+### Mobile (Batch 2  -  Features)
+- Put-away: replaced forced sequential flow with scrollable item list (scan or tap any item)
+- Pick walk: item detail modal now has PICK + CLOSE buttons side by side for manual picking
+- Pick walk: replaced Alert.alert cancel with styled app modal (white card, 12px radius, tan border)
+- Pick walk: fixed NEXT ITEM PREVIEW  -  wrong API URL, stale task list, forward-scan logic for next PENDING task, "LAST ITEM IN BATCH" on final item
+- Cycle count architecture: removed auto-adjustment of inventory on variance  -  creates PENDING audit records instead
+- Cycle count: support for unexpected items (items found during count not in snapshot), flagged with "NEW" badge
+- Cycle count: blind count mode respects `count_show_expected` setting from admin
+- Transfer: X clear buttons on FROM BIN and TO BIN fields to correct mis-scans
+
+### CSV Templates
+- Added `docs/templates/` with 4 import templates: items, purchase orders, sales orders, bins (3 example rows each)
+- CSV import now supports purchase orders and sales orders (SKU-based line matching, auto-creates PO/SO headers)
+- "Download Template" link next to each import type selector
+
+### Database
+- Migration 013: `warehouse_ids INT[]` on users for multi-warehouse, role simplification (ADMIN/USER), default mobile module access
+- New endpoints: `GET/POST /api/admin/adjustments/pending|review`, `POST /api/admin/items/:id/archive`, `DELETE /api/admin/warehouses/:id`
+
+### Stats
+- 261 tests passing
+
+## [v0.9.4] - 2026-04-08
+
+### Refactored
+- Extracted `inventory_service.py` with `add_inventory()` and `move_inventory()`  -  inventory math now lives in one place instead of 3 route files
+- Created `@with_db` decorator  -  eliminates manual db session boilerplate from all 10 route files + 43 admin routes
+- Split 1,925-line `admin.py` monolith into 4 focused modules: `admin_warehouse.py`, `admin_items.py`, `admin_orders.py`, `admin_users.py`
+- Extracted shared mobile StyleSheets: `screenStyles`, `buttonStyles`, `modalStyles`, `listStyles`, `doneStyles`  -  removed ~360 lines of duplicate styles across 12 screens
+- Created `useScreenError` hook  -  consolidated error + scanDisabled state in 10 screens
+- Created `ScreenHeader` component  -  replaced ~20 lines of duplicated header JSX per screen
+- Created `ModeSelector` component  -  reusable Standard/Turbo toggle for Receive and Count screens
+- Added `ActivityIndicator` loading states to HomeScreen and PickWalkScreen
+
+### Fixed
+- ReceiveScreen hardcoded `warehouse_id=1` now uses auth context (multi-warehouse support)
+- Removed `console.log` statements from ScanInput and HomeScreen
+
+### Stats
+- 261 tests passing
+- Net: +2,081 / -12,918 lines (mostly deduplication)
+
+## [v0.9.3] - 2026-04-08
+
+### Fixed
+- UI revamp: tan cards, 12px radius, accent stripes, NEXT pick preview, blind cycle counts, carrier picker, password clear on bad login
+
+## [v0.9.2] - 2026-04-08
+
+### Fixed
+- Test suite refactored from per-test TRUNCATE+reseed to transaction rollback (261 tests in ~4.3s, fixes 365-min CI deadlock)
+- ScanInput auto-refocus every 500ms and auto-submit after 100ms pause for C6000 hardware scanner
+- Expanded ignored keys in ScanInput (F1-F12, Tab, Escape, GoBack)
+
+### Added
+- Short pick admin reporting endpoint (GET /api/admin/short-picks) with SKU, bin, expected/picked/shortage, picker, timestamp
+- Short pick count on dashboard pipeline (7d rolling, red when > 0)
+- Pick walk item detail modal  -  tap any item card for SKU, UPC, bin, zone, qty, contributing orders
+- `count_show_expected` setting enforced (hides expected qty for blind counts)
+
+### Changed
+- Bin types simplified from 6 (RECEIVING, PICKING, BULK, STAGING, SHIPPING, QC) to 3 (Staging, PickableStaging, Pickable)
+- Migration: db/migrations/011_bin_type_qc_used.sql
+- Updated across: schema.sql, seed data, admin.py, picking_service.py, putaway.py, PutAwayScreen.js, Settings.jsx, Bins.jsx
+- Seed data fully rewritten to match 61 printed Zebra barcode labels (20 items, 16 bins, 5 POs, 20 SOs)
+- All 12 test files rewritten for new seed data
+- 49 files changed, +2,089 / -665 lines
+
+## [v0.9.1] - 2026-04-06
+
+### Fixed
+- Put-Away missing from home screen (allowed_functions didn't include 'putaway')
+- Receiving confirm fails with PO_id error
+- Cycle count "Failed to create count" (FK constraint on inventory_adjustments)
+- ScanInput doesn't clear after scan
+- Double-tap required on home screen buttons
+- One scan confirms entire pick quantity (now one scan = one unit)
+- Pick quantities showing zeros (field mapping for line_count/total_units)
+- End-of-batch flow redesign with Submit/Cancel
+- Admin login shows no error on wrong password
+- SO status lifecycle (removed ALLOCATED, added proper PICKING/PICKED statuses)
+
+### Added
+- Two receiving modes: Standard (manual qty entry) and Turbo (each scan = 1 unit)
+- User icon dropdown menu with Logout
+- Second warehouse for testing
+- Preferred bins system with put-away suggestions (`preferred_bins` table)
+- SKU display on pick walk screen
+- Admin preferred bins page with full CRUD, inline priority editing, CSV export
+- Admin cycle counts page with detail modal (expected/counted/variance breakdown)
+- `count_show_expected` app setting for hiding expected quantities during counts
+- `useScanQueue` hook for sequential barcode processing in turbo mode
+- `POST /api/putaway/update-preferred` - set/change preferred bin from mobile
+- `GET/POST/PUT/DELETE /api/admin/preferred-bins` - admin CRUD for preferred bins
+- `GET /api/admin/cycle-counts` - cycle count list with line details
+- `GET/PUT /api/admin/settings` - app settings management
+
+### Changed
+- Put-away flow redesigned: scan item → see preferred bin suggestion → scan destination → optional preferred bin prompt
+- Receiving screen restructured to match pick scan pattern (PO queue → work through items)
+- Count screen supports Standard/Turbo modes with AsyncStorage persistence
+- Suggest bin endpoint queries `preferred_bins` table first, falls back to `default_bin_id`
+- Items admin page shows default bin column from preferred bins
+
+### Database
+- New `preferred_bins` table with priority ranking and UNIQUE(item_id, bin_id)
+- Seed data reset to match printed Zebra labels (fly fishing catalog)
+- PO quantities reduced to 5–10, SO quantities reduced to 1–2 for lab testing
+
+## [v0.9.0] - 2026-04-04
+
+### Added
+- React Native / Expo mobile scanner app (`mobile/` directory) for warehouse floor operations
+- 10 screens: Login, Home, Receive, Put-Away, Pick Scan (wave), Pick Walk, Pick Complete, Pack/Ship, Cycle Count, Transfer
+- 5 shared components: ScanInput (keyboard wedge), ErrorPopup (blocking modal), ActiveBatchBanner, WarehouseSelector, PagedList
+- Hardware barcode scanner support via keyboard wedge (TextInput capture on Enter key)
+- JWT auth context with session timeout (8-hour default), auto-logout on app foreground
+- API client (native fetch) with JWT interceptor and 401 auto-logout
+- Stack navigation (React Navigation) with auth-gated routing
+- Universal scan bar on home screen (item/bin lookup from any barcode)
+- Role-based function visibility on home screen (ADMIN sees all, others see allowed_functions)
+- Active batch resume banner on home screen
+- Warehouse switching from header tap
+- Wave picking: scan SOs, build batch, walk pick path with zone/aisle display
+- Short pick modal with quantity input
+- Contributing orders collapsible section on pick walk
+- Pack verification: scan-to-verify each item, then ship with carrier/tracking
+- Cycle count: scan bin, enter counts, auto-variance detection
+- Transfer: 3-step scan flow (item, from bin, to bin) with quantity input
+- Brand theme: Accent Red (#8e2715), Copper (#c4722a), Cream (#FCF4E3), monospace typography, 48dp tap targets
+- `GET /api/picking/active-batch` - returns user's incomplete pick batch for resume
+- `GET /api/warehouses/list` - public endpoint (no auth) for login screen warehouse selector
+- `GET /api/auth/me` - returns user info with role-based allowed_functions
+- `app_settings` table for configurable session timeout
+- `allowed_functions` column on users table for per-user function visibility
+- Migration: `db/migrations/009_mobile_app.sql`
+- 9 new API tests in `test_mobile_endpoints.py` (warehouse list, auth/me, active batch, session settings)
+
+## [v0.8.2] - 2026-04-04
+
+### Changed
+- `GET /api/picking/batch/<id>/next` now includes explicit `zone` and `aisle` fields
+- Zone and aisle return as null (not empty string) when bin has no zone or aisle assignment
+- Pick task queries use LEFT JOIN on zones for bins without zone assignment
+- Added zone_name to batch task list and next-task responses
+
+## [v0.8.1] - 2026-04-04
+
+### Added
+- Wave picking workflow for combining identical items across multiple sales orders
+- `POST /api/picking/wave-validate` - lightweight SO barcode validation before adding to wave
+- `POST /api/picking/wave-create` - creates wave batch with combined picks and optimized walk path
+- `wave_pick_orders` table linking SOs to wave batches
+- `wave_pick_breakdown` table tracking per-SO contributions to combined pick tasks
+- Contributing orders shown on `GET /api/picking/batch/<id>/next` with pick_number/total_picks
+- Short pick FIFO distribution across contributing orders (fills earlier SOs first)
+- Confirm pick updates all contributing SO lines via wave breakdown records
+- ERP connector stub (`connector_stub.py`) with `enrich_order()` placeholder for future integration
+- 19 wave picking tests covering validation, creation, breakdown, short distribution, and full flow
+
+## [v0.8.0] - 2026-04-04
+
+### Added
+- React admin panel frontend (`admin/` directory) built with Vite + React Router
+- Login page with JWT authentication and token persistence
+- Dashboard with pipeline bar (To Receive, Put-away, To Pick, To Pack, To Ship, Low Stock)
+- Dashboard order table, low stock alerts, recent activity feed, and inbound PO table
+- Inventory overview page with search and pagination
+- Cycle count page with bin selection and count creation
+- Receiving page with PO list and line detail modal
+- Put-away page showing items in staging bins
+- Picking page with orders ready to pick
+- Packing page with orders waiting to pack
+- Shipping page with orders waiting to ship
+- Bin management page with create, detail view, edit, and inventory contents
+- Zone management page with create and edit
+- Item management page with search, create, detail view, edit, and soft delete
+- User management page with create, edit, role assignment, and deactivation
+- Audit log viewer with action type, user, and date range filters
+- Settings page with warehouse config, CSV/JSON import, manual PO/SO creation, and version info
+- Reusable components: DataTable (with CSV export), StatusTag, Pipeline, Modal, PageHeader
+- Sidebar navigation organized by warehouse workflow (Floor, Inbound, Outbound, Warehouse, System)
+- Sidebar count badges from dashboard stats
+- API client with JWT auto-injection and 401 redirect
+- CSS custom properties for theming with Instrument Sans and JetBrains Mono fonts
+- Docker support for admin panel in docker-compose.yml
+- Vite dev server with API proxy to Flask backend
+
+## [v0.7.0] - 2026-04-04
+
+### Added
+- Full admin CRUD API for the web admin panel (`/api/admin` blueprint)
+- Warehouse management: list, get (with zones), create, update
+- Zone management: list (filter by warehouse), create with type validation, update
+- Bin management: list (filter by warehouse/zone), get (with inventory), create with type validation, update
+- Item management: list with pagination and category/active filters, get (with inventory locations), create with SKU/UPC uniqueness, update, soft delete (blocks if inventory exists)
+- Purchase order management: list with pagination and status/warehouse filters, get (with lines), create with lines, update (OPEN only), close
+- Sales order management: list with pagination and status/warehouse filters, get (with lines), create with lines, update (OPEN only), cancel (releases allocated inventory if ALLOCATED)
+- User management: list (excludes password_hash), create with bcrypt hashing and role validation, update (including password change), soft delete (blocks self-deactivation)
+- Audit log viewer: paginated list with action_type, user_id, date range filters
+- Inventory overview: paginated list with warehouse/item filters, joins item and bin details
+- CSV/JSON bulk import for items and bins with per-row validation and error reporting
+- Dashboard stats endpoint: open POs, pending receipts, putaway queue, order pipeline counts, total SKUs/bins, low stock alerts, recent activity feed
+- Role enforcement: write operations require ADMIN or MANAGER role, read operations open to all authenticated users
+
+## [v0.6.0] - 2026-04-02
+
+### Added
+- Cycle counting workflow: create counts, view expected vs actual, submit with variance detection
+- `POST /api/inventory/cycle-count/create` - create cycle counts for one or more bins with inventory snapshot
+- `GET /api/inventory/cycle-count/<count_id>` - view count with expected quantities and count status
+- `POST /api/inventory/cycle-count/submit` - submit physical counts, auto-create adjustments for variances
+- Inventory adjustment records with reason codes and cycle count linkage
+- General-purpose bin transfers for stock reorganization
+- `POST /api/transfers/move` - move items between any two bins with audit trail
+- Automatic inventory correction on cycle count variance (updates quantity_on_hand)
+- Last-counted-at tracking on inventory rows
+
+## [v0.5.0] - 2026-04-02
+
+### Added
+- Packing workflow: scan-to-verify pack station with barcode validation
+- `GET /api/packing/order/<barcode>` - load order for packing with calculated weight
+- `POST /api/packing/verify` - scan item barcode to verify against picked list
+- `POST /api/packing/complete` - mark order fully packed after all items verified
+- Shipping / fulfillment workflow: record tracking info and create fulfillment records
+- `POST /api/shipping/fulfill` - submit shipment with tracking number, carrier, and ship method
+- Fulfillment line traceability (links shipped items back to source pick bins)
+- Calculated package weight from item weights × picked quantities
+- Over-pack prevention (blocks verifying more than picked quantity)
+- Status enforcement: packing requires PICKING status, shipping requires PACKED status
+
+## [v0.4.0] - 2026-04-02
+
+### Added
+- Batch picking with pick path optimization (`pick_sequence`-based serpentine walk)
+- `POST /api/picking/create-batch` - create pick batch from multiple SOs with inventory allocation
+- `GET /api/picking/batch/<id>` - full batch with tasks in walk-path order
+- `GET /api/picking/batch/<id>/next` - next pending pick task
+- `POST /api/picking/confirm` - confirm pick with barcode validation (rejects wrong scans)
+- `POST /api/picking/short` - report short picks with shortage tracking
+- `POST /api/picking/complete-batch` - complete batch, update SO statuses
+- Picking service (`picking_service.py`) with core allocation and path optimization logic
+
+## [v0.3.0] - 2026-04-02
+
+### Added
+- Receiving workflow: scan PO barcode, verify items, submit receipt to staging bin
+- Put-away workflow: pending items list, bin suggestion (default bin or stock consolidation), scan-to-confirm transfer
+- `GET /api/receiving/po/<barcode>` - PO lookup with lines and expected items
+- `POST /api/receiving/receive` - submit item receipts with inventory updates
+- `GET /api/putaway/pending/<warehouse_id>` - items in staging awaiting put-away
+- `GET /api/putaway/suggest/<item_id>` - suggested bin for put-away
+- `POST /api/putaway/confirm` - confirm put-away with bin transfer record
+- Reusable audit logging service (`audit_service.py`)
+- Over-receipt warnings (allowed but flagged)
+
+## [v0.2.0] - 2026-04-02
+
+### Added
+- JWT authentication system (`POST /api/auth/login`, `POST /api/auth/refresh`)
+- `@require_auth` and `@require_role` middleware decorators
+- Item lookup by barcode (`GET /api/lookup/item/<barcode>`) with inventory locations
+- Bin lookup by barcode (`GET /api/lookup/bin/<barcode>`) with contents
+- Item search (`GET /api/lookup/item/search?q=`) - case-insensitive by SKU, name, UPC
+- Bin search (`GET /api/lookup/bin/search?q=`) - case-insensitive by code
+- User model with bcrypt password verification
+- Auth service with JWT token generation and validation
+- Password hashing utility (`scripts/hash_password.py`)
+
+## [v0.1.0] - 2026-04-02
+
+### Added
+- Initial project structure matching build plan
+- PostgreSQL schema - 20 tables covering warehouses, zones, bins, items, inventory, POs, SOs, pick batches, fulfillments, audit log, users
+- Flask API skeleton with `/api/health` endpoint
+- Docker Compose for local development (PostgreSQL 16 + Flask API)
+- Apartment test lab seed data (1 warehouse, 5 zones, 9 bins, 10 items, sample PO + SOs)
+- README, CONTRIBUTING.md, LICENSE (MIT), .gitignore, .env.example

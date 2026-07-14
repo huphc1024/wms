@@ -1,0 +1,1270 @@
+"""Users, Audit Log, Dashboard Stats, Settings, Cycle Counts, and Adjustment Approval endpoints."""
+
+import math
+import uuid
+from datetime import datetime, timezone
+
+import bcrypt
+from flask import g, jsonify, request
+from sqlalchemy import text
+
+from constants import (
+    PO_OPEN, PO_PARTIAL, SO_OPEN, SO_PICKED, SO_PACKED,
+    BATCH_OPEN, BATCH_IN_PROGRESS,
+    ADJ_PENDING, ADJ_APPROVED, ADJ_REJECTED,
+    BIN_STAGING, ACTION_ADJUST,
+    ALL_OVERRIDE_KEYS,
+    ALL_PAGE_KEYS,
+)
+from middleware.auth_middleware import require_admin_or_page_permission, require_auth
+from middleware.db import with_db
+from routes.admin import VALID_ROLES, admin_bp
+from schemas.inventory_adjustments import DirectAdjustmentRequest, ReviewAdjustmentsRequest
+from schemas.settings import UpdateSettingsRequest
+from schemas.users import (
+    CreateUserRequest,
+    UpdateUserPagePermissionsRequest,
+    UpdateUserRequest,
+)
+from services.audit_service import write_audit_log
+from services.events_service import emit_event, get_user_external_id, resolve_source_external_id
+from services.auth_service import validate_password
+from services.inventory_service import add_inventory
+from utils.validation import validate_body
+
+
+# ── Users ─────────────────────────────────────────────────────────────────────
+
+@admin_bp.route("/users", methods=["GET"])
+@require_auth
+@require_admin_or_page_permission("users")
+@with_db
+def list_users():
+    page = request.args.get("page", 1, type=int)
+    per_page = min(request.args.get("per_page", 50, type=int), 1000)
+
+    total = g.db.execute(text("SELECT COUNT(*) FROM users")).scalar()
+    pages = max(1, math.ceil(total / per_page))
+
+    rows = g.db.execute(
+        text("SELECT user_id, username, full_name, role, warehouse_id, warehouse_ids, allowed_functions, is_active, created_at, last_login FROM users ORDER BY user_id LIMIT :limit OFFSET :offset"),
+        {"limit": per_page, "offset": (page - 1) * per_page},
+    ).fetchall()
+    return jsonify({
+        "users": [
+            {"user_id": r.user_id, "username": r.username, "full_name": r.full_name,
+             "role": r.role, "warehouse_id": r.warehouse_id,
+             "warehouse_ids": list(r.warehouse_ids) if r.warehouse_ids else [],
+             "allowed_functions": list(r.allowed_functions) if r.allowed_functions else [],
+             "is_active": r.is_active,
+             "created_at": r.created_at.isoformat() if r.created_at else None,
+             "last_login": r.last_login.isoformat() if r.last_login else None}
+            for r in rows
+        ],
+        "total": total, "page": page, "per_page": per_page, "pages": pages,
+    })
+
+
+@admin_bp.route("/users", methods=["POST"])
+@require_auth
+@require_admin_or_page_permission("users")
+@validate_body(CreateUserRequest)
+@with_db
+def create_user(validated):
+    data = validated.model_dump()
+
+    pw_error = validate_password(data["password"])
+    if pw_error:
+        return jsonify({"error": pw_error}), 400
+
+    dup = g.db.execute(text("SELECT 1 FROM users WHERE username = :u"), {"u": data["username"]}).fetchone()
+    if dup:
+        return jsonify({"error": f"Duplicate username: {data['username']}"}), 400
+
+    warehouse_ids = data.get("warehouse_ids", [])
+    warehouse_id = warehouse_ids[0] if warehouse_ids else data.get("warehouse_id")
+    allowed_functions = data.get("allowed_functions", [])
+
+    pw_hash = bcrypt.hashpw(data["password"].encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    result = g.db.execute(
+        text("""
+            INSERT INTO users (username, password_hash, full_name, role, warehouse_id, warehouse_ids, allowed_functions, external_id)
+            VALUES (:u, :pw, :name, :role, :wid, :wids, :funcs, :ext_id)
+            RETURNING user_id, username, full_name, role, warehouse_id, warehouse_ids, allowed_functions, is_active, created_at
+        """),
+        {"u": data["username"], "pw": pw_hash, "name": data["full_name"],
+         "role": data["role"], "wid": warehouse_id, "wids": warehouse_ids,
+         "funcs": allowed_functions, "ext_id": str(uuid.uuid4())},
+    )
+    row = result.fetchone()
+    g.db.commit()
+    return jsonify({
+        "user_id": row.user_id, "username": row.username, "full_name": row.full_name,
+        "role": row.role, "warehouse_id": row.warehouse_id,
+        "warehouse_ids": list(row.warehouse_ids) if row.warehouse_ids else [],
+        "allowed_functions": list(row.allowed_functions) if row.allowed_functions else [],
+        "is_active": row.is_active,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }), 201
+
+
+@admin_bp.route("/users/<int:user_id>", methods=["PUT"])
+@require_auth
+@require_admin_or_page_permission("users")
+@validate_body(UpdateUserRequest)
+@with_db
+def update_user(user_id, validated):
+    data = validated.model_dump(exclude_unset=True)
+
+    existing = g.db.execute(
+        text("SELECT user_id, role, is_active FROM users WHERE user_id = :uid"), {"uid": user_id}
+    ).fetchone()
+    if not existing:
+        return jsonify({"error": "User not found"}), 404
+
+    # Prevent admin from deactivating themselves or downgrading their own role
+    is_self = g.current_user["user_id"] == user_id
+    if is_self:
+        if "is_active" in data and not data["is_active"]:
+            return jsonify({"error": "Cannot deactivate your own account"}), 400
+        if "role" in data and data["role"] != "ADMIN":
+            return jsonify({"error": "Cannot downgrade your own role"}), 400
+
+    # Prevent deactivating or demoting the last active admin.
+    # V-031: SELECT ... FOR UPDATE locks every active admin row so that a
+    # concurrent demote/deactivate/delete cannot observe the same count
+    # and both proceed to leave zero admins.
+    if existing.role == "ADMIN" and existing.is_active:
+        demoting = ("role" in data and data["role"] != "ADMIN")
+        deactivating = ("is_active" in data and not data["is_active"])
+        if demoting or deactivating:
+            admins = g.db.execute(
+                text(
+                    "SELECT user_id FROM users "
+                    "WHERE role = 'ADMIN' AND is_active = TRUE "
+                    "FOR UPDATE"
+                )
+            ).fetchall()
+            if len(admins) <= 1:
+                return jsonify({"error": "Cannot remove the last active admin"}), 400
+
+    ALLOWED_FIELDS = {"full_name", "role", "warehouse_id", "is_active"}
+    fields, params = [], {"uid": user_id}
+    for col in ALLOWED_FIELDS:
+        if col in data:
+            fields.append(f"{col} = :{col}")
+            params[col] = data[col]
+
+    if "warehouse_ids" in data:
+        fields.append("warehouse_ids = :warehouse_ids")
+        params["warehouse_ids"] = data["warehouse_ids"]
+        # Keep warehouse_id in sync (first warehouse)
+        if data["warehouse_ids"]:
+            fields.append("warehouse_id = :wid_sync")
+            params["wid_sync"] = data["warehouse_ids"][0]
+
+    if "allowed_functions" in data:
+        fields.append("allowed_functions = :allowed_functions")
+        params["allowed_functions"] = data["allowed_functions"]
+
+    if "password" in data and data["password"]:
+        pw_error = validate_password(data["password"])
+        if pw_error:
+            return jsonify({"error": pw_error}), 400
+        pw_hash = bcrypt.hashpw(data["password"].encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        fields.append("password_hash = :pw_hash")
+        params["pw_hash"] = pw_hash
+        fields.append("password_changed_at = NOW()")
+
+    if not fields:
+        return jsonify({"error": "No fields to update"}), 400
+
+    g.db.execute(text(f"UPDATE users SET {', '.join(fields)} WHERE user_id = :uid"), params)
+    g.db.commit()
+
+    row = g.db.execute(
+        text("SELECT user_id, username, full_name, role, warehouse_id, warehouse_ids, allowed_functions, is_active, created_at, last_login FROM users WHERE user_id = :uid"),
+        {"uid": user_id},
+    ).fetchone()
+    return jsonify({
+        "user_id": row.user_id, "username": row.username, "full_name": row.full_name,
+        "role": row.role, "warehouse_id": row.warehouse_id,
+        "warehouse_ids": list(row.warehouse_ids) if row.warehouse_ids else [],
+        "allowed_functions": list(row.allowed_functions) if row.allowed_functions else [],
+        "is_active": row.is_active,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "last_login": row.last_login.isoformat() if row.last_login else None,
+    })
+
+
+@admin_bp.route("/users/<int:user_id>", methods=["DELETE"])
+@require_auth
+@require_admin_or_page_permission("users")
+@with_db
+def delete_user(user_id):
+    existing = g.db.execute(text("SELECT user_id FROM users WHERE user_id = :uid"), {"uid": user_id}).fetchone()
+    if not existing:
+        return jsonify({"error": "User not found"}), 404
+
+    if g.current_user["user_id"] == user_id:
+        return jsonify({"error": "Cannot delete yourself"}), 400
+
+    # Prevent deleting the last active admin.
+    # V-031: same row-locking pattern as update_user so two concurrent
+    # deletes cannot both observe admin_count == 2 and both proceed.
+    target = g.db.execute(
+        text("SELECT role, is_active FROM users WHERE user_id = :uid"), {"uid": user_id}
+    ).fetchone()
+    if target and target.role == "ADMIN" and target.is_active:
+        admins = g.db.execute(
+            text(
+                "SELECT user_id FROM users "
+                "WHERE role = 'ADMIN' AND is_active = TRUE "
+                "FOR UPDATE"
+            )
+        ).fetchall()
+        if len(admins) <= 1:
+            return jsonify({"error": "Cannot delete the last active admin"}), 400
+
+    g.db.execute(text("DELETE FROM users WHERE user_id = :uid"), {"uid": user_id})
+    g.db.commit()
+    return jsonify({"message": "User deleted"})
+
+
+# ── Per-page web-admin permission grants (P6.1) ──────────────────────────────
+
+@admin_bp.route("/users/<int:user_id>/permissions", methods=["GET"])
+@require_auth
+@require_admin_or_page_permission("users")
+@with_db
+def get_user_permissions(user_id):
+    """Return the list of page_keys explicitly granted to a USER.
+    ADMIN role users return the full ALL_PAGE_KEYS catalog so the UI
+    can mark every checkbox without a separate role check."""
+    user = g.db.execute(
+        text("SELECT user_id, role FROM users WHERE user_id = :uid"),
+        {"uid": user_id},
+    ).fetchone()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    if user.role == "ADMIN":
+        # ADMIN bypasses both page and override
+        # checks, so the modal should render every checkbox (including
+        # the override card) as checked. The PUT path no-ops for ADMIN
+        # so this is purely display.
+        return jsonify({
+            "user_id": user_id,
+            "role": "ADMIN",
+            "page_keys": list(ALL_PAGE_KEYS) + list(ALL_OVERRIDE_KEYS),
+            "is_full_access": True,
+        })
+
+    rows = g.db.execute(
+        text(
+            "SELECT page_key FROM user_page_permissions "
+            "WHERE user_id = :uid ORDER BY page_key"
+        ),
+        {"uid": user_id},
+    ).fetchall()
+    return jsonify({
+        "user_id": user_id,
+        "role": user.role,
+        "page_keys": [r.page_key for r in rows],
+        "is_full_access": False,
+    })
+
+
+@admin_bp.route("/users/<int:user_id>/permissions", methods=["PUT"])
+@require_auth
+@require_admin_or_page_permission("users")
+@validate_body(UpdateUserPagePermissionsRequest)
+@with_db
+def replace_user_permissions(user_id, validated):
+    """Replace a user's full per-page grant set in one transaction.
+
+    Unknown page_keys land as 400 so a typo cannot quietly persist a
+    grant the sidebar will never honor. The replace-all semantics mean
+    the caller does not have to diff and DELETE the old set; whatever
+    page_keys arrive in the body become the new authoritative set.
+
+    Granting permissions to an ADMIN is a no-op: ADMINs bypass the
+    table entirely so the rows do nothing useful. The handler still
+    accepts the request without writing rows so the frontend's
+    "Save permissions" button does not have to special-case roles.
+    """
+    user = g.db.execute(
+        text("SELECT user_id, role FROM users WHERE user_id = :uid"),
+        {"uid": user_id},
+    ).fetchone()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    requested = list(dict.fromkeys(validated.page_keys))  # de-dup, preserve order
+    # Override grants (mig 062) ride on the same junction
+    # table so the multi-select can write them in one PUT. The full
+    # acceptable set is ALL_PAGE_KEYS ∪ ALL_OVERRIDE_KEYS.
+    valid_keys = set(ALL_PAGE_KEYS) | set(ALL_OVERRIDE_KEYS)
+    unknown = [k for k in requested if k not in valid_keys]
+    if unknown:
+        return jsonify({
+            "error": "Unknown page_key(s)",
+            "unknown": unknown,
+        }), 400
+
+    if user.role == "ADMIN":
+        # ADMINs always have full access; rows are inert. Skip the
+        # write so we do not pollute the table with redundant data.
+        return jsonify({
+            "user_id": user_id,
+            "role": "ADMIN",
+            "page_keys": list(ALL_PAGE_KEYS) + list(ALL_OVERRIDE_KEYS),
+            "is_full_access": True,
+        })
+
+    granted_by = g.current_user["user_id"]
+    g.db.execute(
+        text("DELETE FROM user_page_permissions WHERE user_id = :uid"),
+        {"uid": user_id},
+    )
+    if requested:
+        # Pass a list of dicts so SQLAlchemy issues an executemany.
+        # Avoids the :keys::text[] form which collides with SQLAlchemy's
+        # named-parameter parser (the `::` cast is read as the start of
+        # another parameter).
+        g.db.execute(
+            text(
+                "INSERT INTO user_page_permissions (user_id, page_key, granted_by) "
+                "VALUES (:uid, :pk, :gb)"
+            ),
+            [{"uid": user_id, "pk": pk, "gb": granted_by} for pk in requested],
+        )
+    g.db.commit()
+    return jsonify({
+        "user_id": user_id,
+        "role": user.role,
+        "page_keys": requested,
+        "is_full_access": False,
+    })
+
+
+# ── Audit Log ─────────────────────────────────────────────────────────────────
+
+@admin_bp.route("/audit-log", methods=["GET"])
+@require_auth
+@require_admin_or_page_permission("audit-log")
+@with_db
+def list_audit_log():
+    page = request.args.get("page", 1, type=int)
+    per_page = min(request.args.get("per_page", 50, type=int), 1000)
+
+    where_clauses, params = [], {}
+    action_type = request.args.get("action_type")
+    user_id = request.args.get("user_id")
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    # Per-item history filter. Matches both rows where
+    # entity_type='ITEM' AND entity_id=item_id (direct item events) and
+    # rows whose details JSONB carries the item_id (e.g. PICK / RECEIVE
+    # rows scoped to an SO or PO that touched this item). The OR keeps a
+    # single page returning the full lifecycle.
+    item_id_arg = request.args.get("item_id", type=int)
+
+    if action_type:
+        where_clauses.append("al.action_type = :action_type")
+        params["action_type"] = action_type
+    if user_id:
+        where_clauses.append("al.user_id = :filter_user_id")
+        params["filter_user_id"] = user_id
+    if start_date:
+        where_clauses.append("al.created_at >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        where_clauses.append("al.created_at <= :end_date")
+        params["end_date"] = end_date
+    if item_id_arg:
+        where_clauses.append(
+            "((al.entity_type = 'ITEM' AND al.entity_id = :item_id_filter) "
+            " OR (al.details ? 'item_id' "
+            "     AND (al.details->>'item_id')::int = :item_id_filter))"
+        )
+        params["item_id_filter"] = item_id_arg
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    total = g.db.execute(text(f"SELECT COUNT(*) FROM audit_log al {where_sql}"), params).scalar()
+    pages = max(1, math.ceil(total / per_page))
+
+    # v1.4.2 #95: sortable column headers. Whitelist prevents SQL
+    # injection via an operator-supplied sort_by value and also caps
+    # the sort axes to the ones that meaningfully make sense on an
+    # audit log (timestamp / action / user / entity type).
+    SORT_COLUMNS = {
+        "created_at": "al.created_at",
+        "action_type": "al.action_type",
+        "user_id": "al.user_id",
+        "entity_type": "al.entity_type",
+    }
+    sort_by_arg = request.args.get("sort_by", "created_at")
+    sort_col = SORT_COLUMNS.get(sort_by_arg, "al.created_at")
+    sort_dir = "ASC" if request.args.get("sort_direction", "desc").lower() == "asc" else "DESC"
+
+    params["limit"] = per_page
+    params["offset"] = (page - 1) * per_page
+    rows = g.db.execute(
+        text(f"""
+            SELECT al.log_id, al.action_type, al.entity_type, al.entity_id,
+                   al.user_id, al.device_id, al.warehouse_id, al.details, al.created_at,
+                   CASE al.entity_type
+                       WHEN 'ITEM' THEN (SELECT sku FROM items WHERE item_id = al.entity_id)
+                       WHEN 'SO' THEN (SELECT so_number FROM sales_orders WHERE so_id = al.entity_id)
+                       WHEN 'PO' THEN (SELECT po_number FROM purchase_orders WHERE po_id = al.entity_id)
+                       WHEN 'BIN' THEN (SELECT bin_code FROM bins WHERE bin_id = al.entity_id)
+                       ELSE NULL
+                   END AS entity_name,
+                   w.warehouse_code
+            FROM audit_log al
+            LEFT JOIN warehouses w ON w.warehouse_id = al.warehouse_id
+            {where_sql}
+            ORDER BY {sort_col} {sort_dir}, al.log_id DESC LIMIT :limit OFFSET :offset
+        """),
+        params,
+    ).fetchall()
+
+    # Collect IDs from details to batch-resolve to human-readable names
+    bin_ids, item_ids, so_ids, po_ids = set(), set(), set(), set()
+    for r in rows:
+        d = r.details if isinstance(r.details, dict) else {}
+        for k, v in d.items():
+            if not isinstance(v, int):
+                continue
+            if "bin" in k:
+                bin_ids.add(v)
+            elif "item" in k:
+                item_ids.add(v)
+            elif "so" in k:
+                so_ids.add(v)
+            elif "po" in k:
+                po_ids.add(v)
+
+    bin_map, item_map, so_map, po_map = {}, {}, {}, {}
+    if bin_ids:
+        for br in g.db.execute(text("SELECT bin_id, bin_code FROM bins WHERE bin_id = ANY(:ids)"), {"ids": list(bin_ids)}).fetchall():
+            bin_map[br.bin_id] = br.bin_code
+    if item_ids:
+        for ir in g.db.execute(text("SELECT item_id, sku FROM items WHERE item_id = ANY(:ids)"), {"ids": list(item_ids)}).fetchall():
+            item_map[ir.item_id] = ir.sku
+    if so_ids:
+        for sr in g.db.execute(text("SELECT so_id, so_number FROM sales_orders WHERE so_id = ANY(:ids)"), {"ids": list(so_ids)}).fetchall():
+            so_map[sr.so_id] = sr.so_number
+    if po_ids:
+        for pr in g.db.execute(text("SELECT po_id, po_number FROM purchase_orders WHERE po_id = ANY(:ids)"), {"ids": list(po_ids)}).fetchall():
+            po_map[pr.po_id] = pr.po_number
+
+    def resolve_details(details):
+        if not isinstance(details, dict):
+            return details
+        resolved = {}
+        for k, v in details.items():
+            if isinstance(v, int):
+                if "bin" in k and v in bin_map:
+                    resolved[k.replace("_id", "")] = bin_map[v]
+                    continue
+                elif "item" in k and v in item_map:
+                    resolved[k.replace("_id", "")] = item_map[v]
+                    continue
+                elif "so" in k and v in so_map:
+                    resolved[k.replace("_id", "")] = so_map[v]
+                    continue
+                elif "po" in k and v in po_map:
+                    resolved[k.replace("_id", "")] = po_map[v]
+                    continue
+            resolved[k] = v
+        return resolved
+
+    return jsonify({
+        "entries": [
+            {"log_id": r.log_id, "action_type": r.action_type, "entity_type": r.entity_type,
+             "entity_id": r.entity_id, "entity_name": r.entity_name,
+             "username": r.user_id, "device_id": r.device_id,
+             "warehouse_id": r.warehouse_id, "warehouse_code": r.warehouse_code,
+             "details": resolve_details(r.details),
+             "created_at": r.created_at.isoformat() if r.created_at else None}
+            for r in rows
+        ],
+        "total": total, "page": page, "per_page": per_page, "pages": pages,
+    })
+
+
+# ── Dashboard Stats ───────────────────────────────────────────────────────────
+
+@admin_bp.route("/dashboard", methods=["GET"])
+@require_auth
+# /dashboard is reachable by any authenticated user so the sidebar can show badges; the response shape is non-sensitive (just counts).
+@with_db
+def dashboard():
+    warehouse_id = request.args.get("warehouse_id", type=int)
+    wh_filter = "AND warehouse_id = :wid" if warehouse_id else ""
+    wh_params = {"wid": warehouse_id} if warehouse_id else {}
+
+    open_pos = g.db.execute(text(f"SELECT COUNT(*) FROM purchase_orders WHERE status IN (:po_open, :po_partial) {wh_filter}"), {**wh_params, "po_open": PO_OPEN, "po_partial": PO_PARTIAL}).scalar()
+
+    pending_receipts = g.db.execute(
+        text(f"SELECT COALESCE(SUM(pol.quantity_ordered - pol.quantity_received), 0) FROM purchase_order_lines pol JOIN purchase_orders po ON po.po_id = pol.po_id WHERE po.status IN (:po_open, :po_partial) {wh_filter.replace('warehouse_id', 'po.warehouse_id')}"),
+        {**wh_params, "po_open": PO_OPEN, "po_partial": PO_PARTIAL},
+    ).scalar()
+
+    items_awaiting_putaway = g.db.execute(
+        text(f"SELECT COALESCE(SUM(inv.quantity_on_hand), 0) FROM inventory inv JOIN bins b ON b.bin_id = inv.bin_id WHERE b.bin_type = :bin_staging {wh_filter.replace('warehouse_id', 'inv.warehouse_id')}"),
+        {**wh_params, "bin_staging": BIN_STAGING},
+    ).scalar()
+
+    open_sos = g.db.execute(text(f"SELECT COUNT(*) FROM sales_orders WHERE status = :so_open {wh_filter}"), {**wh_params, "so_open": SO_OPEN}).scalar()
+
+    # PICKING was retired as an SO status in mig 060; "in picking" is now
+    # derived from any OPEN SO with a row in pick_batch_orders against a
+    # non-terminal batch. "Ready to pick" is open_sos minus that count so
+    # the two tiles stay disjoint.
+    in_picking = g.db.execute(
+        text(f"""
+            SELECT COUNT(DISTINCT pbo.so_id)
+              FROM pick_batch_orders pbo
+              JOIN pick_batches pb ON pb.batch_id = pbo.batch_id
+              JOIN sales_orders so ON so.so_id = pbo.so_id
+             WHERE pb.status IN (:batch_open, :batch_in_progress)
+               AND so.status = :so_open
+               {wh_filter.replace('warehouse_id', 'so.warehouse_id')}
+        """),
+        {**wh_params, "so_open": SO_OPEN, "batch_open": BATCH_OPEN, "batch_in_progress": BATCH_IN_PROGRESS},
+    ).scalar()
+    ready_to_pick = max(0, open_sos - in_picking)
+    # Toggle-aware pack/ship counts
+    packing_row = g.db.execute(
+        text("SELECT value FROM app_settings WHERE key = 'require_packing_before_shipping'")
+    ).fetchone()
+    require_packing = not packing_row or packing_row.value != "false"
+
+    picked_count = g.db.execute(text(f"SELECT COUNT(*) FROM sales_orders WHERE status = :so_picked {wh_filter}"), {**wh_params, "so_picked": SO_PICKED}).scalar()
+    packed_count = g.db.execute(text(f"SELECT COUNT(*) FROM sales_orders WHERE status = :so_packed {wh_filter}"), {**wh_params, "so_packed": SO_PACKED}).scalar()
+    # v1.9.0 #311: surface cancelled count so operators have visibility
+    # into cancellation rate alongside the other lifecycle counters.
+    cancelled_count = g.db.execute(text(f"SELECT COUNT(*) FROM sales_orders WHERE status = 'CANCELLED' {wh_filter}"), wh_params).scalar()
+    # mig 074: refunds are their own terminal status now, counted apart from
+    # plain cancellations so the cancellation rate is not inflated by refunds.
+    refunded_count = g.db.execute(text(f"SELECT COUNT(*) FROM sales_orders WHERE status = 'REFUNDED' {wh_filter}"), wh_params).scalar()
+
+    if require_packing:
+        ready_to_pack = picked_count
+        orders_packed = packed_count
+        ready_to_ship = packed_count
+    else:
+        ready_to_pack = 0
+        orders_packed = 0
+        ready_to_ship = picked_count + packed_count
+
+    total_skus = g.db.execute(text("SELECT COUNT(*) FROM items WHERE is_active = TRUE")).scalar()
+    total_bins = g.db.execute(text(f"SELECT COUNT(*) FROM bins WHERE is_active = TRUE {wh_filter}"), wh_params).scalar()
+
+    low_stock = g.db.execute(
+        text("""
+            SELECT COUNT(*) FROM (
+                SELECT i.item_id
+                FROM items i
+                LEFT JOIN inventory inv ON inv.item_id = i.item_id
+                WHERE i.is_active = TRUE AND i.reorder_point IS NOT NULL AND i.reorder_point > 0
+                GROUP BY i.item_id, i.reorder_point
+                HAVING COALESCE(SUM(inv.quantity_on_hand), 0) <= i.reorder_point
+            ) sub
+        """)
+    ).scalar()
+
+    recent = g.db.execute(
+        text(f"SELECT action_type, user_id, details, created_at FROM audit_log {('WHERE warehouse_id = :wid' if warehouse_id else '')} ORDER BY created_at DESC LIMIT 10"),
+        wh_params,
+    ).fetchall()
+
+    # Short picks in last 7 days
+    short_pick_count = g.db.execute(
+        text(f"SELECT COUNT(*) FROM audit_log WHERE action_type = 'PICK' AND details->>'type' = 'SHORT_PICK' AND created_at >= NOW() - INTERVAL '7 days' {('AND warehouse_id = :wid' if warehouse_id else '')}"),
+        wh_params,
+    ).scalar()
+
+    # Pending adjustments count
+    pending_adjustments = g.db.execute(
+        text("SELECT COUNT(*) FROM inventory_adjustments WHERE status = :adj_pending"),
+        {"adj_pending": ADJ_PENDING},
+    ).scalar()
+
+    # v1.8.0 (#296) pending TO approvals scoped to the requested
+    # warehouse. A TO touches a warehouse when it appears as either
+    # source or destination, so the count surfaces work the operator
+    # at this warehouse needs to act on.
+    if warehouse_id:
+        pending_to_approvals = g.db.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM transfer_order_approvals tap
+                  JOIN transfer_orders o ON o.to_id = tap.to_id
+                 WHERE tap.status = 'PENDING'
+                   AND (o.source_warehouse_id = :wid
+                        OR o.destination_warehouse_id = :wid)
+                """
+            ),
+            {"wid": warehouse_id},
+        ).scalar()
+    else:
+        pending_to_approvals = g.db.execute(
+            text(
+                "SELECT COUNT(*) FROM transfer_order_approvals "
+                " WHERE status = 'PENDING'"
+            ),
+        ).scalar()
+
+    result = {
+        "open_pos": open_pos,
+        "pending_receipts": int(pending_receipts),
+        "items_awaiting_putaway": int(items_awaiting_putaway),
+        "open_sos": open_sos,
+        "orders_ready_to_pick": ready_to_pick,
+        "orders_in_picking": in_picking,
+        "ready_to_ship": ready_to_ship,
+        "cancelled_orders": cancelled_count,
+        "refunded_orders": refunded_count,
+        "require_packing": require_packing,
+        "total_skus": total_skus,
+        "total_bins": total_bins,
+        "short_picks_7d": short_pick_count,
+        "low_stock_items": low_stock,
+        "pending_adjustments": pending_adjustments,
+        "pending_to_approvals": pending_to_approvals,
+        "recent_activity": [
+            {"action": r.action_type, "user": r.user_id,
+             "detail": str(r.details) if r.details else None,
+             "time": r.created_at.isoformat() if r.created_at else None}
+            for r in recent
+        ],
+    }
+
+    if require_packing:
+        result["ready_to_pack"] = ready_to_pack
+        result["orders_packed"] = orders_packed
+
+    return jsonify(result)
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+
+@admin_bp.route("/settings", methods=["GET"])
+@require_auth
+@require_admin_or_page_permission("settings")
+@with_db
+def get_settings():
+    rows = g.db.execute(text("SELECT id, key, value, updated_at FROM app_settings ORDER BY key")).fetchall()
+    return jsonify({
+        "settings": [
+            {"id": r.id, "key": r.key, "value": r.value,
+             "updated_at": r.updated_at.isoformat() if r.updated_at else None}
+            for r in rows
+        ]
+    })
+
+
+@admin_bp.route("/settings/<setting_key>", methods=["GET"])
+@require_auth
+@require_admin_or_page_permission("settings")
+@with_db
+def get_setting(setting_key):
+    row = g.db.execute(
+        text("SELECT id, key, value FROM app_settings WHERE key = :key"),
+        {"key": setting_key},
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "Setting not found"}), 404
+    return jsonify({"key": row.key, "value": row.value})
+
+
+@admin_bp.route("/settings", methods=["PUT"])
+@require_auth
+@require_admin_or_page_permission("settings")
+@validate_body(UpdateSettingsRequest)
+@with_db
+def update_settings(validated):
+    data = {"settings": validated.settings}
+
+    # Toggle protection: reject disabling packing when PACKED orders exist
+    if data["settings"].get("require_packing_before_shipping") == "false":
+        packed_count = g.db.execute(
+            text("SELECT COUNT(*) FROM sales_orders WHERE status = :so_packed"),
+            {"so_packed": SO_PACKED},
+        ).scalar()
+        if packed_count > 0:
+            return jsonify({
+                "error": f"Cannot disable packing. {packed_count} order{'s' if packed_count != 1 else ''} in PACKED status. Ship them before disabling."
+            }), 400
+
+    for key, value in data["settings"].items():
+        g.db.execute(
+            text(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (:key, :value, NOW())
+                ON CONFLICT (key) DO UPDATE SET value = :value, updated_at = NOW()
+                """
+            ),
+            {"key": key, "value": str(value)},
+        )
+    g.db.commit()
+    return jsonify({"message": "Settings updated"})
+
+
+# ── Cycle Counts (admin view) ────────────────────────────────────────────────
+
+@admin_bp.route("/cycle-counts", methods=["GET"])
+@require_auth
+@require_admin_or_page_permission("cycle-counts")
+@with_db
+def list_cycle_counts():
+    # No row cap: operators need to reach every count, and the UI has no
+    # pagination control. Lines are fetched in a single batched query
+    # (count_id = ANY) and grouped in Python so dropping the limit does
+    # not reintroduce a per-count N+1 round trip.
+    rows = g.db.execute(
+        text(
+            """
+            SELECT cc.count_id, cc.status, cc.assigned_to, cc.created_at,
+                   cc.completed_at, b.bin_code, b.bin_id
+            FROM cycle_counts cc
+            JOIN bins b ON b.bin_id = cc.bin_id
+            ORDER BY cc.created_at DESC
+            """
+        )
+    ).fetchall()
+
+    count_ids = [r.count_id for r in rows]
+    lines_by_count = {}
+    if count_ids:
+        line_rows = g.db.execute(
+            text(
+                """
+                SELECT ccl.count_id, ccl.count_line_id, i.sku, i.item_name,
+                       ccl.expected_quantity, ccl.counted_quantity, ccl.unexpected,
+                       (ccl.counted_quantity - ccl.expected_quantity) AS variance
+                FROM cycle_count_lines ccl
+                JOIN items i ON i.item_id = ccl.item_id
+                WHERE ccl.count_id = ANY(:cids)
+                ORDER BY ccl.count_id, i.sku
+                """
+            ),
+            {"cids": count_ids},
+        ).fetchall()
+        for l in line_rows:
+            lines_by_count.setdefault(l.count_id, []).append({
+                "count_line_id": l.count_line_id,
+                "sku": l.sku,
+                "item_name": l.item_name,
+                "expected_quantity": l.expected_quantity,
+                "counted_quantity": l.counted_quantity,
+                "unexpected": l.unexpected,
+                "variance": l.variance,
+            })
+
+    counts = [
+        {
+            "count_id": r.count_id,
+            "bin_code": r.bin_code,
+            "status": r.status,
+            "assigned_to": r.assigned_to,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "lines": lines_by_count.get(r.count_id, []),
+        }
+        for r in rows
+    ]
+
+    return jsonify({"cycle_counts": counts})
+
+
+# ── Inventory Adjustment Approval ────────────────────────────────────────────
+
+@admin_bp.route("/adjustments/pending", methods=["GET"])
+@require_auth
+@require_admin_or_page_permission("adjustments")
+@with_db
+def list_pending_adjustments():
+    """Return pending inventory adjustments grouped by cycle count."""
+    # expected_quantity / counted_quantity come from the originating
+    # cycle_count_line (keyed by count + item). Correlated subselects so a
+    # non-cycle-count adjustment (cycle_count_id NULL) simply yields NULL
+    # without fanning the adjustment row out across line matches.
+    rows = g.db.execute(
+        text("""
+            SELECT ia.adjustment_id, ia.item_id, ia.bin_id, ia.warehouse_id,
+                   ia.quantity_change, ia.reason_code, ia.reason_detail,
+                   ia.status, ia.adjusted_by, ia.adjusted_at, ia.cycle_count_id,
+                   i.sku, i.item_name, b.bin_code,
+                   (SELECT ccl.expected_quantity
+                      FROM cycle_count_lines ccl
+                     WHERE ccl.count_id = ia.cycle_count_id
+                       AND ccl.item_id = ia.item_id
+                     LIMIT 1) AS expected_quantity,
+                   (SELECT ccl.counted_quantity
+                      FROM cycle_count_lines ccl
+                     WHERE ccl.count_id = ia.cycle_count_id
+                       AND ccl.item_id = ia.item_id
+                     LIMIT 1) AS counted_quantity
+            FROM inventory_adjustments ia
+            JOIN items i ON i.item_id = ia.item_id
+            JOIN bins b ON b.bin_id = ia.bin_id
+            WHERE ia.status = :adj_pending
+            ORDER BY ia.cycle_count_id, ia.adjustment_id
+        """),
+        {"adj_pending": ADJ_PENDING},
+    ).fetchall()
+
+    return jsonify({
+        "adjustments": [
+            {
+                "adjustment_id": r.adjustment_id,
+                "item_id": r.item_id,
+                "bin_id": r.bin_id,
+                "warehouse_id": r.warehouse_id,
+                "quantity_change": r.quantity_change,
+                "expected_quantity": r.expected_quantity,
+                "counted_quantity": r.counted_quantity,
+                "reason_code": r.reason_code,
+                "reason_detail": r.reason_detail,
+                "status": r.status,
+                "adjusted_by": r.adjusted_by,
+                "adjusted_at": r.adjusted_at.isoformat() if r.adjusted_at else None,
+                "cycle_count_id": r.cycle_count_id,
+                "sku": r.sku,
+                "item_name": r.item_name,
+                "bin_code": r.bin_code,
+            }
+            for r in rows
+        ]
+    })
+
+
+@admin_bp.route("/adjustments/review", methods=["POST"])
+@require_auth
+@require_admin_or_page_permission("adjustments")
+@validate_body(ReviewAdjustmentsRequest)
+@with_db
+def review_adjustments(validated):
+    """Approve or reject individual adjustments. Approved adjustments update inventory."""
+    data = {"decisions": [d.model_dump() for d in validated.decisions]}
+
+    approved = 0
+    rejected = 0
+
+    for decision in data["decisions"]:
+        adj_id = decision.get("adjustment_id")
+        action = decision.get("action")  # 'approve' or 'reject'
+
+        if not adj_id or action not in ("approve", "reject"):
+            continue
+
+        # v1.5.0 #119: FOR UPDATE serialises concurrent approvals of the
+        # same adjustment so the status-check-then-update pattern is
+        # race-safe and the inventoryadjusted.completed / cycle_count.adjusted
+        # event emits in commit order on the integration_events outbox.
+        row = g.db.execute(
+            text(
+                "SELECT adjustment_id, item_id, bin_id, warehouse_id, quantity_change,"
+                " reason_code, status, adjusted_by, cycle_count_id, external_id"
+                " FROM inventory_adjustments WHERE adjustment_id = :aid FOR UPDATE"
+            ),
+            {"aid": adj_id},
+        ).fetchone()
+
+        if not row or row.status != ADJ_PENDING:
+            continue
+
+        # Separation of duties check for cycle count adjustments
+        is_self_approval = row.cycle_count_id and row.adjusted_by == g.current_user["username"]
+        if is_self_approval and action == "approve":
+            sep_row = g.db.execute(
+                text("SELECT value FROM app_settings WHERE key = 'require_count_approval_separation'")
+            ).fetchone()
+            require_separation = sep_row and sep_row.value == "true"
+            if require_separation:
+                return jsonify({"error": "Cannot approve your own cycle count"}), 403
+
+        if action == "approve":
+            # Apply the inventory adjustment
+            existing = g.db.execute(
+                text("SELECT inventory_id, quantity_on_hand FROM inventory WHERE item_id = :iid AND bin_id = :bid"),
+                {"iid": row.item_id, "bid": row.bin_id},
+            ).fetchone()
+
+            if existing:
+                new_qty = max(0, existing.quantity_on_hand + row.quantity_change)
+                g.db.execute(
+                    text("UPDATE inventory SET quantity_on_hand = :qty, updated_at = NOW() WHERE inventory_id = :inv_id"),
+                    {"qty": new_qty, "inv_id": existing.inventory_id},
+                )
+            elif row.quantity_change > 0:
+                g.db.execute(
+                    text("INSERT INTO inventory (item_id, bin_id, warehouse_id, quantity_on_hand) VALUES (:iid, :bid, :wid, :qty)"),
+                    {"iid": row.item_id, "bid": row.bin_id, "wid": row.warehouse_id, "qty": row.quantity_change},
+                )
+
+            g.db.execute(
+                text("UPDATE inventory_adjustments SET status = :status WHERE adjustment_id = :aid"),
+                {"aid": adj_id, "status": ADJ_APPROVED},
+            )
+
+            if is_self_approval:
+                write_audit_log(
+                    g.db,
+                    action_type="SELF_APPROVED_COUNT",
+                    entity_type="ADJUSTMENT",
+                    entity_id=adj_id,
+                    user_id=g.current_user["username"],
+                    warehouse_id=row.warehouse_id,
+                    details={"cycle_count_id": row.cycle_count_id, "quantity_change": row.quantity_change},
+                )
+
+            # v1.5.0 #113: the variance branch (cycle_count_id non-null)
+            # emits cycle_count.adjusted for the variance detail plus
+            # inventoryadjusted.completed for the canonical adjustment shape;
+            # the correction branch emits inventoryadjusted.completed alone.
+            # Fires only on APPROVE (once per approved variance); rejects
+            # emit nothing.
+            item_ext = g.db.execute(
+                text("SELECT external_id FROM items WHERE item_id = :iid"),
+                {"iid": row.item_id},
+            ).fetchone()
+            bin_ext = g.db.execute(
+                text("SELECT external_id FROM bins WHERE bin_id = :bid"),
+                {"bid": row.bin_id},
+            ).fetchone()
+            applied_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+            if row.cycle_count_id:
+                # Join cycle_counts (for its external_id) and
+                # cycle_count_lines (for counted qty + counter name) so
+                # the event payload carries the variance context.
+                cc = g.db.execute(
+                    text(
+                        """
+                        SELECT cc.external_id AS cycle_count_external_id,
+                               ccl.counted_quantity,
+                               ccl.expected_quantity,
+                               ccl.counted_by,
+                               ccl.counted_at
+                          FROM cycle_counts cc
+                          JOIN cycle_count_lines ccl
+                            ON ccl.count_id = cc.count_id
+                         WHERE cc.count_id = :cid
+                           AND ccl.item_id = :iid
+                         LIMIT 1
+                        """
+                    ),
+                    {"cid": row.cycle_count_id, "iid": row.item_id},
+                ).fetchone()
+                # Resolve item canonical UUID to source-system external_id
+                # (the SKU upstream pusher used at Pipe B time). Adjustment +
+                # bin + cycle_count entities stay canonical -- they originate
+                # inside Sentry, no upstream identity.
+                item_source_external_id = (
+                    resolve_source_external_id(g.db, "item", item_ext.external_id)
+                    or str(item_ext.external_id)
+                )
+                emit_event(
+                    g.db,
+                    event_type="cycle_count.adjusted",
+                    event_version=1,
+                    aggregate_type="inventory_adjustment",
+                    aggregate_id=adj_id,
+                    aggregate_external_id=row.external_id,
+                    warehouse_id=row.warehouse_id,
+                    source_txn_id=g.source_txn_id,
+                    payload={
+                        "cycle_count_external_id": str(cc.cycle_count_external_id),
+                        "item_external_id": item_source_external_id,
+                        "bin_external_id": str(bin_ext.external_id),
+                        "counted_quantity": cc.counted_quantity,
+                        "system_quantity": cc.expected_quantity,
+                        "quantity_delta": row.quantity_change,
+                        "counted_by_user_external_id": get_user_external_id(g.db, cc.counted_by),
+                        "counted_at": cc.counted_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    },
+                )
+                # Cycle-count adjustments also ride the canonical
+                # inventoryadjusted.completed stream so an adjustment-stream
+                # consumer sees every finalised inventory_adjustments row.
+                # Variance detail stays on cycle_count.adjusted above.
+                emit_event(
+                    g.db,
+                    event_type="inventoryadjusted.completed",
+                    event_version=1,
+                    aggregate_type="inventory_adjustment",
+                    aggregate_id=adj_id,
+                    aggregate_external_id=row.external_id,
+                    warehouse_id=row.warehouse_id,
+                    source_txn_id=g.source_txn_id,
+                    payload={
+                        "adjustment_external_id": str(row.external_id),
+                        "item_external_id": item_source_external_id,
+                        "bin_external_id": str(bin_ext.external_id),
+                        "quantity_delta": row.quantity_change,
+                        "reason_code": "CYCLE_COUNT",
+                        "applied_by_user_external_id": get_user_external_id(g.db, g.current_user["username"]),
+                        "applied_at": applied_at,
+                    },
+                )
+            else:
+                # Same source-id resolution as the cycle_count branch.
+                item_source_external_id = (
+                    resolve_source_external_id(g.db, "item", item_ext.external_id)
+                    or str(item_ext.external_id)
+                )
+                emit_event(
+                    g.db,
+                    event_type="inventoryadjusted.completed",
+                    event_version=1,
+                    aggregate_type="inventory_adjustment",
+                    aggregate_id=adj_id,
+                    aggregate_external_id=row.external_id,
+                    warehouse_id=row.warehouse_id,
+                    source_txn_id=g.source_txn_id,
+                    payload={
+                        "adjustment_external_id": str(row.external_id),
+                        "item_external_id": item_source_external_id,
+                        "bin_external_id": str(bin_ext.external_id),
+                        "quantity_delta": row.quantity_change,
+                        "reason_code": row.reason_code,
+                        # The APPROVER is the actor who effectuated the
+                        # change; row.adjusted_by is the submitter
+                        # (different person in the two-step flow).
+                        "applied_by_user_external_id": get_user_external_id(g.db, g.current_user["username"]),
+                        "applied_at": applied_at,
+                    },
+                )
+
+            approved += 1
+        else:
+            g.db.execute(
+                text("UPDATE inventory_adjustments SET status = :status WHERE adjustment_id = :aid"),
+                {"aid": adj_id, "status": ADJ_REJECTED},
+            )
+            rejected += 1
+
+    g.db.commit()
+    return jsonify({"approved": approved, "rejected": rejected})
+
+
+# ── Direct Inventory Adjustments ─────────────────────────────────────────────
+
+@admin_bp.route("/adjustments/direct", methods=["POST"])
+@require_auth
+@require_admin_or_page_permission("adjustments")
+@validate_body(DirectAdjustmentRequest)
+@with_db
+def direct_adjustment(validated):
+    """Create and auto-approve an inventory adjustment (ADD or REMOVE)."""
+    item_id = validated.item_id
+    bin_id = validated.bin_id
+    warehouse_id = validated.warehouse_id
+    adjustment_type = validated.adjustment_type
+    quantity = validated.quantity
+    reason = validated.reason
+
+    # Validate item exists
+    item = g.db.execute(
+        text("SELECT item_id, sku, external_id FROM items WHERE item_id = :iid"),
+        {"iid": item_id},
+    ).fetchone()
+    if not item:
+        return jsonify({"error": "Item not found"}), 404
+
+    # Validate bin exists and belongs to warehouse
+    bin_row = g.db.execute(
+        text("SELECT bin_id, bin_code, external_id FROM bins WHERE bin_id = :bid AND warehouse_id = :wid"),
+        {"bid": bin_id, "wid": warehouse_id},
+    ).fetchone()
+    if not bin_row:
+        return jsonify({"error": "Bin not found in the specified warehouse"}), 404
+
+    if adjustment_type == "ADD":
+        quantity_change = quantity
+        add_inventory(g.db, item_id, bin_id, warehouse_id, quantity)
+    else:
+        # REMOVE  -  validate sufficient stock
+        # v1.5.0 #119: FOR UPDATE on the inventory row is the
+        # serialisation point for concurrent direct-adjustment REMOVEs
+        # against the same item+bin. The ADD branch goes through
+        # add_inventory() which already locks the target row (V-030);
+        # this branch does its own SELECT so it needs its own lock.
+        inv = g.db.execute(
+            text("SELECT inventory_id, quantity_on_hand FROM inventory WHERE item_id = :iid AND bin_id = :bid FOR UPDATE"),
+            {"iid": item_id, "bid": bin_id},
+        ).fetchone()
+        available = inv.quantity_on_hand if inv else 0
+        if available < quantity:
+            return jsonify({"error": f"Insufficient inventory. Available: {available}"}), 400
+
+        quantity_change = -quantity
+        new_qty = available - quantity
+        if new_qty == 0:
+            g.db.execute(text("DELETE FROM inventory WHERE inventory_id = :inv_id"), {"inv_id": inv.inventory_id})
+        else:
+            g.db.execute(
+                text("UPDATE inventory SET quantity_on_hand = :qty, updated_at = NOW() WHERE inventory_id = :inv_id"),
+                {"qty": new_qty, "inv_id": inv.inventory_id},
+            )
+
+    # Create adjustment record as APPROVED
+    adj = g.db.execute(
+        text("""
+            INSERT INTO inventory_adjustments (item_id, bin_id, warehouse_id, quantity_change, reason_code, reason_detail, status, adjusted_by, adjusted_at, external_id)
+            VALUES (:iid, :bid, :wid, :qty_change, :reason_code, :reason_detail, :status, :user_id, NOW(), :ext_id)
+            RETURNING adjustment_id, adjusted_at, external_id
+        """),
+        {
+            "iid": item_id, "bid": bin_id, "wid": warehouse_id,
+            "qty_change": quantity_change,
+            "reason_code": "DIRECT_ADJUSTMENT",
+            "reason_detail": reason,
+            "status": ADJ_APPROVED,
+            "user_id": g.current_user["user_id"],
+            "ext_id": str(uuid.uuid4()),
+        },
+    ).fetchone()
+
+    write_audit_log(
+        g.db, ACTION_ADJUST, "ITEM", item_id,
+        user_id=g.current_user["user_id"],
+        warehouse_id=warehouse_id,
+        details={
+            "adjustment_id": adj.adjustment_id,
+            "adjustment_type": adjustment_type,
+            "bin_id": bin_id,
+            "quantity": quantity,
+            "reason": reason,
+        },
+    )
+
+    # v1.5.0 #114: emit inventoryadjusted.completed on the integration_events
+    # outbox. direct_adjustment auto-approves inline so the admin doing
+    # the call is both proposer and effectuator; applied_by_user_external_id
+    # names that admin. cycle_count_id is always null on this path, so
+    # the event is never cycle_count.adjusted here.
+    # Direct-adjustment path: same source-id resolution.
+    item_source_external_id = (
+        resolve_source_external_id(g.db, "item", item.external_id)
+        or str(item.external_id)
+    )
+    emit_event(
+        g.db,
+        event_type="inventoryadjusted.completed",
+        event_version=1,
+        aggregate_type="inventory_adjustment",
+        aggregate_id=adj.adjustment_id,
+        aggregate_external_id=adj.external_id,
+        warehouse_id=warehouse_id,
+        source_txn_id=g.source_txn_id,
+        payload={
+            "adjustment_external_id": str(adj.external_id),
+            "item_external_id": item_source_external_id,
+            "bin_external_id": str(bin_row.external_id),
+            "quantity_delta": quantity_change,
+            "reason_code": "DIRECT_ADJUSTMENT",
+            "applied_by_user_external_id": get_user_external_id(g.db, g.current_user["username"]),
+            "applied_at": adj.adjusted_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        },
+    )
+
+    g.db.commit()
+    return jsonify({
+        "adjustment_id": adj.adjustment_id,
+        "item_id": item_id,
+        "sku": item.sku,
+        "bin_id": bin_id,
+        "bin_code": bin_row.bin_code,
+        "warehouse_id": warehouse_id,
+        "adjustment_type": adjustment_type,
+        "quantity_change": quantity_change,
+        "reason": reason,
+        "status": ADJ_APPROVED,
+        "adjusted_at": adj.adjusted_at.isoformat() if adj.adjusted_at else None,
+    }), 201
+
+
+@admin_bp.route("/adjustments/list", methods=["GET"])
+@require_auth
+@require_admin_or_page_permission("adjustments")
+@with_db
+def list_adjustments():
+    """Return recent inventory adjustments with item and bin details."""
+    warehouse_id = request.args.get("warehouse_id", type=int)
+    page = request.args.get("page", 1, type=int)
+    per_page = min(request.args.get("per_page", 50, type=int), 1000)
+
+    where_clauses, params = [], {}
+    if warehouse_id:
+        where_clauses.append("ia.warehouse_id = :wid")
+        params["wid"] = warehouse_id
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    total = g.db.execute(
+        text(f"SELECT COUNT(*) FROM inventory_adjustments ia {where_sql}"), params,
+    ).scalar()
+    pages = max(1, math.ceil(total / per_page))
+
+    params["limit"] = per_page
+    params["offset"] = (page - 1) * per_page
+
+    # #161: inventory_adjustments.adjusted_by is VARCHAR(100) but the
+    # writer sites are inconsistent -- direct_adjustment stores the
+    # stringified user_id, while the approval-flow writer stores the
+    # username itself. The LEFT JOIN resolves the numeric case to the
+    # real username; COALESCE falls back to whatever string is in the
+    # column when the join misses (already a username, or a user that
+    # has since been deleted). Normalising the writer sites to one
+    # convention is a follow-up.
+    rows = g.db.execute(
+        text(f"""
+            SELECT ia.adjustment_id, ia.item_id, ia.bin_id, ia.warehouse_id,
+                   ia.quantity_change, ia.reason_code, ia.reason_detail,
+                   ia.status, ia.adjusted_by, ia.adjusted_at, ia.cycle_count_id,
+                   i.sku, i.item_name, b.bin_code,
+                   COALESCE(u.username, ia.adjusted_by) AS username
+            FROM inventory_adjustments ia
+            JOIN items i ON i.item_id = ia.item_id
+            JOIN bins b ON b.bin_id = ia.bin_id
+            LEFT JOIN users u
+                   ON ia.adjusted_by ~ '^[0-9]+$'
+                  AND u.user_id = ia.adjusted_by::int
+            {where_sql}
+            ORDER BY ia.adjusted_at DESC
+            LIMIT :limit OFFSET :offset
+        """),
+        params,
+    ).fetchall()
+
+    return jsonify({
+        "adjustments": [
+            {
+                "adjustment_id": r.adjustment_id,
+                "item_id": r.item_id,
+                "sku": r.sku,
+                "item_name": r.item_name,
+                "bin_id": r.bin_id,
+                "bin_code": r.bin_code,
+                "warehouse_id": r.warehouse_id,
+                "quantity_change": r.quantity_change,
+                "reason_code": r.reason_code,
+                "reason_detail": r.reason_detail,
+                "status": r.status,
+                "adjusted_by": r.adjusted_by,
+                "username": r.username,
+                "adjusted_at": r.adjusted_at.isoformat() if r.adjusted_at else None,
+                "cycle_count_id": r.cycle_count_id,
+            }
+            for r in rows
+        ],
+        "total": total, "page": page, "per_page": per_page, "pages": pages,
+    })

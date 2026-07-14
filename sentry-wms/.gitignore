@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+pgdata/
+# docker-compose.override.yml is a developer-local override that Compose
+# auto-merges. Keep it out of source control so local build-context tweaks
+# (e.g. pointing the api build at the repo root so its Dockerfile can COPY
+# db/mappings/) stay out of the tracked docker-compose.yml.
+docker-compose.override.yml
+
+# Build outputs
+dist/
+build/
+*.egg
+
+# v1.4.2 #73 artifact: api/Dockerfile bakes this at image build time
+# (RUN grep ... > /app/BUILD_VERSION) for the check_build_version()
+# startup guard. It should never be committed -- the file is baked
+# per-image and can leak onto the host via the dev bind mount. If it
+# does leak with a stale version, the guard sys.exit(2)s the dev
+# container on every restart after a version bump.
+api/BUILD_VERSION
+
+# Expo / React Native
+mobile/.expo/web/
+mobile/android/
+mobile/ios/
+site/
+
+# Proxy
+proxy/certs/
+proxy/certs/*.pem
+
+# Local .env backups (never commit; see also .env above)
+.env.backup*
+*.env.backup*

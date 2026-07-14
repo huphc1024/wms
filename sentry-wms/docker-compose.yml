@@ -1,0 +1,304 @@
+
+services:
+  db:
+    image: postgres:16
+    container_name: sentry-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sentry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentry}
+      POSTGRES_DB: ${POSTGRES_DB:-sentry}
+      SKIP_SEED: ${SKIP_SEED:-false}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # v1.7.0 test-DB isolation: 00- runs first so the empty
+      # sentry_test database exists before schema.sql loads into
+      # `sentry`. Existing volumes need `docker compose down -v` to
+      # pick this up; the postgres image runs init scripts only on a
+      # virgin data dir.
+      - ./db/create-test-db.sql:/docker-entrypoint-initdb.d/00-create-test-db.sql
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./db/seed-apartment-lab.sql:/seed-data/seed-apartment-lab.sql
+      - ./db/seed.sh:/docker-entrypoint-initdb.d/02-seed.sh
+      # Schema also loaded into sentry_test so the conftest's
+      # TRUNCATE has tables to wipe. Runs after the schema lands in
+      # `sentry` (alphabetic order: 03 > 02 > 01).
+      - ./db/schema.sql:/seed-data/schema-for-test-db.sql
+      - ./db/load-schema-into-test-db.sh:/docker-entrypoint-initdb.d/03-load-schema-into-test-db.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentry"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: ./api
+    container_name: sentry-api
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sentry}:${POSTGRES_PASSWORD:-sentry}@db:5432/${POSTGRES_DB:-sentry}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env -- see .env.example}
+      FLASK_ENV: ${FLASK_ENV:-production}
+      FLASK_PORT: 5000
+      # #136 / #107 follow-up: explicitly forward TRUST_PROXY into the
+      # api container. Without this, setting TRUST_PROXY=true in .env is
+      # cosmetic -- Compose does not auto-forward arbitrary host env vars.
+      # Default false for direct-connect deployments; operator opts in by
+      # setting TRUST_PROXY=true in .env when Sentry runs behind a TLS-
+      # terminating reverse proxy. See docs/deployment.md.
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      # v1.5.1 V-206 (#147): forward API_BIND_HOST into the container
+      # so the Flask boot guard can refuse the
+      # "TRUST_PROXY=true + API_BIND_HOST=0.0.0.0" combination. Without
+      # forwarding, the guard sees None and cannot detect the unsafe
+      # shape. The value is informational inside the container; Docker
+      # applies the bind at the host level.
+      API_BIND_HOST: ${API_BIND_HOST:-127.0.0.1}
+      CORS_ORIGINS: "http://localhost:3000,http://localhost:5000,http://localhost:8080,http://localhost:8081"
+      SENTRY_ENCRYPTION_KEY: ${SENTRY_ENCRYPTION_KEY:?Set SENTRY_ENCRYPTION_KEY in .env -- see .env.example}
+      # v1.5.0 #128: pepper for the X-WMS-Token SHA-256 hash. The app
+      # fails to boot without it so a misconfigured deployment never
+      # silently falls back to an empty pepper.
+      SENTRY_TOKEN_PEPPER: ${SENTRY_TOKEN_PEPPER:?Set SENTRY_TOKEN_PEPPER in .env -- see .env.example}
+      # #227: HMAC key for the webhook_subscription_events Redis channel.
+      # The api container's admin handlers publish signed pubsub envelopes;
+      # the dispatcher container verifies them with the same key. An
+      # unset or trivial value refuses dispatcher boot.
+      SENTRY_PUBSUB_HMAC_KEY: ${SENTRY_PUBSUB_HMAC_KEY:?Set SENTRY_PUBSUB_HMAC_KEY in .env -- see .env.example}
+      # The API enqueues Celery tasks (manual sync trigger, fulfillment
+      # push) so it needs the authenticated broker URL too.
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env -- see .env.example}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env -- see .env.example}@redis:6379/0
+      # #212: the admin webhook PATCH/DELETE/rotate handlers publish
+      # cross-worker invalidation messages on the
+      # webhook_subscription_events Redis channel (plan §2.9). Without
+      # REDIS_URL the publisher silently no-ops, peer dispatcher
+      # workers see stale subscription state for up to 60s, and an
+      # operator-initiated pause looks effective in the admin UI but
+      # actually keeps dispatching from peer workers. Same authenticated
+      # URL shape as CELERY_BROKER_URL above.
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env -- see .env.example}@redis:6379/0
+    ports:
+      # V-040: bind to loopback by default so a misconfigured public-cloud
+      # host does not expose the API to the internet. Deployments that
+      # need external access should layer a reverse proxy (nginx, caddy,
+      # cloud ALB) or override this in docker-compose.override.yml.
+      # Dev laptops that need a phone / scanner on the same LAN to reach
+      # the API directly can set API_BIND_HOST=0.0.0.0 in .env (#64).
+      - "${API_BIND_HOST:-127.0.0.1}:5000:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./api:/app
+      - ./db:/db
+
+  redis:
+    image: redis:7-alpine
+    container_name: sentry-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env -- see .env.example}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env -- see .env.example}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  snapshot-keeper:
+    # v1.5.0 #132: holds REPEATABLE READ transactions that export a
+    # pg_snapshot_id via pg_export_snapshot(). The API tier imports
+    # the same snapshot on short-lived connections to page through
+    # /api/v1/snapshot/inventory. Single-keeper architecture (plan
+    # R12); horizontal scale is deferred. Restart policy is always-on
+    # so a crash is quickly recovered and the 410 snapshot_expired
+    # path is exercised for any in-flight scans.
+    build: ./api
+    container_name: sentry-snapshot-keeper
+    command: python -m services.snapshot_keeper
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sentry}:${POSTGRES_PASSWORD:-sentry}@db:5432/${POSTGRES_DB:-sentry}
+      # v1.5.1 V-214 (#153): operators who run the least-privilege
+      # role-creation SQL at db/role-snapshot-keeper.sql set
+      # SNAPSHOT_KEEPER_DATABASE_URL in .env to point the keeper at
+      # the dedicated sentry_keeper role (SELECT on integration_events,
+      # SELECT/UPDATE/DELETE on snapshot_scans, EXECUTE on
+      # pg_export_snapshot). Defaults to the forwarded DATABASE_URL
+      # above when the dedicated var is unset so dev and single-role
+      # deployments keep working unchanged.
+      SNAPSHOT_KEEPER_DATABASE_URL: ${SNAPSHOT_KEEPER_DATABASE_URL:-}
+      SNAPSHOT_KEEPER_HEARTBEAT_FILE: /tmp/snapshot-keeper-heartbeat
+    volumes:
+      - ./api:/app
+    healthcheck:
+      # Heartbeat written every 5s by the keeper. Mark unhealthy when
+      # the file is older than 30s so a hung loop restarts the container.
+      test: ["CMD-SHELL", "find /tmp/snapshot-keeper-heartbeat -newermt '-30 seconds' -print -quit | grep -q ."]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  webhook-dispatcher:
+    # v1.6.0 #173 (D1): outbound webhook dispatcher daemon. Mirrors the
+    # snapshot-keeper shape (single Python process, heartbeat file,
+    # SIGTERM-aware loop). D1 boots the skeleton with kill switch and
+    # env validation; D2-D11 fill in HMAC signing, LISTEN/NOTIFY wake,
+    # per-subscription delivery loop, retry schedule, SSRF guard, and
+    # the rest of the dispatcher logic. DISPATCHER_ENABLED=false stops
+    # dispatch traffic without removing the container.
+    build: ./api
+    container_name: sentry-webhook-dispatcher
+    command: python -m services.webhook_dispatcher
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sentry}:${POSTGRES_PASSWORD:-sentry}@db:5432/${POSTGRES_DB:-sentry}
+      # v1.6.0 #169 (F6): operators who run db/role-dispatcher.sql set
+      # DISPATCHER_DATABASE_URL in .env to point the dispatcher at the
+      # dedicated sentry_dispatcher role (SELECT on integration_events,
+      # SELECT/UPDATE on webhook_subscriptions, INSERT/SELECT/UPDATE on
+      # webhook_deliveries + sequence USAGE, SELECT on webhook_secrets).
+      # Defaults to DATABASE_URL above when unset so dev keeps working.
+      DISPATCHER_DATABASE_URL: ${DISPATCHER_DATABASE_URL:-}
+      # SENTRY_ENCRYPTION_KEY decrypts webhook_secrets.secret_ciphertext
+      # for HMAC signing (plan §3.2). Required.
+      SENTRY_ENCRYPTION_KEY: ${SENTRY_ENCRYPTION_KEY:?Set SENTRY_ENCRYPTION_KEY in .env -- see .env.example}
+      # SENTRY_TOKEN_PEPPER is intentionally NOT forwarded -- it is
+      # inbound-auth only (wms_tokens hashing) and the dispatcher has
+      # no use for it. Forwarding would expand the daemon's secret
+      # surface unnecessarily.
+      # #227: same HMAC key the api container uses to sign published
+      # subscription_event messages. The dispatcher verifies inbound
+      # messages with this key; rotating it requires restarting both
+      # containers in lockstep.
+      SENTRY_PUBSUB_HMAC_KEY: ${SENTRY_PUBSUB_HMAC_KEY:?Set SENTRY_PUBSUB_HMAC_KEY in .env -- see .env.example}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env -- see .env.example}@redis:6379/0
+      DISPATCHER_HEARTBEAT_FILE: /tmp/webhook-dispatcher-heartbeat
+      DISPATCHER_ENABLED: ${DISPATCHER_ENABLED:-true}
+      # Dispatcher tunables (env_validator enforces bounds at boot;
+      # see plan §2.10). Values shown are the documented defaults.
+      # #237: DISPATCHER_HTTP_TIMEOUT_MS is the wall-clock cap on
+      # the entire send call; CONNECT + READ are the per-op
+      # timeouts requests passes through. env_validator refuses
+      # boot when CONNECT + READ > TIMEOUT.
+      DISPATCHER_HTTP_TIMEOUT_MS: ${DISPATCHER_HTTP_TIMEOUT_MS:-10000}
+      DISPATCHER_HTTP_CONNECT_TIMEOUT_MS: ${DISPATCHER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      DISPATCHER_HTTP_READ_TIMEOUT_MS: ${DISPATCHER_HTTP_READ_TIMEOUT_MS:-8000}
+      DISPATCHER_FALLBACK_POLL_MS: ${DISPATCHER_FALLBACK_POLL_MS:-2000}
+      DISPATCHER_SHUTDOWN_DRAIN_S: ${DISPATCHER_SHUTDOWN_DRAIN_S:-30}
+      DISPATCHER_MAX_CONCURRENT_POSTS: ${DISPATCHER_MAX_CONCURRENT_POSTS:-16}
+      DISPATCHER_MAX_PENDING_HARD_CAP: ${DISPATCHER_MAX_PENDING_HARD_CAP:-50000}
+      DISPATCHER_MAX_DLQ_HARD_CAP: ${DISPATCHER_MAX_DLQ_HARD_CAP:-5000}
+      # Dangerous opt-outs. The env_validator combination guard refuses
+      # to boot when both are true, AND when SENTRY_ALLOW_INTERNAL_WEBHOOKS
+      # is true with FLASK_ENV=production. Safe defaults (false) keep
+      # the policy in effect.
+      SENTRY_ALLOW_HTTP_WEBHOOKS: ${SENTRY_ALLOW_HTTP_WEBHOOKS:-false}
+      SENTRY_ALLOW_INTERNAL_WEBHOOKS: ${SENTRY_ALLOW_INTERNAL_WEBHOOKS:-false}
+      FLASK_ENV: ${FLASK_ENV:-development}
+    volumes:
+      - ./api:/app
+      - ./db:/db
+    healthcheck:
+      test: ["CMD", "python", "-m", "services.webhook_dispatcher.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  connector-publisher:
+    # v1.30.0 (Pipe C): channel-availability publisher daemon. Mirrors the
+    # webhook-dispatcher / snapshot-keeper shape (single Python process,
+    # heartbeat file, SIGTERM-aware loop). Each cycle reconciles per-channel
+    # availability against live inventory and debounce-publishes dirty rows to
+    # each channel's HTTP sink. No Redis dependency: it wakes on the existing
+    # integration_events_visible NOTIFY plus a periodic reconcile, and holds no
+    # cross-worker state. CONNECTOR_PUBLISHER_ENABLED=false stops publishing
+    # without removing the container.
+    build: ./api
+    container_name: sentry-connector-publisher
+    command: python -m services.connector_publisher
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sentry}:${POSTGRES_PASSWORD:-sentry}@db:5432/${POSTGRES_DB:-sentry}
+      # Operators who run db/role-publisher.sql set PUBLISHER_DATABASE_URL in
+      # .env to point at the dedicated least-privilege sentry_publisher role
+      # (read inventory, write only the channel tables). Defaults to
+      # DATABASE_URL above when unset so dev keeps working.
+      PUBLISHER_DATABASE_URL: ${PUBLISHER_DATABASE_URL:-}
+      CONNECTOR_PUBLISHER_HEARTBEAT_FILE: /tmp/connector-publisher-heartbeat
+      CONNECTOR_PUBLISHER_ENABLED: ${CONNECTOR_PUBLISHER_ENABLED:-true}
+      # Tunables (env_validator enforces bounds at boot). Values shown are the
+      # documented defaults.
+      CONNECTOR_PUBLISHER_FALLBACK_POLL_MS: ${CONNECTOR_PUBLISHER_FALLBACK_POLL_MS:-2000}
+      CONNECTOR_PUBLISHER_RECONCILE_INTERVAL_S: ${CONNECTOR_PUBLISHER_RECONCILE_INTERVAL_S:-60}
+      CONNECTOR_PUBLISHER_SHUTDOWN_DRAIN_S: ${CONNECTOR_PUBLISHER_SHUTDOWN_DRAIN_S:-30}
+      CONNECTOR_PUBLISHER_HTTP_CONNECT_TIMEOUT_MS: ${CONNECTOR_PUBLISHER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      CONNECTOR_PUBLISHER_HTTP_READ_TIMEOUT_MS: ${CONNECTOR_PUBLISHER_HTTP_READ_TIMEOUT_MS:-8000}
+      # Dispatch-time SSRF guard opt-out (dev/CI only). Safe default keeps the
+      # guard in effect; the dispatcher env validator refuses it in production.
+      SENTRY_ALLOW_INTERNAL_WEBHOOKS: ${SENTRY_ALLOW_INTERNAL_WEBHOOKS:-false}
+      FLASK_ENV: ${FLASK_ENV:-development}
+    volumes:
+      - ./api:/app
+      - ./db:/db
+    healthcheck:
+      test: ["CMD", "python", "-m", "services.connector_publisher.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  celery-worker:
+    build: ./api
+    container_name: sentry-celery
+    command: celery -A jobs worker --loglevel=info --pool=solo
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      PYTHONPATH: /app
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env -- see .env.example}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env -- see .env.example}@redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sentry}:${POSTGRES_PASSWORD:-sentry}@db:5432/${POSTGRES_DB:-sentry}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env -- see .env.example}
+      SENTRY_ENCRYPTION_KEY: ${SENTRY_ENCRYPTION_KEY:?Set SENTRY_ENCRYPTION_KEY in .env -- see .env.example}
+    volumes:
+      - ./api:/app
+      - ./db:/db
+
+  admin:
+    build: ./admin
+    container_name: sentry-admin
+    ports:
+      # V-040: same rationale as the api service -- loopback only by default.
+      # Warehouse deployments that need LAN access (e.g. tablets/scanners)
+      # should override via docker-compose.override.yml or a compose profile,
+      # or set ADMIN_BIND_HOST=0.0.0.0 in .env for LAN-dev convenience (#64).
+      - "${ADMIN_BIND_HOST:-127.0.0.1}:8080:8080"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

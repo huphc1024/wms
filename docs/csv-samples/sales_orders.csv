@@ -1,0 +1,4 @@
+so_number,warehouse_code,status,priority
+SO-2001,WH-HCM-01,open,1
+SO-2002,WH-HCM-01,open,2
+SO-2003,WH-HCM-01,open,3

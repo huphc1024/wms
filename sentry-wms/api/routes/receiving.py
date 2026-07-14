@@ -1,0 +1,708 @@
+"""
+Receiving endpoints: PO lookup and item receipt submission.
+"""
+
+import uuid
+from datetime import datetime, timezone
+
+from flask import Blueprint, g, jsonify, request
+from sqlalchemy import text
+
+from constants import (
+    PO_OPEN, PO_PARTIAL, PO_RECEIVED, PO_CLOSED,
+    POL_PENDING, POL_PARTIAL, POL_RECEIVED,
+    ACTION_RECEIVE, ACTION_RECEIVE_CANCEL,
+    SO_OPEN, SO_WAITING_STOCK,
+    BIN_PICKABLE, BIN_PICKABLE_STAGING,
+)
+from middleware.auth_middleware import require_auth, warehouse_scope_clause
+from middleware.db import with_db
+from schemas.receiving import CancelReceivingRequest, ReceiveItemsRequest
+from services.audit_service import write_audit_log
+from services.events_service import emit_event, get_user_external_id, resolve_source_external_id
+from services.inventory_service import add_inventory
+from services.webhook_dispatcher.backorder_notifier import (
+    dispatch_backorder_notification,
+)
+from utils.validation import validate_body
+
+receiving_bp = Blueprint("receiving", __name__)
+
+
+def _check_waiting_backorders_for_item(db, *, warehouse_id, item_id, source_txn_id, deferred_notifications):
+    """After a receipt lands inventory for (warehouse_id, item_id),
+    look at WAITING_STOCK backorders in that warehouse that carry a line
+    on this item. For each, check whether ALL its lines are now satisfiable
+    against current pickable on-hand. Flip the satisfiable ones to OPEN,
+    stamp backorder_fulfillable_at, and emit backorder.fulfillable. The
+    helper appends one (event_type, payload, warehouse_id) tuple per
+    flipped BO to ``deferred_notifications``; the caller drains the
+    list AFTER its commit to fire the corresponding Teams cards.
+
+    Partial-satisfaction stays in WAITING_STOCK with no event (matches the
+    spec's "notify only when fully available" decision so a Teams ping
+    doesn't fire until the warehouse can actually pull the BO).
+
+    Inventory is NOT consumed here; the BO becomes pickable for the
+    next batch builder.
+    """
+    candidates = db.execute(
+        text(
+            """
+            SELECT bo.so_id, bo.so_number, bo.external_id, bo.warehouse_id,
+                   bo.backorder_opened_at, bo.parent_so_id, bo.customer_name
+              FROM sales_orders bo
+             WHERE bo.status = :waiting
+               AND bo.warehouse_id = :wid
+               AND EXISTS (
+                 SELECT 1 FROM sales_order_lines bol
+                  WHERE bol.so_id = bo.so_id
+                    AND bol.item_id = :iid
+               )
+             ORDER BY bo.backorder_opened_at ASC
+            """
+        ),
+        {"waiting": SO_WAITING_STOCK, "wid": warehouse_id, "iid": item_id},
+    ).fetchall()
+
+    for bo in candidates:
+        bo_lines = db.execute(
+            text(
+                """
+                SELECT sol.so_line_id, sol.item_id, sol.quantity_ordered,
+                       i.sku, i.item_name, i.external_id AS item_external_id
+                  FROM sales_order_lines sol
+                  JOIN items i ON i.item_id = sol.item_id
+                 WHERE sol.so_id = :bid
+                """
+            ),
+            {"bid": bo.so_id},
+        ).fetchall()
+        if not bo_lines:
+            continue
+
+        all_satisfiable = True
+        for line in bo_lines:
+            available = db.execute(
+                text(
+                    """
+                    SELECT COALESCE(
+                             SUM(GREATEST(inv.quantity_on_hand - inv.quantity_allocated, 0)),
+                             0
+                           )
+                      FROM inventory inv
+                      JOIN bins b ON b.bin_id = inv.bin_id
+                     WHERE inv.item_id = :iid
+                       AND inv.warehouse_id = :wid
+                       AND b.bin_type IN (:bp, :bps)
+                    """
+                ),
+                {
+                    "iid": line.item_id,
+                    "wid": warehouse_id,
+                    "bp": BIN_PICKABLE,
+                    "bps": BIN_PICKABLE_STAGING,
+                },
+            ).scalar() or 0
+            if available < line.quantity_ordered:
+                all_satisfiable = False
+                break
+        if not all_satisfiable:
+            continue
+
+        db.execute(
+            text(
+                "UPDATE sales_orders "
+                "   SET status = :open, backorder_fulfillable_at = NOW() "
+                " WHERE so_id = :bid"
+            ),
+            {"open": SO_OPEN, "bid": bo.so_id},
+        )
+
+        days_waiting = 0
+        if bo.backorder_opened_at:
+            row = db.execute(
+                text(
+                    "SELECT EXTRACT(EPOCH FROM (NOW() - :opened))::bigint AS s"
+                ),
+                {"opened": bo.backorder_opened_at},
+            ).fetchone()
+            if row and row.s:
+                days_waiting = int(row.s) // 86400
+
+        parent_so_number = ""
+        if bo.parent_so_id is not None:
+            parent_so_number = db.execute(
+                text("SELECT so_number FROM sales_orders WHERE so_id = :sid"),
+                {"sid": bo.parent_so_id},
+            ).scalar() or ""
+
+        fulfillable_at = (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+        fulfillable_payload = {
+            "backorder_so_external_id": str(bo.external_id),
+            "backorder_so_number": bo.so_number,
+            "parent_so_number": parent_so_number,
+            "warehouse_id": warehouse_id,
+            "customer_name": bo.customer_name,
+            "items": [
+                {
+                    "item_external_id": str(line.item_external_id),
+                    "sku": line.sku,
+                    "item_name": line.item_name,
+                    "qty": line.quantity_ordered,
+                }
+                for line in bo_lines
+            ],
+            "days_waiting": days_waiting,
+            "fulfillable_at": fulfillable_at,
+        }
+        emit_event(
+            db,
+            event_type="backorder.fulfillable",
+            event_version=1,
+            aggregate_type="sales_order",
+            aggregate_id=bo.so_id,
+            aggregate_external_id=bo.external_id,
+            warehouse_id=warehouse_id,
+            source_txn_id=source_txn_id,
+            payload=fulfillable_payload,
+        )
+        deferred_notifications.append(
+            ("backorder.fulfillable", fulfillable_payload, warehouse_id)
+        )
+
+
+@receiving_bp.route("/po/<barcode>")
+@require_auth
+@with_db
+def lookup_po(barcode):
+    # V-026: filter warehouse at SELECT time so non-admins cannot use
+    # this endpoint as an existence oracle for POs in other warehouses.
+    # A PO belonging to a warehouse the user can't see returns the same
+    # 404 as a PO that doesn't exist at all.
+    scope_clause, scope_params = warehouse_scope_clause("warehouse_id")
+    po = g.db.execute(
+        text(
+            f"""
+            SELECT po_id, po_number, po_barcode, vendor_name, vendor_id,
+                   status, expected_date, warehouse_id, notes, created_at,
+                   received_at, created_by
+            FROM purchase_orders
+            WHERE (po_barcode = :barcode OR po_number = :barcode)
+              {scope_clause}
+            LIMIT 1
+            """
+        ),
+        {"barcode": barcode, **scope_params},
+    ).fetchone()
+
+    if not po:
+        return jsonify({"error": "Purchase order not found"}), 404
+
+    if po.status == PO_CLOSED:
+        return jsonify({"error": "Purchase order is closed"}), 400
+
+    lines = g.db.execute(
+        text(
+            """
+            SELECT pol.po_line_id, pol.line_number, pol.item_id,
+                   i.sku, i.item_name, i.upc,
+                   pol.quantity_ordered, pol.quantity_received,
+                   (pol.quantity_ordered - pol.quantity_received) AS quantity_remaining,
+                   pol.status
+            FROM purchase_order_lines pol
+            JOIN items i ON i.item_id = pol.item_id
+            WHERE pol.po_id = :po_id
+            ORDER BY pol.line_number
+            """
+        ),
+        {"po_id": po.po_id},
+    ).fetchall()
+
+    return jsonify({
+        "purchase_order": {
+            "po_id": po.po_id,
+            "po_number": po.po_number,
+            "po_barcode": po.po_barcode,
+            "vendor_name": po.vendor_name,
+            "status": po.status,
+            "expected_date": po.expected_date.isoformat() if po.expected_date else None,
+            "warehouse_id": po.warehouse_id,
+            "notes": po.notes,
+            "created_at": po.created_at.isoformat() if po.created_at else None,
+        },
+        "lines": [
+            {
+                "po_line_id": l.po_line_id,
+                "line_number": l.line_number,
+                "item_id": l.item_id,
+                "sku": l.sku,
+                "item_name": l.item_name,
+                "upc": l.upc,
+                "quantity_ordered": l.quantity_ordered,
+                "quantity_received": l.quantity_received,
+                "quantity_remaining": l.quantity_remaining,
+                "status": l.status,
+            }
+            for l in lines
+        ],
+    })
+
+
+@receiving_bp.route("/receive", methods=["POST"])
+@require_auth
+@validate_body(ReceiveItemsRequest)
+@with_db
+def receive_items(validated):
+    po_id = validated.po_id
+    items = validated.items
+
+    # Validate PO with warehouse scope at SELECT time (V-026).
+    # v1.5.0 #119: FOR UPDATE holds a row lock on the purchase_orders
+    # aggregate for the rest of this transaction so two concurrent
+    # receives against the same PO produce per-aggregate FIFO on the
+    # integration_events outbox. The PO line lock (V-029) below is
+    # stricter than this one on its own axis; both hold.
+    scope_clause, scope_params = warehouse_scope_clause("warehouse_id")
+    po = g.db.execute(
+        text(
+            f"""
+            SELECT po_id, status, warehouse_id, external_id FROM purchase_orders
+            WHERE po_id = :po_id {scope_clause}
+            FOR UPDATE
+            """
+        ),
+        {"po_id": po_id, **scope_params},
+    ).fetchone()
+
+    if not po:
+        return jsonify({"error": "Purchase order not found"}), 404
+
+    if po.status not in (PO_OPEN, PO_PARTIAL):
+        return jsonify({"error": f"Purchase order status is {po.status}, cannot receive"}), 400
+
+    warehouse_id = po.warehouse_id
+    username = g.current_user["username"]
+    receipt_ids = []
+    warnings = []
+    # Collected by _check_waiting_backorders_for_item per flipped BO,
+    # drained after g.db.commit() to fire Teams cards.
+    _deferred_notifications: list = []
+
+    # Hoist request-constant external-id resolution out of the per-item
+    # loop. The PO and the user are the same for every item in this
+    # request, so resolve each once and reuse the cached value in every
+    # item's emit_event payload. (Same values as before, fewer round
+    # trips.)
+    po_external_id = (
+        resolve_source_external_id(g.db, "purchase_order", po.external_id)
+        or str(po.external_id)
+    )
+    completed_by_user_external_id = get_user_external_id(g.db, username)
+
+    # Per-request memo for item external-id resolution so a repeated
+    # item_id resolves once.
+    _item_external_id_cache: dict = {}
+
+    # v1.5.0 #112 audit window shrink: instead of writing each item's
+    # audit_log row mid-loop (which fires the chain-hash trigger and
+    # takes LOCK TABLE audit_log_chain_head IN EXCLUSIVE MODE, held to
+    # COMMIT), collect each item's audit args here and write them all
+    # near the end, just before the final PO-status update + commit.
+    # quantity_received_before is captured at loop time (pre-call value)
+    # so the row stays self-contained and identical to the old behavior.
+    _pending_audit_rows: list = []
+
+    for item_entry in items:
+        item_id = item_entry.item_id
+        quantity = item_entry.quantity
+        bin_id = item_entry.bin_id
+        lot_number = item_entry.lot_number
+        serial_number = item_entry.serial_number
+        notes = item_entry.notes
+
+        # Validate bin exists and belongs to PO warehouse
+        bin_row = g.db.execute(
+            text("SELECT bin_id, warehouse_id FROM bins WHERE bin_id = :bin_id"),
+            {"bin_id": bin_id},
+        ).fetchone()
+        if not bin_row:
+            return jsonify({"error": f"Bin {bin_id} not found"}), 404
+        if bin_row.warehouse_id != warehouse_id:
+            return jsonify({"error": f"Bin {bin_id} does not belong to this PO's warehouse"}), 400
+
+        # Find matching PO line. V-029: SELECT ... FOR UPDATE holds a
+        # row lock for the remainder of this transaction so two
+        # concurrent receives against the same line cannot both pass
+        # the remaining-quantity check. The second waits until the
+        # first commits (seeing updated quantity_received) or rolls
+        # back (seeing the original).
+        po_line = g.db.execute(
+            text(
+                """
+                SELECT po_line_id, line_number, quantity_ordered, quantity_received
+                FROM purchase_order_lines
+                WHERE po_id = :po_id AND item_id = :item_id
+                LIMIT 1
+                FOR UPDATE
+                """
+            ),
+            {"po_id": po_id, "item_id": item_id},
+        ).fetchone()
+
+        if not po_line:
+            return jsonify({"error": f"Item {item_id} is not on PO {po_id}"}), 400
+
+        # Check for over-receipt
+        remaining = po_line.quantity_ordered - po_line.quantity_received
+        if quantity > remaining:
+            over_receipt_row = g.db.execute(
+                text("SELECT value FROM app_settings WHERE key = 'allow_over_receipt'")
+            ).fetchone()
+            if not over_receipt_row or over_receipt_row.value != "true":
+                return jsonify({
+                    "error": f"Over-receipt not allowed on line {po_line.line_number}: "
+                             f"requested {quantity} but only {remaining} remaining. "
+                             f"Enable 'allow_over_receipt' in Settings to permit this."
+                }), 400
+            warnings.append(
+                f"Over-receipt on line {po_line.line_number}: received {quantity} but only {remaining} remaining"
+            )
+
+        # 1. Create item_receipts record
+        result = g.db.execute(
+            text(
+                """
+                INSERT INTO item_receipts (po_id, po_line_id, item_id, quantity_received, bin_id,
+                                           warehouse_id, lot_number, serial_number, received_by, notes, external_id)
+                VALUES (:po_id, :po_line_id, :item_id, :quantity, :bin_id,
+                        :warehouse_id, :lot_number, :serial_number, :received_by, :notes, :ext_id)
+                RETURNING receipt_id, external_id, received_at
+                """
+            ),
+            {
+                "po_id": po_id,
+                "po_line_id": po_line.po_line_id,
+                "item_id": item_id,
+                "quantity": quantity,
+                "bin_id": bin_id,
+                "warehouse_id": warehouse_id,
+                "lot_number": lot_number,
+                "serial_number": serial_number,
+                "received_by": username,
+                "notes": notes,
+                "ext_id": str(uuid.uuid4()),
+            },
+        )
+        receipt_row = result.fetchone()
+        receipt_id = receipt_row.receipt_id
+        receipt_external_id = receipt_row.external_id
+        receipt_at = receipt_row.received_at
+        receipt_ids.append(receipt_id)
+
+        # Look up the item's canonical UUID, then resolve it to the
+        # source-system external_id (the SKU the upstream pusher used at
+        # Pipe B time) for the wire payload. Falls back to canonical UUID
+        # when no upstream mapping exists. Memoized per request so a
+        # repeated item_id resolves once.
+        if item_id in _item_external_id_cache:
+            item_external_id = _item_external_id_cache[item_id]
+        else:
+            item_row = g.db.execute(
+                text("SELECT external_id FROM items WHERE item_id = :iid"),
+                {"iid": item_id},
+            ).fetchone()
+            item_canonical = item_row.external_id if item_row else None
+            item_external_id = (
+                resolve_source_external_id(g.db, "item", item_canonical)
+                or (str(item_canonical) if item_canonical else None)
+            )
+            _item_external_id_cache[item_id] = item_external_id
+
+        # 2 & 3. Update PO line quantity and status
+        new_qty_received = po_line.quantity_received + quantity
+        new_line_status = POL_RECEIVED if new_qty_received >= po_line.quantity_ordered else POL_PARTIAL
+        g.db.execute(
+            text(
+                """
+                UPDATE purchase_order_lines
+                SET quantity_received = :qty, status = :status
+                WHERE po_line_id = :po_line_id
+                """
+            ),
+            {"qty": new_qty_received, "status": new_line_status, "po_line_id": po_line.po_line_id},
+        )
+
+        # 4. Create or update inventory
+        add_inventory(g.db, item_id, bin_id, warehouse_id, quantity, lot_number)
+
+        # 5. Audit log (deferred)
+        # quantity_ordered + quantity_received_before make the row
+        # self-contained: ordered total / cumulative-before-this-call /
+        # this transaction. Investigators can reconstruct PO progress
+        # from one row without joining purchase_order_lines.
+        # quantity_received_before is captured HERE (the pre-call value
+        # of po_line.quantity_received) so the deferred write below
+        # records the same number it would have mid-loop. The write
+        # itself is deferred to the end of the handler so the chain-hash
+        # trigger's EXCLUSIVE table lock is held for the shortest window
+        # rather than across the rest of the loop + backorder matcher.
+        _pending_audit_rows.append(
+            {
+                "quantity_ordered": po_line.quantity_ordered,
+                "quantity_received_before": po_line.quantity_received,
+                "quantity": quantity,
+                "item_id": item_id,
+                "bin_id": bin_id,
+                "receipt_id": receipt_id,
+            }
+        )
+
+        # 6. v1.5.0 #112: emit receipt.completed on the integration_events
+        # outbox. One event per item_receipts row; lines[] is a
+        # single-element array in v1.5.0 (Sentry does not batch items
+        # into one receipt). Visible_at is set at COMMIT by the deferred
+        # trigger so readers see events in commit order.
+        emit_event(
+            g.db,
+            event_type="receipt.completed",
+            event_version=1,
+            aggregate_type="item_receipt",
+            aggregate_id=receipt_id,
+            aggregate_external_id=receipt_external_id,
+            warehouse_id=warehouse_id,
+            source_txn_id=g.source_txn_id,
+            payload={
+                # receipt_external_id stays canonical (no upstream system
+                # creates receipts; they originate inside Sentry).
+                "receipt_external_id": str(receipt_external_id),
+                # po_external_id resolves to the source-system PO identifier
+                # (e.g. our PO number) when one was Pipe-B'd in. Resolved
+                # once before the loop; reused here.
+                "po_external_id": po_external_id,
+                "lines": [
+                    {
+                        "item_external_id": item_external_id,
+                        "quantity_received": quantity,
+                        "lot_number": lot_number,
+                        "serial_number": serial_number,
+                    }
+                ],
+                "completed_by_user_external_id": completed_by_user_external_id,
+                "completed_at": receipt_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            },
+        )
+
+        # Flip any WAITING_STOCK backorders in this warehouse
+        # that this receipt makes fully satisfiable. Same transaction;
+        # the partial index from mig 067 covers the candidate lookup.
+        # Notifications are collected here and fired AFTER the commit
+        # below so a fire-and-forget Teams send does not block the
+        # receipt's HTTP response.
+        _check_waiting_backorders_for_item(
+            g.db,
+            warehouse_id=warehouse_id,
+            item_id=item_id,
+            source_txn_id=g.source_txn_id,
+            deferred_notifications=_deferred_notifications,
+        )
+
+    # Deferred audit writes. Done here -- after the per-item loop and
+    # its backorder-matcher work -- so the chain-hash trigger's
+    # LOCK TABLE audit_log_chain_head IN EXCLUSIVE MODE (held until
+    # COMMIT) is acquired as late as possible, shrinking the window the
+    # global lock is held. Written in per-item order so the chain mirrors
+    # receipt order, identical to the previous mid-loop behavior.
+    for audit_details in _pending_audit_rows:
+        write_audit_log(
+            g.db,
+            action_type=ACTION_RECEIVE,
+            entity_type="PO",
+            entity_id=po_id,
+            user_id=username,
+            warehouse_id=warehouse_id,
+            details=audit_details,
+        )
+
+    # Update PO status based on all lines
+    all_lines = g.db.execute(
+        text("SELECT status FROM purchase_order_lines WHERE po_id = :po_id"),
+        {"po_id": po_id},
+    ).fetchall()
+
+    if all(l.status == POL_RECEIVED for l in all_lines):
+        g.db.execute(
+            text("UPDATE purchase_orders SET status = :status, received_at = NOW() WHERE po_id = :po_id"),
+            {"po_id": po_id, "status": PO_RECEIVED},
+        )
+        po_status = PO_RECEIVED
+    else:
+        g.db.execute(
+            text("UPDATE purchase_orders SET status = :status WHERE po_id = :po_id"),
+            {"po_id": po_id, "status": PO_PARTIAL},
+        )
+        po_status = PO_PARTIAL
+
+    g.db.commit()
+
+    # Drain backorder.fulfillable notifications collected by
+    # _check_waiting_backorders_for_item. Fire-and-forget Teams cards
+    # spawned in daemon threads.
+    for event_type, payload, wid in _deferred_notifications:
+        dispatch_backorder_notification(
+            event_type=event_type,
+            payload=payload,
+            warehouse_id=wid,
+        )
+
+    return jsonify({
+        "message": "Receipt submitted successfully",
+        "receipt_ids": receipt_ids,
+        "po_status": po_status,
+        "warnings": warnings,
+    })
+
+
+@receiving_bp.route("/cancel", methods=["POST"])
+@require_auth
+@validate_body(CancelReceivingRequest)
+@with_db
+def cancel_receiving(validated):
+    """Undo all receipts from a session by receipt_ids.
+
+    Reverses inventory additions, PO line quantities, and deletes receipt records.
+    Used when user cancels a receiving session.
+    """
+    receipt_ids = validated.receipt_ids
+    if not receipt_ids:
+        return jsonify({"message": "Nothing to cancel"}), 200
+
+    username = g.current_user["username"]
+    reversed_count = 0
+
+    # Collect PO IDs before deleting receipts
+    po_ids = set()
+    po_ids.add(validated.po_id)
+
+    scope_clause, scope_params = warehouse_scope_clause("warehouse_id")
+
+    # Pre-flight cross-PO guard. The mobile receive screen accumulates
+    # receipt_ids across every PO loaded in a session (sessionReceiptIds
+    # is never reset between POs), so a single Cancel tap can sweep
+    # receipts belonging to POs the operator never intended to touch.
+    # Reject the whole call if any visible receipt belongs to a different
+    # po_id; refuse before any state mutation so a partial reversal is
+    # not possible. Receipts in another warehouse are filtered out by
+    # scope_clause (V-026) and are not considered mismatched here, which
+    # preserves the existing silent-skip behaviour for cross-warehouse
+    # IDs in the loop below.
+    mismatched = g.db.execute(
+        text(
+            f"""
+            SELECT receipt_id, po_id FROM item_receipts
+             WHERE receipt_id = ANY(:rids)
+               AND po_id != :po_id
+               {scope_clause}
+             LIMIT 20
+            """
+        ),
+        {"rids": receipt_ids, "po_id": validated.po_id, **scope_params},
+    ).fetchall()
+    if mismatched:
+        return jsonify({
+            "error": (
+                "receipt_ids span multiple purchase orders; refusing to "
+                "cross-cancel. Cancel one PO at a time."
+            ),
+            "po_id": validated.po_id,
+            "mismatched_receipt_ids": [r.receipt_id for r in mismatched],
+        }), 400
+
+    # V-025: derive audit warehouse_id from the receipt rows themselves,
+    # never from the attacker-controlled request body. Track per-
+    # warehouse reversals so each audit row has a trustworthy
+    # warehouse_id + reversed-receipt list.
+    reversed_by_warehouse: dict[int, list[int]] = {}
+    for rid in receipt_ids:
+        # V-026: scoped SELECT means a receipt in another warehouse is
+        # indistinguishable from a receipt that doesn't exist (both
+        # silently skipped, not 403).
+        receipt = g.db.execute(
+            text(
+                f"""
+                SELECT receipt_id, po_id, po_line_id, item_id, quantity_received,
+                       bin_id, warehouse_id
+                FROM item_receipts
+                WHERE receipt_id = :rid {scope_clause}
+                """
+            ),
+            {"rid": rid, **scope_params},
+        ).fetchone()
+        if not receipt:
+            continue
+
+        po_ids.add(receipt.po_id)
+        reversed_by_warehouse.setdefault(receipt.warehouse_id, []).append(rid)
+
+        # 1. Reverse inventory
+        g.db.execute(
+            text("""
+                UPDATE inventory SET quantity_on_hand = GREATEST(0, quantity_on_hand - :qty)
+                WHERE item_id = :iid AND bin_id = :bid AND warehouse_id = :wid
+            """),
+            {"qty": receipt.quantity_received, "iid": receipt.item_id, "bid": receipt.bin_id, "wid": receipt.warehouse_id},
+        )
+
+        # 2. Reverse PO line quantity
+        g.db.execute(
+            text("""
+                UPDATE purchase_order_lines
+                SET quantity_received = GREATEST(0, quantity_received - :qty),
+                    status = CASE WHEN GREATEST(0, quantity_received - :qty) = 0 THEN :pol_pending
+                                  WHEN GREATEST(0, quantity_received - :qty) >= quantity_ordered THEN :pol_received
+                                  ELSE :pol_partial END
+                WHERE po_line_id = :plid
+            """),
+            {"qty": receipt.quantity_received, "plid": receipt.po_line_id,
+             "pol_pending": POL_PENDING, "pol_received": POL_RECEIVED, "pol_partial": POL_PARTIAL},
+        )
+
+        # 3. Delete receipt record
+        g.db.execute(text("DELETE FROM item_receipts WHERE receipt_id = :rid"), {"rid": rid})
+
+        reversed_count += 1
+
+    for pid in po_ids:
+        all_lines = g.db.execute(
+            text("SELECT quantity_received, quantity_ordered FROM purchase_order_lines WHERE po_id = :pid"),
+            {"pid": pid},
+        ).fetchall()
+        if all(l.quantity_received >= l.quantity_ordered for l in all_lines):
+            new_status = PO_RECEIVED
+        elif any(l.quantity_received > 0 for l in all_lines):
+            new_status = PO_PARTIAL
+        else:
+            new_status = PO_OPEN
+        g.db.execute(
+            text("UPDATE purchase_orders SET status = :status WHERE po_id = :pid"),
+            {"status": new_status, "pid": pid},
+        )
+
+    # V-025: one audit row per warehouse involved, each with the
+    # authoritative warehouse_id from the receipt rows rather than the
+    # request body. Never fall back to validated.warehouse_id.
+    for wh_id, rids in reversed_by_warehouse.items():
+        write_audit_log(
+            g.db,
+            action_type=ACTION_RECEIVE_CANCEL,
+            entity_type="PO",
+            entity_id=validated.po_id or 0,
+            user_id=username,
+            warehouse_id=wh_id,
+            details={"reversed_receipts": len(rids), "receipt_ids": rids},
+        )
+
+    g.db.commit()
+    return jsonify({"message": f"Cancelled {reversed_count} receipt(s)", "reversed": reversed_count})

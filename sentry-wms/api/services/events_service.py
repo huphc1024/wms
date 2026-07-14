@@ -1,0 +1,231 @@
+"""emit_event: append a row to integration_events inside the caller's transaction.
+
+Shaped after ``write_audit_log`` so every emit site reads identically.
+The helper runs inside the caller's open transaction (no commit, no
+rollback); ``integration_events.visible_at`` gets set by the deferred
+trigger at COMMIT time so readers see events in commit order even when
+BIGSERIAL assigned ``event_id`` values out of commit order (see
+migration 020 for the full trigger contract).
+
+Idempotency: the table's ``(aggregate_type, aggregate_id, event_type,
+source_txn_id)`` UNIQUE constraint collapses retries of the same
+logical request into a single row. ``INSERT ... ON CONFLICT DO
+NOTHING RETURNING event_id`` returns the new ``event_id`` on first
+emit and ``None`` when the row was a duplicate; callers treat
+``None`` as "already emitted, no-op."
+
+Schema validation is gated by ``SENTRY_VALIDATE_EVENT_SCHEMAS`` (Decision U):
+
+- ``true`` / ``1`` / ``yes``: validate every payload against the
+  registered schema before insert. A mismatch raises; tests and CI run
+  this way so code bugs fail loudly.
+- anything else (default in production): skip validation and rely on
+  the consumer's own validator. Prevents a payload-schema drift from
+  blocking mobile writes in the warehouse.
+
+v1.5.1 V-217 (umbrella #156): the env var is read on every emit via
+``_validation_enabled()`` rather than snapshotted at module import.
+An operator can flip the toggle during an incident and the next
+emit reflects the new state without a worker restart.
+"""
+
+import json
+import os
+import uuid
+from typing import Optional
+
+from flask import g, has_request_context
+from sqlalchemy import text
+
+from services.events_schema_registry import get_validator
+
+def _validation_enabled() -> bool:
+    """v1.5.1 V-217 (umbrella #156): read SENTRY_VALIDATE_EVENT_SCHEMAS
+    on every emit rather than snapshotting it at module import.
+
+    Pre-v1.5.1 a module-level constant froze the value at the first
+    import; flipping the env var at runtime (via a shell export, a
+    test fixture, or an operator trying to hot-toggle during an
+    incident) had no effect because the constant was already
+    resolved. Reading the env var per-call makes the flag behave
+    like every other operator-tunable toggle -- set it, restart the
+    worker if desired, or just flip it and wait a request cycle."""
+    return os.getenv("SENTRY_VALIDATE_EVENT_SCHEMAS", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def emit_event(
+    db,
+    event_type: str,
+    event_version: int,
+    aggregate_type: str,
+    aggregate_id: int,
+    aggregate_external_id,
+    warehouse_id: int,
+    source_txn_id,
+    payload: dict,
+) -> Optional[int]:
+    """Append one row to ``integration_events`` inside the caller's transaction.
+
+    Returns the new ``event_id`` on first emit, or ``None`` if a row with
+    the same ``(aggregate_type, aggregate_id, event_type, source_txn_id)``
+    already exists (idempotent replay).
+
+    Validation failure raises ``jsonschema.ValidationError`` when the
+    ``SENTRY_VALIDATE_EVENT_SCHEMAS`` env var is set. An unknown
+    ``(event_type, event_version)`` always raises ``KeyError`` - that's
+    a code bug regardless of env.
+
+    v1.5.1 V-217 (umbrella #156): the env var is read on every call
+    so a runtime toggle takes effect on the next emit, not after a
+    worker restart.
+    """
+    if _validation_enabled():
+        validator = get_validator(event_type, event_version)
+        validator.validate(payload)
+
+    result = db.execute(
+        text(
+            """
+            INSERT INTO integration_events (
+                event_type, event_version, aggregate_type, aggregate_id,
+                aggregate_external_id, warehouse_id, source_txn_id, payload
+            )
+            VALUES (
+                :event_type, :event_version, :aggregate_type, :aggregate_id,
+                :aggregate_external_id, :warehouse_id, :source_txn_id, CAST(:payload AS JSONB)
+            )
+            ON CONFLICT (aggregate_type, aggregate_id, event_type, source_txn_id) DO NOTHING
+            RETURNING event_id
+            """
+        ),
+        {
+            "event_type": event_type,
+            "event_version": event_version,
+            "aggregate_type": aggregate_type,
+            "aggregate_id": aggregate_id,
+            "aggregate_external_id": _as_str(aggregate_external_id),
+            "warehouse_id": warehouse_id,
+            "source_txn_id": _as_str(source_txn_id),
+            "payload": json.dumps(payload),
+        },
+    )
+    row = result.fetchone()
+    return row[0] if row else None
+
+
+def _as_str(value):
+    """Normalise a uuid.UUID or str input to the string form Postgres expects."""
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    return value
+
+
+def resolve_source_external_id(
+    db,
+    source_type: str,
+    canonical_id,
+    source_system: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve a Sentry canonical UUID back to its source-system external_id.
+
+    Looks up the cross_system_mappings table for the (source_type, canonical_id)
+    pair and returns the source_id -- the identifier the upstream source system
+    (e.g., "erp-connector") used when it Pipe-B pushed the entity to Sentry.
+
+    Returns None when:
+      * No mapping row exists (entity created directly in Sentry without a
+        Pipe-B push, e.g., warehouse-floor manual entry).
+      * canonical_id is None / empty.
+
+    Caller pattern: COALESCE the result with the canonical UUID so the field
+    always carries SOMETHING the consumer can act on:
+
+        source_id = resolve_source_external_id(db, "sales_order", so.external_id)
+        payload["sales_order_external_id"] = source_id or str(so.external_id)
+
+    The canonical UUID stays available on `aggregate_id` (which is what
+    Sentry consumers should use for cross-system idempotency anyway), so the
+    fallback never strands the consumer with no identifier at all.
+
+    source_system filter:
+      When None (default), returns the most-recently-updated mapping for the
+      pair. Single-source deployments (one upstream connector pushing per
+      aggregate) only ever have one row, so ORDER-BY is a no-op there.
+      Multi-source deployments should pass source_system explicitly to
+      pick the right upstream identifier.
+
+    NOTE on field naming: pre-this-change the Sentry event payload's
+    *_external_id fields carried the canonical UUID ("the external id Sentry
+    exposes externally"), forcing every consumer to do this same lookup
+    against Sentry's API on every event. After this change those fields
+    carry the source-system external_id ("the external id from the system
+    that owns the data"), which matches the field-name convention used by
+    every other event-integration system the maintainer knows of, and
+    lets consumers process events without an out-of-band Sentry call.
+    """
+    if canonical_id is None or canonical_id == "":
+        return None
+
+    if source_system is not None:
+        row = db.execute(
+            text(
+                """
+                SELECT source_id
+                FROM cross_system_mappings
+                WHERE canonical_id = :cid
+                  AND source_type = :stype
+                  AND source_system = :ssys
+                LIMIT 1
+                """
+            ),
+            {"cid": str(canonical_id), "stype": source_type, "ssys": source_system},
+        ).fetchone()
+    else:
+        row = db.execute(
+            text(
+                """
+                SELECT source_id
+                FROM cross_system_mappings
+                WHERE canonical_id = :cid AND source_type = :stype
+                ORDER BY last_updated_at DESC
+                LIMIT 1
+                """
+            ),
+            {"cid": str(canonical_id), "stype": source_type},
+        ).fetchone()
+    return row.source_id if row else None
+
+
+def get_user_external_id(db, username: str) -> Optional[str]:
+    """Look up ``users.external_id`` by username, cached per-request in ``g``.
+
+    Plan section 1.7.1: "Username-to-UUID lookups happen inside the emit
+    helper, cached per request in ``g`` to avoid repeated queries for
+    the same username." A receive_items call that receives 10 items
+    from the same picker pays one lookup, not ten.
+
+    Returns ``None`` if the username is not in ``users``; emit sites
+    should surface that as a code bug (every action has a known actor).
+    """
+    if username is None:
+        return None
+    cache_attr = "_user_external_id_cache"
+    cache = {}
+    if has_request_context():
+        cache = getattr(g, cache_attr, None)
+        if cache is None:
+            cache = {}
+            setattr(g, cache_attr, cache)
+    if username in cache:
+        return cache[username]
+    row = db.execute(
+        text("SELECT external_id FROM users WHERE username = :u"),
+        {"u": username},
+    ).fetchone()
+    value = str(row.external_id) if row else None
+    cache[username] = value
+    return value
