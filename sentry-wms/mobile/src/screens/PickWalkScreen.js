@@ -227,6 +227,15 @@ export default function PickWalkScreen({ navigation, route }) {
                 {task.zone_name}{task.aisle ? ` \u00b7 AISLE ${task.aisle}` : ''}
               </Text>
             )}
+            <TouchableOpacity
+              style={[buttonStyles.buttonSecondary, { marginTop: 12, width: '100%' }]}
+              onPress={() => navigation.navigate('Map', {
+                itemId: task.item_id,
+                sku: task.sku,
+              })}
+            >
+              <Text style={buttonStyles.buttonSecondaryText}>XEM TRÊN SƠ ĐỒ 2D</Text>
+            </TouchableOpacity>
           </View>
 
           {/* Item card */}

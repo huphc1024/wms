@@ -15,6 +15,7 @@ const ALL_FUNCTIONS = [
   { key: 'putaway', label: 'Put-Away' },
   { key: 'count', label: 'Count' },
   { key: 'transfer', label: 'Transfer' },
+  { key: 'map', label: 'Map' },
 ];
 
 // Web-admin page grants (mig 061). Mirrors the sidebar

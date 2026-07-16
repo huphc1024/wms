@@ -17,6 +17,7 @@ const FUNCTIONS = [
   { key: 'putaway', label: 'PUT-AWAY', sub: 'Bin placement', screen: 'PutAway', accent: 'copper' },
   { key: 'transfer', label: 'TRANSFER', sub: 'Bin to bin', screen: 'Transfer', accent: 'gray' },
   { key: 'count', label: 'COUNT', sub: 'Cycle count', screen: 'Count', accent: 'gray' },
+  { key: 'map', label: 'MAP', sub: 'Sơ đồ kho 2D', screen: 'Map', accent: 'gray' },
   { key: 'ship', label: 'SHIP', sub: 'Fulfill & ship', screen: 'Ship', accent: 'gray' },
 ];
 
@@ -198,8 +199,10 @@ export default function HomeScreen({ navigation }) {
     showError('Barcode not recognized');
   };
 
+  // MAP is always visible for any signed-in worker — it is a read-only
+  // warehouse locator, not an operational privilege like pick/receive.
   const visibleFunctions = FUNCTIONS.filter(
-    (fn) => allowedFunctions.includes(fn.key)
+    (fn) => fn.key === 'map' || allowedFunctions.includes(fn.key)
   );
 
   const getBadgeCount = (key) => badges[key] || 0;

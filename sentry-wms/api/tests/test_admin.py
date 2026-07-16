@@ -221,6 +221,20 @@ class TestWarehouseMap:
         assert "canvas" in data
         assert data["bins"][0]["map"]["x"] is not None
         assert "categories" in data
+        assert "racks" in data
+
+    def test_mobile_warehouse_map(self, client, auth_headers):
+        resp = client.get("/api/warehouse-map?warehouse_id=1", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert len(data["racks"]) >= 1
+        rack_key = data["racks"][0]["rack_key"]
+        detail = client.get(
+            f"/api/warehouse-map/rack/{rack_key}?warehouse_id=1",
+            headers=auth_headers,
+        )
+        assert detail.status_code == 200
+        assert detail.get_json()["rack"]["levels"]
 
     def test_get_warehouse_map_requires_warehouse_id(self, client, auth_headers):
         resp = client.get("/api/admin/warehouse-map", headers=auth_headers)

@@ -462,6 +462,7 @@ def create_app():
     from routes.dashboard import dashboard_bp
     from routes.dockd import dockd_bp
     from routes.pos import pos_bp
+    from routes.warehouse_map import warehouse_map_bp
     from routes.web import web_bp
 
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
@@ -473,6 +474,7 @@ def create_app():
     app.register_blueprint(shipping_bp, url_prefix="/api/shipping")
     app.register_blueprint(inventory_bp, url_prefix="/api/inventory")
     app.register_blueprint(transfers_bp, url_prefix="/api/transfers")
+    app.register_blueprint(warehouse_map_bp, url_prefix="/api/warehouse-map")
     app.register_blueprint(admin_bp, url_prefix="/api/admin")
     app.register_blueprint(warehouses_bp, url_prefix="/api/warehouses")
     # v1.5.0 #122: first /api/v1/* surface. Gated by @require_wms_token
