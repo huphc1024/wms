@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
 
-Write-Host "=== Sentry WMS local setup ===" -ForegroundColor Cyan
+Write-Host "=== Sơn Lộc WMS local setup ===" -ForegroundColor Cyan
 
 # Python venv + API deps
 $Venv = Join-Path $Root "api\.venv"

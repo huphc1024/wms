@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate, Navigate } from 'react-router-dom';
 import { useAuth } from '../auth.jsx';
 import { useLocale } from '../i18n/locale.jsx';
+import { BRAND_NAME } from '../brand.js';
 
 export default function Login() {
   const { user, login } = useAuth();
@@ -67,7 +68,7 @@ export default function Login() {
               <line x1="19" y1="16" x2="23.5" y2="16" stroke="#FCF4E3" strokeWidth="1" opacity="0.4"/>
               <line x1="19" y1="20" x2="23.5" y2="20" stroke="#FCF4E3" strokeWidth="1" opacity="0.4"/>
             </svg>
-            Sentry WMS
+            {BRAND_NAME}
           </span>
           <div className="topbar-lang" role="group" aria-label={t('lang.label')}>
             <button

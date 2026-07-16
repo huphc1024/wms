@@ -4,6 +4,7 @@ import { useAuth } from '../auth.jsx';
 import { useWarehouse } from '../warehouse.jsx';
 import { useLocale } from '../i18n/locale.jsx';
 import { api } from '../api.js';
+import { BRAND_NAME } from '../brand.js';
 
 const SEARCH_DEBOUNCE_MS = 250;
 
@@ -163,7 +164,7 @@ export default function TopBar({ forced = false }) {
           <line x1="19" y1="16" x2="23.5" y2="16" stroke="#FCF4E3" strokeWidth="1" opacity="0.4"/>
           <line x1="19" y1="20" x2="23.5" y2="20" stroke="#FCF4E3" strokeWidth="1" opacity="0.4"/>
         </svg>
-        Sentry WMS
+        {BRAND_NAME}
         {serverVersion && (
           <span
             className="topbar-version"

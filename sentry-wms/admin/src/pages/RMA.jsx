@@ -7,7 +7,7 @@ import Modal from '../components/Modal.jsx';
 
 // A return SO (the <orig>-RMA) is received one item at a time into a chosen
 // disposition: the warehouse + bin decide whether the goods go back as
-// sellable stock or are held as defective / open-box. Sentry carries that
+// sellable stock or are held as defective / open-box. Sơn Lộc WMS carries that
 // location on the return.received event for a downstream ledger's GL.
 // CANCELLED is intentionally absent: there is no RMA-cancel action yet, and the
 // generic sales-order cancel unwinds allocation/picking, which is wrong for a

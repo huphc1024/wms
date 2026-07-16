@@ -1,8 +1,8 @@
-# Sentry WMS
+# Sơn Lộc WMS
 
-Sentry WMS is a free, open-source warehouse management system built for e-commerce fulfillment.
+Sơn Lộc WMS is a warehouse management system for e-commerce fulfillment.
 
-It connects barcode scans, pick tasks, and inventory movements to whatever database or ERP your business runs on. Sentry handles the physical warehouse execution layer -- receiving, storage, picking, packing, shipping, and counting -- so your system of record stays accurate.
+It connects barcode scans, pick tasks, and inventory movements to whatever database or ERP your business runs on. Sơn Lộc WMS handles the physical warehouse execution layer -- receiving, storage, picking, packing, shipping, and counting -- so your system of record stays accurate.
 
 ## Features
 

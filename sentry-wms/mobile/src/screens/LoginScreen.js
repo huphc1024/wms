@@ -4,8 +4,9 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from '../auth/AuthContext';
 import client, { getStoredApiUrl, setApiUrl, hasStoredApiUrl } from '../api/client';
 import { colors, fonts, radii } from '../theme/styles';
+import { BRAND_SHORT, BRAND_TAGLINE } from '../brand';
 
-const SENTRY_LOGIN_RENDERED = '__sentry_login_rendered__';
+const LOGIN_RENDERED = '__sonloc_login_rendered__';
 
 export default function LoginScreen() {
   const { login } = useAuth();
@@ -24,13 +25,13 @@ export default function LoginScreen() {
   const [modalChecking, setModalChecking] = useState(false);
   const [renderGuard] = useState(() => {
     // Guard against duplicate renders  -  only allow one instance
-    if (global[SENTRY_LOGIN_RENDERED]) return false;
-    global[SENTRY_LOGIN_RENDERED] = true;
+    if (global[LOGIN_RENDERED]) return false;
+    global[LOGIN_RENDERED] = true;
     return true;
   });
 
   useEffect(() => {
-    return () => { global[SENTRY_LOGIN_RENDERED] = false; };
+    return () => { global[LOGIN_RENDERED] = false; };
   }, []);
 
   useEffect(() => {
@@ -135,8 +136,8 @@ export default function LoginScreen() {
       >
         <View style={styles.container}>
           <View style={styles.logoSection}>
-            <Text style={styles.logoText}>SENTRY</Text>
-            <Text style={styles.logoSubtext}>WAREHOUSE MANAGEMENT</Text>
+            <Text style={styles.logoText}>{BRAND_SHORT}</Text>
+            <Text style={styles.logoSubtext}>{BRAND_TAGLINE}</Text>
           </View>
 
           <View style={styles.form}>
@@ -179,8 +180,8 @@ export default function LoginScreen() {
     >
       <View style={styles.container}>
         <View style={styles.logoSection}>
-          <Text style={styles.logoText}>SENTRY</Text>
-          <Text style={styles.logoSubtext}>WAREHOUSE MANAGEMENT</Text>
+          <Text style={styles.logoText}>{BRAND_SHORT}</Text>
+          <Text style={styles.logoSubtext}>{BRAND_TAGLINE}</Text>
         </View>
 
         <View style={styles.form}>
@@ -276,16 +277,16 @@ const styles = StyleSheet.create({
   },
   logoText: {
     fontFamily: fonts.mono,
-    fontSize: 36,
+    fontSize: 30,
     fontWeight: '700',
     color: colors.accentRed,
-    letterSpacing: 4,
+    letterSpacing: 2,
   },
   logoSubtext: {
     fontFamily: fonts.mono,
     fontSize: 11,
     color: colors.textMuted,
-    letterSpacing: 2,
+    letterSpacing: 1.5,
     marginTop: 4,
   },
   form: {

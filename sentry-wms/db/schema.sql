@@ -83,6 +83,10 @@ CREATE TABLE items (
     upc VARCHAR(50),                       -- primary barcode
     barcode_aliases JSONB,                 -- array of alternate barcodes
     category VARCHAR(100),
+    storage_profile VARCHAR(20) CHECK (
+        storage_profile IS NULL
+        OR storage_profile IN ('HEAVY', 'FMCG', 'FULFILLMENT', 'PROJECT')
+    ),
     weight_lbs DECIMAL(10,4),
     length_in DECIMAL(10,2),
     width_in DECIMAL(10,2),
@@ -103,6 +107,7 @@ CREATE TABLE items (
 
 CREATE INDEX ix_items_upc ON items(upc);
 CREATE INDEX ix_items_sku ON items(sku);
+CREATE INDEX ix_items_storage_profile ON items(storage_profile);
 
 -- ============================================================
 -- INVENTORY (Current stock by bin)

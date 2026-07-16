@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Initialize PostgreSQL for Sentry WMS without Docker."""
+"""Initialize PostgreSQL for Sơn Lộc WMS without Docker."""
 
 from __future__ import annotations
 

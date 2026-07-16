@@ -14,7 +14,7 @@ import StatusTag from '../components/StatusTag.jsx';
 // SalesOrders.jsx + TransferOrders.jsx; the single-file layout was
 // kept for codebase uniformity.
 
-const COLOR_TOP = '#8e2715';   // Sentry red (top performer per card)
+const COLOR_TOP = '#8e2715';   // Brand red (top performer per card)
 const COLOR_OTHER = '#c4722a'; // Copper (every other user)
 
 const EVENT_LABELS = {

@@ -1,8 +1,8 @@
 {
-  "name": "sentry-wms-mobile",
+  "name": "sonloc-wms-mobile",
   "version": "1.29.0",
   "license": "Apache-2.0",
-  "description": "Sentry WMS - Mobile Scanner App",
+  "description": "Sơn Lộc WMS - Ứng dụng quét kho",
   "main": "expo/AppEntry.js",
   "scripts": {
     "start": "expo start",
@@ -22,6 +22,7 @@
     "@react-navigation/native-stack": "^7.0.0",
     "expo": "^54.0.0",
     "expo-asset": "~12.0.12",
+    "expo-camera": "~17.0.10",
     "expo-secure-store": "~15.0.8",
     "expo-splash-screen": "~31.0.13",
     "expo-status-bar": "~3.0.9",

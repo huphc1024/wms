@@ -1,9 +1,10 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Stage, Layer, Rect, Text, Group, Circle, Arrow } from 'react-konva';
 import { api } from '../api.js';
 import { useWarehouse } from '../warehouse.jsx';
 import { useLocale } from '../i18n/locale.jsx';
 import PageHeader from '../components/PageHeader.jsx';
+import Modal from '../components/Modal.jsx';
 
 const WORLD_W_M = 50;
 const WORLD_H_M = 40;
@@ -48,10 +49,18 @@ function binStatus(bin) {
   return 'occupied';
 }
 
+const SLOT_STATUS = {
+  empty: { fill: '#F0EDE6', stroke: '#B8AA96', dot: '#B8AA96' },
+  occupied: { fill: '#E8F5EA', stroke: '#2D7A3A', dot: '#2D7A3A' },
+  expired: { fill: '#FEF3D7', stroke: '#C4722A', dot: '#C4722A' },
+};
+
 function statusColor(status) {
-  if (status === 'empty') return '#dcfce7';
-  if (status === 'expired') return '#ddd6fe';
-  return '#bfdbfe';
+  return SLOT_STATUS[status]?.fill ?? SLOT_STATUS.empty.fill;
+}
+
+function statusStroke(status) {
+  return SLOT_STATUS[status]?.stroke ?? SLOT_STATUS.empty.stroke;
 }
 
 /** How many pallet-block slots fit in a zone by area (not by DB bin count). */
@@ -202,6 +211,24 @@ export default function WarehouseSimulation() {
   const [scale, setScale] = useState(1);
   const [stagePos, setStagePos] = useState({ x: 0, y: 0 });
   const [layoutOverrides, setLayoutOverrides] = useState({});
+  const [slotModalOpen, setSlotModalOpen] = useState(false);
+  const [skuQuery, setSkuQuery] = useState('');
+  const [skuMatches, setSkuMatches] = useState([]);
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [moveQty, setMoveQty] = useState('1');
+  const [moveMsg, setMoveMsg] = useState('');
+  const [moveError, setMoveError] = useState('');
+  const [moveBusy, setMoveBusy] = useState(false);
+  const skuSearchTimer = useRef(null);
+  const skuInputRef = useRef(null);
+
+  const refreshMapQuiet = useCallback(async () => {
+    if (!warehouseId) return;
+    const res = await api.get(`/admin/warehouse-map?warehouse_id=${warehouseId}`);
+    if (!res?.ok) return;
+    const data = await res.json();
+    setMapData(data);
+  }, [warehouseId]);
 
   const loadMap = useCallback(async () => {
     if (!warehouseId) return;
@@ -219,10 +246,114 @@ export default function WarehouseSimulation() {
     setSelectedBin(null);
     setSelectedPallet(null);
     setSelectedZone(null);
+    setSlotModalOpen(false);
     setScale(1);
     setStagePos({ x: 0, y: 0 });
     setLayoutOverrides({});
   }, [warehouseId, t]);
+
+  const openBinSlot = useCallback((binId, palletId = null) => {
+    setSelectedBin(binId);
+    setSelectedZone(null);
+    setSelectedPallet(palletId);
+    setSkuQuery('');
+    setSkuMatches([]);
+    setSelectedItem(null);
+    setMoveQty('1');
+    setMoveMsg('');
+    setMoveError('');
+    setSlotModalOpen(true);
+    setTimeout(() => skuInputRef.current?.focus(), 80);
+  }, []);
+
+  const searchSku = useCallback(async (q) => {
+    const trimmed = String(q || '').trim();
+    if (!trimmed) {
+      setSkuMatches([]);
+      return [];
+    }
+    const res = await api.get(`/admin/items?q=${encodeURIComponent(trimmed)}&per_page=12&active=true`);
+    if (!res?.ok) {
+      setSkuMatches([]);
+      return [];
+    }
+    const data = await res.json();
+    const items = data.items || data || [];
+    const list = Array.isArray(items) ? items : [];
+    setSkuMatches(list);
+    if (list.length === 1) {
+      const only = list[0];
+      setSelectedItem(only);
+      setSkuQuery(only.sku || trimmed);
+    }
+    return list;
+  }, []);
+
+  const onSkuInput = (value) => {
+    setSkuQuery(value);
+    setSelectedItem(null);
+    setMoveMsg('');
+    setMoveError('');
+    if (skuSearchTimer.current) clearTimeout(skuSearchTimer.current);
+    skuSearchTimer.current = setTimeout(() => searchSku(value), 280);
+  };
+
+  const pickItem = (item) => {
+    setSelectedItem(item);
+    setSkuQuery(item.sku || '');
+    setSkuMatches([]);
+    setMoveError('');
+  };
+
+  const pickPalletForMove = (pallet) => {
+    setSelectedPallet(pallet.pallet_id);
+    setSkuQuery(pallet.sku || '');
+    setSelectedItem(pallet.item_id ? { item_id: pallet.item_id, sku: pallet.sku } : null);
+    setMoveQty(String(Math.max(1, Number(pallet.quantity_on_hand) || 1)));
+    setSkuMatches([]);
+    setMoveError('');
+    if (pallet.sku && !pallet.item_id) searchSku(pallet.sku);
+  };
+
+  const submitMove = async (adjustmentType) => {
+    if (!selected || !warehouseId) return;
+    let itemId = selectedItem?.item_id;
+    let matches = skuMatches;
+    if (!itemId && skuQuery.trim()) {
+      matches = await searchSku(skuQuery.trim());
+      const exact = matches.find((i) => String(i.sku).toUpperCase() === skuQuery.trim().toUpperCase()) || matches[0];
+      itemId = exact?.item_id;
+      if (exact) setSelectedItem(exact);
+    }
+    if (!itemId) {
+      setMoveError('Chọn hoặc scan SKU trước.');
+      return;
+    }
+    const qty = parseInt(moveQty, 10);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      setMoveError('Số lượng phải > 0.');
+      return;
+    }
+    setMoveBusy(true);
+    setMoveError('');
+    setMoveMsg('');
+    const res = await api.post('/admin/adjustments/direct', {
+      warehouse_id: Number(warehouseId),
+      bin_id: selected.bin_id,
+      item_id: itemId,
+      adjustment_type: adjustmentType,
+      quantity: qty,
+      reason: `Simulation ${adjustmentType === 'ADD' ? 'inbound' : 'outbound'} ${selected.bin_code}`,
+    });
+    setMoveBusy(false);
+    if (!res?.ok) {
+      const data = await res?.json().catch(() => ({}));
+      setMoveError(data?.error || data?.message || 'Thao tác thất bại.');
+      return;
+    }
+    setMoveMsg(adjustmentType === 'ADD' ? `Đã nhập ${qty} vào ${selected.bin_code}` : `Đã xuất ${qty} khỏi ${selected.bin_code}`);
+    await refreshMapQuiet();
+  };
 
   useEffect(() => { loadMap(); }, [loadMap]);
 
@@ -255,6 +386,21 @@ export default function WarehouseSimulation() {
     if (!selected) return null;
     return (selected.pallets || []).find((p) => p.pallet_id === selectedPallet) || null;
   }, [selected, selectedPallet]);
+
+  useEffect(() => {
+    if (!slotModalOpen || !selectedPalletData) return;
+    setSkuQuery(selectedPalletData.sku || '');
+    if (selectedPalletData.item_id) {
+      setSelectedItem({
+        item_id: selectedPalletData.item_id,
+        sku: selectedPalletData.sku,
+        item_name: selectedPalletData.item_name,
+      });
+    } else if (selectedPalletData.sku) {
+      searchSku(selectedPalletData.sku);
+    }
+    setMoveQty(String(Math.max(1, Number(selectedPalletData.quantity_on_hand) || 1)));
+  }, [slotModalOpen, selectedPalletData, searchSku]);
 
   const zoneSummary = useMemo(() => ({
     receiving: summarizeZone(groupedBins.receiving || [], 'Receiving', zoneCapacity(ZONES.receiving)),
@@ -344,9 +490,15 @@ export default function WarehouseSimulation() {
         <div className="sim2-main">
           <aside className="sim2-sidebar">
             <h3>Bộ lọc kho</h3>
-            <div className="sim2-legend-item"><span className="sim2-dot empty" /> Trống</div>
-            <div className="sim2-legend-item"><span className="sim2-dot occupied" /> Đang có hàng</div>
-            <div className="sim2-legend-item"><span className="sim2-dot expired" /> Sắp hết hạn</div>
+            <div className="sim2-legend-item sim2-legend-status sim2-legend-status--empty">
+              <span className="sim2-dot empty" /> Trống
+            </div>
+            <div className="sim2-legend-item sim2-legend-status sim2-legend-status--occupied">
+              <span className="sim2-dot occupied" /> Đang có hàng
+            </div>
+            <div className="sim2-legend-item sim2-legend-status sim2-legend-status--expired">
+              <span className="sim2-dot expired" /> Sắp hết hạn
+            </div>
             <div className="sim2-legend-item"><span className="sim2-line blue" /> Luồng xe nâng</div>
             <div className="sim2-legend-item"><span className="sim2-line green" /> Lối đi bộ an toàn</div>
             <p style={{ marginTop: 10, fontSize: 12, color: 'var(--text-secondary)' }}>
@@ -473,8 +625,8 @@ export default function WarehouseSimulation() {
                       <Rect
                         width={slot.w * PX_PER_M}
                         height={slot.h * PX_PER_M}
-                        fill="rgba(248, 250, 252, 0.92)"
-                        stroke="#94a3b8"
+                        fill="rgba(240, 237, 230, 0.92)"
+                        stroke="#B8AA96"
                         strokeWidth={1}
                         dash={[4, 3]}
                         cornerRadius={4}
@@ -500,14 +652,14 @@ export default function WarehouseSimulation() {
                           const ny = e.target.y() / PX_PER_M;
                           setLayoutOverrides((prev) => ({ ...prev, [bin.bin_id]: { ...bin.pos, x: nx, y: ny } }));
                         }}
-                        onClick={() => { setSelectedBin(bin.bin_id); setSelectedZone(null); setSelectedPallet(null); }}
+                        onClick={() => openBinSlot(bin.bin_id)}
                         opacity={muted ? 0.3 : 1}
                       >
                         <Rect
                           width={bin.pos.w * PX_PER_M}
                           height={bin.pos.h * PX_PER_M}
                           fill={statusColor(status)}
-                          stroke={isSelected ? '#111827' : '#64748b'}
+                          stroke={isSelected ? '#111827' : statusStroke(status)}
                           strokeWidth={isSelected ? 2.2 : 1}
                           cornerRadius={4}
                         />
@@ -518,8 +670,8 @@ export default function WarehouseSimulation() {
                           const px = 6 + col * ((bin.pos.w * PX_PER_M - 20) / 2);
                           const py = 18 + row * 11;
                           return (
-                            <Group key={p.pallet_id} x={px} y={py} onClick={(e) => { e.cancelBubble = true; setSelectedBin(bin.bin_id); setSelectedPallet(p.pallet_id); }}>
-                              <Circle radius={4} fill={p.expiry_date && (new Date(p.expiry_date) - new Date()) / (24 * 3600 * 1000) <= 30 ? '#dc2626' : '#2563eb'} />
+                            <Group key={p.pallet_id} x={px} y={py} onClick={(e) => { e.cancelBubble = true; openBinSlot(bin.bin_id, p.pallet_id); }}>
+                              <Circle radius={4} fill={p.expiry_date && (new Date(p.expiry_date) - new Date()) / (24 * 3600 * 1000) <= 30 ? SLOT_STATUS.expired.dot : SLOT_STATUS.occupied.dot} />
                               <Text text={p.pallet_id.slice(-2)} x={6} y={-5} fontSize={8} />
                             </Group>
                           );
@@ -541,57 +693,149 @@ export default function WarehouseSimulation() {
               <div className="sim2-metric"><span>Sắp hết hạn</span><strong>{nearExpirySlots}</strong></div>
             </div>
 
-            <div className="sim2-detail-card">
-              {selected ? (
-                <>
-                  <div style={{ fontWeight: 800, marginBottom: 8 }}>{selected.bin_code}</div>
-                  <div className="sim2-detail-row"><span>SKU</span><strong>{selected.contents?.[0]?.sku || '-'}</strong></div>
-                  <div className="sim2-detail-row"><span>Lot</span><strong>{selected.pallets?.[0]?.lot_code || '-'}</strong></div>
-                  <div className="sim2-detail-row"><span>Pallet</span><strong>{selected.pallet_count || 0}</strong></div>
-                  <div className="sim2-detail-row"><span>Tồn</span><strong>{selected.total_qty}</strong></div>
-                  <div className="sim2-detail-row"><span>Zone</span><strong>{selected.zone_name}</strong></div>
-                  <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                    {(selected.pallets || []).map((p) => (
-                      <button key={p.pallet_id} type="button" className={`btn btn-sm ${selectedPallet === p.pallet_id ? 'btn-primary' : ''}`} onClick={() => setSelectedPallet(p.pallet_id)}>
-                        {p.pallet_id}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              ) : selectedZone ? (
-                <>
-                  <div style={{ fontWeight: 800, marginBottom: 8 }}>{zoneSummary[selectedZone]?.label}</div>
-                  <div className="sim2-detail-row"><span>Sức chứa khu</span><strong>{zoneSummary[selectedZone]?.capacity ?? 0}</strong></div>
-                  <div className="sim2-detail-row"><span>Bin thực tế</span><strong>{zoneSummary[selectedZone]?.bins ?? 0}</strong></div>
-                  <div className="sim2-detail-row"><span>Đang có hàng</span><strong>{zoneSummary[selectedZone]?.occupied ?? 0}</strong></div>
-                  <div className="sim2-detail-row"><span>Lấp đầy</span><strong>{zoneSummary[selectedZone]?.fillPct ?? 0}%</strong></div>
-                  <div className="sim2-detail-row"><span>Còn trống</span><strong>{zoneSummary[selectedZone]?.emptyPct ?? 100}% ({zoneSummary[selectedZone]?.empty ?? 0})</strong></div>
-                </>
-              ) : (
-                <div style={{ color: 'var(--text-secondary)', fontSize: 14 }}>Click vào khu / pallet để xem chi tiết.</div>
-              )}
-            </div>
-
-            {selected && (selected.pallets || []).length > 0 && (
-              <div className="warehouse-sim-pallet-table-wrap">
-                <h3 className="warehouse-sim-detail-subtitle">{t('sim.palletList', 'Danh sach pallet')}</h3>
-                <table className="warehouse-sim-pallet-table">
-                  <thead>
-                    <tr><th>ID</th><th>SKU</th><th>LOT</th><th>HSD</th><th>Tồn</th></tr>
-                  </thead>
-                  <tbody>
-                    {selected.pallets.map((p) => (
-                      <tr key={p.pallet_id} className={p.pallet_id === selectedPallet ? 'is-selected' : ''} onClick={() => setSelectedPallet(p.pallet_id)}>
-                        <td>{p.pallet_id}</td><td>{p.sku}</td><td>{p.lot_code}</td><td>{p.expiry_date}</td><td>{p.quantity_on_hand}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+            <div className="sim2-detail-scroll">
+              <div className="sim2-detail-card">
+                {selected ? (
+                  <>
+                    <div style={{ fontWeight: 800, marginBottom: 8 }}>{selected.bin_code}</div>
+                    <div className="sim2-detail-row"><span>SKU</span><strong>{selected.contents?.[0]?.sku || '-'}</strong></div>
+                    <div className="sim2-detail-row"><span>Lot</span><strong>{selected.pallets?.[0]?.lot_code || '-'}</strong></div>
+                    <div className="sim2-detail-row"><span>Pallet</span><strong>{selected.pallet_count || 0}</strong></div>
+                    <div className="sim2-detail-row"><span>Tồn</span><strong>{selected.total_qty}</strong></div>
+                    <div className="sim2-detail-row"><span>Zone</span><strong>{selected.zone_name}</strong></div>
+                    <button type="button" className="btn btn-sm btn-primary" style={{ marginTop: 10 }} onClick={() => openBinSlot(selected.bin_id, selectedPallet)}>
+                      Mở thao tác nhập / xuất
+                    </button>
+                  </>
+                ) : selectedZone ? (
+                  <>
+                    <div style={{ fontWeight: 800, marginBottom: 8 }}>{zoneSummary[selectedZone]?.label}</div>
+                    <div className="sim2-detail-row"><span>Sức chứa khu</span><strong>{zoneSummary[selectedZone]?.capacity ?? 0}</strong></div>
+                    <div className="sim2-detail-row"><span>Bin thực tế</span><strong>{zoneSummary[selectedZone]?.bins ?? 0}</strong></div>
+                    <div className="sim2-detail-row"><span>Đang có hàng</span><strong>{zoneSummary[selectedZone]?.occupied ?? 0}</strong></div>
+                    <div className="sim2-detail-row"><span>Lấp đầy</span><strong>{zoneSummary[selectedZone]?.fillPct ?? 0}%</strong></div>
+                    <div className="sim2-detail-row"><span>Còn trống</span><strong>{zoneSummary[selectedZone]?.emptyPct ?? 100}% ({zoneSummary[selectedZone]?.empty ?? 0})</strong></div>
+                  </>
+                ) : (
+                  <div style={{ color: 'var(--text-secondary)', fontSize: 14 }}>Click vào ô pallet để nhập / xuất hàng.</div>
+                )}
               </div>
-            )}
-            {renderPalletActions()}
+
+              {selected && (selected.pallets || []).length > 0 && (
+                <div className="warehouse-sim-pallet-table-wrap">
+                  <h3 className="warehouse-sim-detail-subtitle">{t('sim.palletList', 'Danh sach pallet')}</h3>
+                  <table className="warehouse-sim-pallet-table">
+                    <thead>
+                      <tr><th>ID</th><th>SKU</th><th>LOT</th><th>HSD</th><th>Tồn</th></tr>
+                    </thead>
+                    <tbody>
+                      {selected.pallets.map((p) => (
+                        <tr key={p.pallet_id} className={p.pallet_id === selectedPallet ? 'is-selected' : ''} onClick={() => openBinSlot(selected.bin_id, p.pallet_id)}>
+                          <td>{p.pallet_id}</td><td>{p.sku}</td><td>{p.lot_code}</td><td>{p.expiry_date}</td><td>{p.quantity_on_hand}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {renderPalletActions()}
+            </div>
           </aside>
         </div>
+      )}
+
+      {slotModalOpen && selected && (
+        <Modal
+          title={`Ô ${selected.bin_code}`}
+          onClose={() => setSlotModalOpen(false)}
+          size="wide"
+          footer={(
+            <>
+              <button type="button" className="btn" onClick={() => setSlotModalOpen(false)}>Đóng</button>
+              <button type="button" className="btn btn-primary" disabled={moveBusy} onClick={() => submitMove('ADD')}>
+                {moveBusy ? '...' : 'Nhập hàng'}
+              </button>
+              <button type="button" className="btn" disabled={moveBusy} onClick={() => submitMove('REMOVE')}>
+                {moveBusy ? '...' : 'Xuất hàng'}
+              </button>
+            </>
+          )}
+        >
+          <div className="sim-slot-modal">
+            <div className="sim-slot-meta">
+              <div className="sim2-detail-row"><span>Zone</span><strong>{selected.zone_name || '-'}</strong></div>
+              <div className="sim2-detail-row"><span>Tồn hiện tại</span><strong>{selected.total_qty ?? 0}</strong></div>
+              <div className="sim2-detail-row"><span>Số pallet</span><strong>{selected.pallet_count || (selected.pallets || []).length || 0}</strong></div>
+            </div>
+
+            <div className="sim-slot-section">
+              <h4>Hàng trong ô — click để chọn xuất</h4>
+              <div className="sim-slot-pallet-list">
+                {(selected.pallets || []).length === 0 && (
+                  <div className="sim-slot-empty">Ô đang trống — scan/chọn SKU để nhập hàng.</div>
+                )}
+                {(selected.pallets || []).map((p) => (
+                  <button
+                    key={p.pallet_id}
+                    type="button"
+                    className={`sim-slot-pallet-item ${selectedPallet === p.pallet_id ? 'is-active' : ''}`}
+                    onClick={() => pickPalletForMove(p)}
+                  >
+                    <strong>{p.sku || '-'}</strong>
+                    <span>{p.pallet_id}</span>
+                    <span>LOT {p.lot_code || '-'}</span>
+                    <span>SL {p.quantity_on_hand}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="sim-slot-section">
+              <h4>Scan / chọn SKU</h4>
+              <div className="sim-slot-form-row">
+                <input
+                  ref={skuInputRef}
+                  className="form-input"
+                  placeholder="Gõ hoặc scan SKU / UPC rồi Enter"
+                  value={skuQuery}
+                  onChange={(e) => onSkuInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      searchSku(skuQuery);
+                    }
+                  }}
+                />
+                <input
+                  className="form-input"
+                  style={{ width: 110 }}
+                  type="number"
+                  min="1"
+                  value={moveQty}
+                  onChange={(e) => setMoveQty(e.target.value)}
+                  placeholder="SL"
+                />
+              </div>
+              {selectedItem && (
+                <div className="sim-slot-selected-sku">
+                  Đang chọn: <strong>{selectedItem.sku}</strong>{selectedItem.item_name ? ` — ${selectedItem.item_name}` : ''}
+                </div>
+              )}
+              {skuMatches.length > 1 && (
+                <div className="sim-slot-sku-matches">
+                  {skuMatches.map((item) => (
+                    <button key={item.item_id} type="button" className="sim-slot-sku-chip" onClick={() => pickItem(item)}>
+                      {item.sku}{item.item_name ? ` · ${item.item_name}` : ''}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {moveError && <div className="form-error" style={{ marginTop: 8 }}>{moveError}</div>}
+              {moveMsg && <div className="form-success" style={{ marginTop: 8 }}>{moveMsg}</div>}
+              <p className="sim-slot-hint">Nhập hàng = cộng tồn vào ô. Xuất hàng = trừ tồn khỏi ô. Có thể scan barcode vào ô SKU.</p>
+            </div>
+          </div>
+        </Modal>
       )}
     </div>
   );

@@ -65,6 +65,14 @@
   --purple: #534AB7;
   --purple-bg: #EEEDFE;
 
+  /* Warehouse simulation slot status */
+  --sim-empty-bg: #F0EDE6;
+  --sim-empty-border: #B8AA96;
+  --sim-occupied-bg: #E8F5EA;
+  --sim-occupied-border: #2D7A3A;
+  --sim-expired-bg: #FEF3D7;
+  --sim-expired-border: #C4722A;
+
   --sans: 'Instrument Sans', 'Helvetica Neue', sans-serif;
   --mono: 'JetBrains Mono', 'Fira Code', monospace;
 
@@ -748,6 +756,8 @@ a {
 
 .modal-body {
   padding: 20px;
+  max-height: min(62vh, 620px);
+  overflow-y: auto;
 }
 
 .modal-footer {
@@ -1261,6 +1271,121 @@ a {
   padding: 14px;
 }
 
+.sim2-detail {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 140px);
+  overflow: hidden;
+}
+
+.sim2-detail-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.sim-slot-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.sim-slot-meta {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+  background: #f8fafc;
+}
+
+.sim-slot-section h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.sim-slot-pallet-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.sim-slot-pallet-item {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr 0.7fr;
+  gap: 8px;
+  text-align: left;
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.sim-slot-pallet-item:hover {
+  border-color: #94a3b8;
+}
+
+.sim-slot-pallet-item.is-active {
+  border-color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.sim-slot-empty {
+  font-size: 13px;
+  color: var(--text-secondary);
+  padding: 8px 0;
+}
+
+.sim-slot-form-row {
+  display: flex;
+  gap: 8px;
+}
+
+.sim-slot-selected-sku {
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.sim-slot-sku-matches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.sim-slot-sku-chip {
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sim-slot-sku-chip:hover {
+  border-color: #2563eb;
+  color: #1d4ed8;
+}
+
+.sim-slot-hint {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.form-success {
+  color: #166534;
+  background: #dcfce7;
+  border: 1px solid #86efac;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
 .sim-konva-canvas {
   border: 1px solid #cbd5e1;
   border-radius: 12px;
@@ -1277,21 +1402,58 @@ a {
 .sim2-legend-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin: 8px 0;
+  gap: 10px;
+  margin: 6px 0;
   font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.sim2-legend-status {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.sim2-legend-status--empty {
+  background: var(--sim-empty-bg);
+  border-color: color-mix(in srgb, var(--sim-empty-border) 40%, var(--border));
+}
+
+.sim2-legend-status--occupied {
+  background: var(--sim-occupied-bg);
+  border-color: color-mix(in srgb, var(--sim-occupied-border) 35%, var(--border));
+}
+
+.sim2-legend-status--expired {
+  background: var(--sim-expired-bg);
+  border-color: color-mix(in srgb, var(--sim-expired-border) 40%, var(--border));
 }
 
 .sim2-dot {
-  width: 14px;
-  height: 14px;
-  border-radius: 4px;
-  border: 1px solid rgba(0, 0, 0, 0.15);
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 2px solid;
+  flex-shrink: 0;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
 }
 
-.sim2-dot.empty { background: #dcfce7; }
-.sim2-dot.occupied { background: #bfdbfe; }
-.sim2-dot.expired { background: #ddd6fe; }
+.sim2-dot.empty {
+  background: var(--sim-empty-bg);
+  border-color: var(--sim-empty-border);
+}
+
+.sim2-dot.occupied {
+  background: var(--sim-occupied-bg);
+  border-color: var(--sim-occupied-border);
+}
+
+.sim2-dot.expired {
+  background: var(--sim-expired-bg);
+  border-color: var(--sim-expired-border);
+}
 
 .sim2-line {
   width: 18px;
@@ -1424,9 +1586,23 @@ a {
   cursor: pointer;
 }
 
-.sim2-slot.empty { background: #dcfce7; }
-.sim2-slot.occupied { background: #bfdbfe; }
-.sim2-slot.expired { background: #ddd6fe; }
+.sim2-slot.empty {
+  background: var(--sim-empty-bg);
+  border-color: var(--sim-empty-border);
+  color: var(--text-secondary);
+}
+
+.sim2-slot.occupied {
+  background: var(--sim-occupied-bg);
+  border-color: var(--sim-occupied-border);
+  color: var(--success);
+}
+
+.sim2-slot.expired {
+  background: var(--sim-expired-bg);
+  border-color: var(--sim-expired-border);
+  color: var(--copper);
+}
 .sim2-slot.is-selected { outline: 2px solid #111827; }
 .sim2-slot.is-muted { opacity: 0.3; }
 

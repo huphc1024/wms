@@ -1404,7 +1404,7 @@ export default function Webhooks() {
           <p style={{ fontSize: 13, fontWeight: 600 }}>
             {reveal.display_name}: this secret (generation {reveal.secret_generation})
             is shown exactly once. Copy it to the consumer's HMAC verifier
-            now. Sentry stores only the encrypted form; if you lose this
+            now. Sơn Lộc WMS stores only the encrypted form; if you lose this
             value you must rotate.
           </p>
           <div style={{

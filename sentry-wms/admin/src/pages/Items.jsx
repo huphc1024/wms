@@ -11,6 +11,30 @@ const FILTER_OPTIONS = [
   { label: 'All', value: 'all' },
 ];
 
+const STORAGE_PROFILES = [
+  { value: 'HEAVY', label: 'ZONE A — Hàng nặng' },
+  { value: 'FMCG', label: 'ZONE B — FMCG nhẹ' },
+  { value: 'FULFILLMENT', label: 'ZONE C — Fulfillment/backstock' },
+  { value: 'PROJECT', label: 'ZONE D — Project/overflow' },
+];
+const KG_TO_LB = 2.2046226218;
+const CM_TO_IN = 0.3937007874;
+
+function numberOrNull(value) {
+  return value === '' || value == null ? null : Number(value);
+}
+
+function itemToForm(item) {
+  return {
+    ...item,
+    weight_kg: item.weight_lbs != null ? (Number(item.weight_lbs) / KG_TO_LB).toFixed(3) : '',
+    length_cm: item.length_in != null ? (Number(item.length_in) / CM_TO_IN).toFixed(1) : '',
+    width_cm: item.width_in != null ? (Number(item.width_in) / CM_TO_IN).toFixed(1) : '',
+    height_cm: item.height_in != null ? (Number(item.height_in) / CM_TO_IN).toFixed(1) : '',
+    barcode_aliases_text: (item.barcode_aliases || []).join('\n'),
+  };
+}
+
 export default function Items() {
   const [searchParams] = useSearchParams();
   const [items, setItems] = useState([]);
@@ -80,14 +104,24 @@ export default function Items() {
 
   function openCreate() {
     setEditId(null);
-    setForm({ is_active: true });
+    setForm({
+      is_active: true,
+      is_lot_tracked: false,
+      is_serial_tracked: false,
+      reorder_point: 0,
+      reorder_qty: 0,
+    });
     setError('');
     setShowModal(true);
   }
 
-  function openEdit(item) {
-    setEditId(item.id || item.item_id);
-    setForm({ ...item, id: item.id || item.item_id });
+  async function openEdit(item) {
+    const id = item.id || item.item_id;
+    setEditId(id);
+    const res = await api.get(`/admin/items/${id}`);
+    const data = res?.ok ? await res.json() : null;
+    const fullItem = data?.item || item;
+    setForm(itemToForm({ ...fullItem, id }));
     setError('');
     setShowModal(true);
   }
@@ -97,10 +131,31 @@ export default function Items() {
     const body = {
       sku: form.sku,
       item_name: form.item_name,
+      description: form.description || null,
       upc: form.upc || null,
+      barcode_aliases: (form.barcode_aliases_text || '')
+        .split(/[\n,;]+/)
+        .map((value) => value.trim())
+        .filter(Boolean),
       category: form.category || null,
-      weight_lbs: (form.weight_lbs || form.weight) ? Number(form.weight_lbs || form.weight) : null,
+      storage_profile: form.storage_profile || null,
+      weight_lbs: form.weight_kg === '' || form.weight_kg == null
+        ? null
+        : Number(form.weight_kg) * KG_TO_LB,
+      length_in: form.length_cm === '' || form.length_cm == null
+        ? null
+        : Number(form.length_cm) * CM_TO_IN,
+      width_in: form.width_cm === '' || form.width_cm == null
+        ? null
+        : Number(form.width_cm) * CM_TO_IN,
+      height_in: form.height_cm === '' || form.height_cm == null
+        ? null
+        : Number(form.height_cm) * CM_TO_IN,
       default_bin_id: form.default_bin_id ? Number(form.default_bin_id) : null,
+      reorder_point: numberOrNull(form.reorder_point) ?? 0,
+      reorder_qty: numberOrNull(form.reorder_qty) ?? 0,
+      is_lot_tracked: !!form.is_lot_tracked,
+      is_serial_tracked: !!form.is_serial_tracked,
     };
     const res = editId
       ? await api.put(`/admin/items/${editId}`, body)
@@ -151,8 +206,9 @@ export default function Items() {
     { key: 'item_name', label: 'Item Name' },
     { key: 'upc', label: 'UPC', mono: true, render: (r) => r.upc || '-' },
     { key: 'default_bin_code', label: 'Default Bin', mono: true, render: (r) => r.default_bin_code || '\u2013' },
+    { key: 'storage_profile', label: '3PL Zone', render: (r) => r.storage_profile || '-' },
     { key: 'category', label: 'Category', render: (r) => r.category || '-' },
-    { key: 'weight_lbs', label: 'Weight', render: (r) => r.weight_lbs ? `${r.weight_lbs} lb` : '-' },
+    { key: 'weight_lbs', label: 'Weight', render: (r) => r.weight_lbs != null ? `${(r.weight_lbs / KG_TO_LB).toFixed(2)} kg` : '-' },
     { key: 'is_active', label: 'Active', render: (r) => r.is_active ? 'Yes' : 'No' },
     { key: 'actions', label: '', render: (r) => (
       <div style={{ display: 'flex', gap: 4 }}>
@@ -196,7 +252,19 @@ export default function Items() {
             <span className="detail-label">SKU</span><span className="mono">{detail.sku}</span>
             <span className="detail-label">UPC</span><span className="mono">{detail.upc || '-'}</span>
             <span className="detail-label">Category</span><span>{detail.category || '-'}</span>
-            <span className="detail-label">Weight</span><span>{(detail.weight_lbs || detail.weight) ? `${detail.weight_lbs || detail.weight} lb` : '-'}</span>
+            <span className="detail-label">3PL Zone</span><span>{detail.storage_profile || '-'}</span>
+            <span className="detail-label">Weight</span><span>{detail.weight_lbs != null ? `${(detail.weight_lbs / KG_TO_LB).toFixed(3)} kg` : '-'}</span>
+            <span className="detail-label">Dimensions</span>
+            <span>
+              {[detail.length_in, detail.width_in, detail.height_in].every((v) => v != null)
+                ? `${(detail.length_in / CM_TO_IN).toFixed(1)} × ${(detail.width_in / CM_TO_IN).toFixed(1)} × ${(detail.height_in / CM_TO_IN).toFixed(1)} cm`
+                : '-'}
+            </span>
+            <span className="detail-label">Lot / Expiry</span><span>{detail.is_lot_tracked ? 'Tracked' : 'Not tracked'}</span>
+            <span className="detail-label">Serial</span><span>{detail.is_serial_tracked ? 'Tracked' : 'Not tracked'}</span>
+            <span className="detail-label">Reorder</span><span>{detail.reorder_point ?? 0} / qty {detail.reorder_qty ?? 0}</span>
+            <span className="detail-label">Barcode aliases</span><span className="mono">{(detail.barcode_aliases || []).join(', ') || '-'}</span>
+            <span className="detail-label">Description</span><span>{detail.description || '-'}</span>
             <span className="detail-label">Active</span><span>{detail.is_active ? 'Yes' : 'No'}</span>
           </div>
           {detail.preferred_bins && detail.preferred_bins.length > 0 && (
@@ -257,9 +325,71 @@ export default function Items() {
               <input className="form-input" value={form.category || ''} onChange={(e) => setForm({ ...form, category: e.target.value })} />
             </div>
             <div className="form-group">
-              <label>Weight (lb)</label>
-              <input className="form-input" type="number" step="0.01" value={form.weight_lbs ?? form.weight ?? ''} onChange={(e) => setForm({ ...form, weight_lbs: e.target.value, weight: e.target.value })} />
+              <label>3PL storage profile</label>
+              <select className="form-select" value={form.storage_profile || ''} onChange={(e) => setForm({ ...form, storage_profile: e.target.value })}>
+                <option value="">Chưa phân loại</option>
+                {STORAGE_PROFILES.map((profile) => (
+                  <option key={profile.value} value={profile.value}>{profile.label}</option>
+                ))}
+              </select>
             </div>
+          </div>
+          <div className="form-row">
+            <div className="form-group">
+              <label>Weight / pallet unit (kg)</label>
+              <input className="form-input" type="number" min="0" step="0.001" value={form.weight_kg ?? ''} onChange={(e) => setForm({ ...form, weight_kg: e.target.value })} />
+            </div>
+            <div className="form-group">
+              <label>Default bin ID</label>
+              <input className="form-input" type="number" min="1" value={form.default_bin_id ?? ''} onChange={(e) => setForm({ ...form, default_bin_id: e.target.value })} />
+            </div>
+          </div>
+          <div className="form-row">
+            <div className="form-group">
+              <label>Length (cm)</label>
+              <input className="form-input" type="number" min="0" step="0.1" value={form.length_cm ?? ''} onChange={(e) => setForm({ ...form, length_cm: e.target.value })} />
+            </div>
+            <div className="form-group">
+              <label>Width (cm)</label>
+              <input className="form-input" type="number" min="0" step="0.1" value={form.width_cm ?? ''} onChange={(e) => setForm({ ...form, width_cm: e.target.value })} />
+            </div>
+            <div className="form-group">
+              <label>Height (cm)</label>
+              <input className="form-input" type="number" min="0" step="0.1" value={form.height_cm ?? ''} onChange={(e) => setForm({ ...form, height_cm: e.target.value })} />
+            </div>
+          </div>
+          {form.length_cm && form.width_cm && form.height_cm && (
+            <div className="settings-note" style={{ marginTop: -4, marginBottom: 12 }}>
+              CBM tính toán: {(Number(form.length_cm) * Number(form.width_cm) * Number(form.height_cm) / 1000000).toFixed(4)} m³
+            </div>
+          )}
+          <div className="form-row">
+            <div className="form-group">
+              <label>Reorder point</label>
+              <input className="form-input" type="number" min="0" value={form.reorder_point ?? 0} onChange={(e) => setForm({ ...form, reorder_point: e.target.value })} />
+            </div>
+            <div className="form-group">
+              <label>Reorder quantity</label>
+              <input className="form-input" type="number" min="0" value={form.reorder_qty ?? 0} onChange={(e) => setForm({ ...form, reorder_qty: e.target.value })} />
+            </div>
+          </div>
+          <div className="form-row">
+            <label className="checkbox-label">
+              <input type="checkbox" checked={!!form.is_lot_tracked} onChange={(e) => setForm({ ...form, is_lot_tracked: e.target.checked })} />
+              Track lot & expiry (FIFO/FEFO)
+            </label>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={!!form.is_serial_tracked} onChange={(e) => setForm({ ...form, is_serial_tracked: e.target.checked })} />
+              Track serial number
+            </label>
+          </div>
+          <div className="form-group">
+            <label>Alternate barcodes <span className="settings-note">(one per line)</span></label>
+            <textarea className="form-input" rows="3" value={form.barcode_aliases_text || ''} onChange={(e) => setForm({ ...form, barcode_aliases_text: e.target.value })} />
+          </div>
+          <div className="form-group">
+            <label>Description / handling notes</label>
+            <textarea className="form-input" rows="3" value={form.description || ''} onChange={(e) => setForm({ ...form, description: e.target.value })} />
           </div>
         </Modal>
       )}

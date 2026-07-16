@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Sentry WMS will be documented in this file.
+All notable changes to Sơn Lộc WMS will be documented in this file.
 
 ## [v1.30.0] - 2026-06-19
 

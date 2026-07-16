@@ -1,6 +1,6 @@
 """Celery application for background job processing.
 
-Sentry WMS uses Celery to run connector sync operations asynchronously.
+Sơn Lộc WMS uses Celery to run connector sync operations asynchronously.
 The Flask API thread never blocks on external ERP calls -- warehouse
 scanners stay responsive while syncs run in the background.
 

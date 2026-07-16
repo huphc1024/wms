@@ -35,8 +35,8 @@ export default function Layout() {
       // every render).
       setPermError((current) => current || (evt.detail || { page_key: null }));
     }
-    window.addEventListener('sentry:permission-denied', onPermDenied);
-    return () => window.removeEventListener('sentry:permission-denied', onPermDenied);
+    window.addEventListener('sonloc:permission-denied', onPermDenied);
+    return () => window.removeEventListener('sonloc:permission-denied', onPermDenied);
   }, []);
 
   function dismissPermError() {

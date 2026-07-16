@@ -168,7 +168,7 @@ export default function Backorders() {
     // The SO list page reads ?focus=<so_number> to auto-open the
     // edit modal for that row. Mirrors the deep-link pattern the
     // Teams adaptive card uses so /backorders -> click -> SO modal
-    // is the same path as Teams ping -> Open in Sentry -> SO modal.
+    // is the same path as Teams ping -> Open in Sơn Lộc WMS -> SO modal.
     navigate(`/sales-orders?focus=${encodeURIComponent(row.so_number)}`);
   }
 

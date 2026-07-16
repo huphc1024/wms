@@ -1,4 +1,4 @@
-# Sentry WMS — Local setup (Windows, không Docker)
+# Sơn Lộc WMS — Local setup (Windows, không Docker)
 
 ## Yêu cầu
 
