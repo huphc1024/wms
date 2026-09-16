@@ -50,6 +50,7 @@ export default function ZoneMapScreen({ navigation, route }) {
               style={styles.rackCard}
               activeOpacity={0.75}
               onPress={() => navigation.navigate('RackMap', {
+                rackId: rack.rack_id,
                 rackKey: rack.rack_key,
                 rackLabel: rack.rack_label,
                 zoneCode,

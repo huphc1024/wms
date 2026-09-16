@@ -13,6 +13,7 @@ import { colors, fonts, screenStyles } from '../theme/styles';
 export default function RackMapScreen({ navigation, route }) {
   const { warehouseId } = useAuth();
   const {
+    rackId,
     rackKey,
     rackLabel,
     zoneCode,
@@ -20,6 +21,10 @@ export default function RackMapScreen({ navigation, route }) {
     itemId,
     sku,
     returnScreen,
+    focusedBinId,
+    palletCode,
+    palletSku,
+    palletSlot,
   } = route.params || {};
 
   const { error, showError, clearError } = useScreenError();
@@ -29,15 +34,17 @@ export default function RackMapScreen({ navigation, route }) {
   const [modalVisible, setModalVisible] = useState(false);
 
   const load = useCallback(async ({ silent = false } = {}) => {
-    if (!warehouseId || !rackKey) return null;
+    if (!warehouseId || (!rackId && !rackKey)) return null;
     if (!silent) setLoading(true);
     try {
       const params = new URLSearchParams({ warehouse_id: String(warehouseId) });
       if (selectMode) params.set('mode', selectMode);
       if (itemId) params.set('item_id', String(itemId));
       if (sku) params.set('sku', sku);
-      const encodedKey = encodeURIComponent(rackKey);
-      const resp = await client.get(`/api/warehouse-map/rack/${encodedKey}?${params.toString()}`);
+      const rackPath = rackId
+        ? `by-id/${rackId}`
+        : encodeURIComponent(rackKey);
+      const resp = await client.get(`/api/warehouse-map/rack/${rackPath}?${params.toString()}`);
       const nextRack = resp.data?.rack || null;
       setRack(nextRack);
       return nextRack;
@@ -47,7 +54,7 @@ export default function RackMapScreen({ navigation, route }) {
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [warehouseId, rackKey, selectMode, itemId, sku, showError]);
+  }, [warehouseId, rackId, rackKey, selectMode, itemId, sku, showError]);
 
   useFocusEffect(
     useCallback(() => {
@@ -66,7 +73,7 @@ export default function RackMapScreen({ navigation, route }) {
     const nextRack = await load({ silent: true });
     if (!binId || !nextRack?.levels) return;
     for (const level of nextRack.levels) {
-      for (const slot of level.slots || []) {
+      for (const slot of level.positions || []) {
         if (slot?.bin?.bin_id === binId) {
           setSelectedSlot(slot);
           return;
@@ -122,7 +129,11 @@ export default function RackMapScreen({ navigation, route }) {
               : 'Ô vàng = có hàng khớp SKU. Chọn để lấy hàng.'}
           </Text>
         ) : (
-          <Text style={styles.hint}>Chạm ô pallet → chọn/scan SKU → Nhập hàng / Xuất hàng</Text>
+          <Text style={styles.hint}>
+            {palletCode
+              ? `${palletCode}${palletSku ? ` · ${palletSku}` : ''} đang ở ${palletSlot || 'vị trí đã chọn'}`
+              : 'Chạm ô pallet → chọn/scan SKU → Nhập hàng / Xuất hàng'}
+          </Text>
         )}
 
         {loading ? (
@@ -131,6 +142,7 @@ export default function RackMapScreen({ navigation, route }) {
           <PalletSlotGrid
             levels={rack?.levels || []}
             selectMode={selectMode}
+            focusedBinId={focusedBinId}
             onSlotPress={handleSlotPress}
           />
         )}

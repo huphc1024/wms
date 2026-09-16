@@ -26,6 +26,7 @@ import Items from './pages/Items.jsx';
 import Vendors from './pages/Vendors.jsx';
 import Data from './pages/Data.jsx';
 import Warehouses from './pages/Warehouses.jsx';
+import CustomerUsers from './pages/CustomerUsers.jsx';
 import Users from './pages/Users.jsx';
 import Tokens from './pages/Tokens.jsx';
 import InboundActivity from './pages/InboundActivity.jsx';
@@ -44,6 +45,12 @@ import TransferOrders from './pages/TransferOrders.jsx';
 import POSActivity from './pages/POSActivity.jsx';
 import Fraud from './pages/Fraud.jsx';
 import WarehouseSimulation from './pages/WarehouseSimulation.jsx';
+import Pallets from './pages/Pallets.jsx';
+import Expiry from './pages/Expiry.jsx';
+import VehicleMovements from './pages/VehicleMovements.jsx';
+import RateCards from './pages/RateCards.jsx';
+import Invoices from './pages/Invoices.jsx';
+import Customers from './pages/Customers.jsx';
 
 function ProtectedRoute({ children }) {
   const { user, loading } = useAuth();
@@ -134,6 +141,7 @@ export default function App() {
         <Route path="/zones" element={<Navigate to="/data/zones" replace />} />
         <Route path="/preferred-bins" element={<Navigate to="/data/preferred-bins" replace />} />
         <Route path="/users" element={<ErrorBoundary fallbackMessage="Could not load users."><Users /></ErrorBoundary>} />
+        <Route path="/customer-users" element={<ErrorBoundary fallbackMessage="Could not load customer portal accounts."><CustomerUsers /></ErrorBoundary>} />
         <Route path="/api-tokens" element={<ErrorBoundary fallbackMessage="Could not load API tokens."><Tokens /></ErrorBoundary>} />
         <Route path="/inbound" element={<ErrorBoundary fallbackMessage="Could not load Inbound activity."><InboundActivity /></ErrorBoundary>} />
         <Route path="/consumer-groups" element={<ErrorBoundary fallbackMessage="Could not load consumer groups."><ConsumerGroups /></ErrorBoundary>} />
@@ -147,6 +155,12 @@ export default function App() {
         <Route path="/adjustments" element={<ErrorBoundary fallbackMessage="Could not load adjustments."><Adjustments /></ErrorBoundary>} />
         <Route path="/inter-warehouse-transfers" element={<ErrorBoundary fallbackMessage="Could not load transfers."><InterWarehouseTransfers /></ErrorBoundary>} />
         <Route path="/transfer-orders" element={<ErrorBoundary fallbackMessage="Could not load transfer orders."><TransferOrders /></ErrorBoundary>} />
+        <Route path="/pallets" element={<ErrorBoundary fallbackMessage="Could not load pallets."><Pallets /></ErrorBoundary>} />
+        <Route path="/expiry" element={<ErrorBoundary fallbackMessage="Could not load expiry."><Expiry /></ErrorBoundary>} />
+        <Route path="/vehicle-movements" element={<ErrorBoundary fallbackMessage="Could not load vehicle movements."><VehicleMovements /></ErrorBoundary>} />
+        <Route path="/customers" element={<ErrorBoundary fallbackMessage="Could not load customers and contracts."><Customers /></ErrorBoundary>} />
+        <Route path="/rate-cards" element={<ErrorBoundary fallbackMessage="Could not load rate cards."><RateCards /></ErrorBoundary>} />
+        <Route path="/invoices" element={<ErrorBoundary fallbackMessage="Could not load invoices."><Invoices /></ErrorBoundary>} />
       </Route>
     </Routes>
   );

@@ -1,0 +1,476 @@
+/* ============================================================
+   Cổng khách hàng — stylesheet
+   ------------------------------------------------------------
+   Same design tokens and self-hosted faces as admin/src/App.css
+   (V-110: no third-party font requests), but written fresh rather
+   than copied: the portal has 8 screens, none of the admin's grid
+   editors, print sheets or map canvases, and a 2,900-line inherited
+   sheet would mostly be dead CSS shipped to customers.
+   ============================================================ */
+
+@font-face {
+  font-family: 'Instrument Sans';
+  src: url('/fonts/InstrumentSans-VariableFont_wdth_wght.woff2')
+       format('woff2-variations'),
+       url('/fonts/InstrumentSans-VariableFont_wdth_wght.woff2')
+       format('woff2');
+  font-weight: 400 700;
+  font-stretch: 75% 125%;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/JetBrainsMono-VariableFont_wght.woff2')
+       format('woff2-variations'),
+       url('/fonts/JetBrainsMono-VariableFont_wght.woff2')
+       format('woff2');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --accent: #8e2715;
+  --accent-hover: #a83020;
+  --copper: #c4722a;
+  --cream: #FCF4E3;
+
+  --bg: #FAFAF7;
+  --white: #FFFFFF;
+  --surface: #F5F3EE;
+
+  --text: #1A1714;
+  --text-secondary: #6b5f50;
+  --text-tertiary: #a89a88;
+
+  --border: #e8e2d8;
+  --border-dark: #d4cdc0;
+
+  --success: #2d7a3a;
+  --success-bg: #e8f5ea;
+  --warning: #8a6d1b;
+  --warning-bg: #fef9e7;
+  --danger: #8e2715;
+  --danger-bg: #fce8e5;
+  --info: #1e5f8a;
+  --info-bg: #e5f0f8;
+
+  --sans: 'Instrument Sans', 'Helvetica Neue', sans-serif;
+  --mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  --radius: 6px;
+  --radius-lg: 10px;
+  --sidebar-width: 232px;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+h1 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
+h2 { margin: 0; font-size: 15px; }
+
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.text-muted { color: var(--text-secondary); }
+.align-right { text-align: right; }
+
+/* ── Shell ─────────────────────────────────────── */
+.shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  min-height: 100%;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 18px 14px;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sidebar-brand div { display: flex; flex-direction: column; line-height: 1.25; }
+.sidebar-brand strong { font-size: 14px; }
+.sidebar-brand span { color: var(--text-secondary); font-size: 12px; }
+
+.sidebar-nav { display: flex; flex-direction: column; gap: 2px; }
+.sidebar-foot { margin-top: auto; }
+
+.nav-link {
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.nav-link:hover { background: rgba(142, 39, 21, 0.07); text-decoration: none; }
+
+.nav-link.active {
+  background: var(--accent);
+  color: var(--cream);
+}
+
+.nav-link-quiet { color: var(--text-secondary); font-weight: 500; }
+
+.main { display: flex; flex-direction: column; min-width: 0; }
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--white);
+}
+
+.topbar-customer { display: flex; align-items: baseline; gap: 8px; }
+.topbar-customer span { color: var(--text-secondary); font-size: 12px; }
+.topbar-user { display: flex; align-items: center; gap: 12px; }
+
+.content { padding: 24px; }
+
+/* ── Page furniture ────────────────────────────── */
+/* Full-bleed: the tables here are the content, and a cap left a third of
+   a 1920px screen empty. Prose keeps its own measure (.page-note below)
+   so nothing turns into a 200-character line. */
+.page { display: grid; gap: 16px; width: 100%; min-width: 0; }
+.page-narrow { max-width: 560px; }
+
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.page-note { margin: 0; color: var(--text-secondary); max-width: 70ch; }
+
+.card {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--white);
+}
+
+.card-title {
+  margin: 0 0 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.card-note { padding: 20px 4px; color: var(--text-secondary); text-align: center; }
+
+.form-card { display: grid; gap: 14px; }
+
+.boundary-error {
+  margin: 16px;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  text-align: center;
+}
+
+.boundary-error h2 { color: var(--danger); font-size: 18px; }
+.boundary-error p { color: var(--text-secondary); }
+
+/* ── Forms ─────────────────────────────────────── */
+.form-group { display: grid; gap: 4px; }
+.form-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+
+.form-group label { color: var(--text-secondary); font-size: 12px; font-weight: 600; }
+.form-hint { color: var(--text-tertiary); font-size: 12px; }
+
+.form-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-dark);
+  border-radius: var(--radius);
+  background: var(--white);
+  color: var(--text);
+  font: inherit;
+}
+
+.form-input:focus-visible {
+  outline: 2px solid var(--copper);
+  outline-offset: 1px;
+}
+
+.search-input, .filter-input { max-width: 320px; }
+.qty-input { max-width: 140px; text-align: right; }
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 7px 14px;
+  border: 1px solid var(--border-dark);
+  border-radius: var(--radius);
+  background: var(--white);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) { background: var(--surface); text-decoration: none; }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.btn-sm { min-height: 28px; padding: 4px 10px; font-size: 13px; }
+.btn-block { width: 100%; }
+
+.btn-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--cream);
+}
+
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+
+/* ── Alerts ────────────────────────────────────── */
+.alert {
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+
+.alert-danger { background: var(--danger-bg); color: var(--danger); }
+.alert-warning { background: var(--warning-bg); color: var(--warning); }
+.alert-success { background: var(--success-bg); color: var(--success); }
+
+/* ── Tables ────────────────────────────────────── */
+.table-wrap { overflow-x: auto; }
+
+.data-table { width: 100%; border-collapse: collapse; }
+
+.data-table th {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-dark);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.data-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.data-table tbody tr:last-child td { border-bottom: 0; }
+.data-table tbody tr:hover { background: var(--surface); }
+
+/* Codes (SKU, SO, PO, invoice number) are identifiers -- wrapping one
+   across three lines makes it unreadable and unscannable. Let the table
+   scroll inside .table-wrap instead. */
+.data-table td.mono { white-space: nowrap; }
+.line-editor td.mono { white-space: normal; }
+
+.row-clickable { cursor: pointer; }
+
+.line-editor td { vertical-align: top; }
+.line-editor tbody tr:hover { background: transparent; }
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 12px;
+  flex-wrap: wrap;
+}
+
+.pagination-buttons { display: flex; align-items: center; gap: 8px; }
+
+/* ── Tags ──────────────────────────────────────── */
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.tag-success { background: var(--success-bg); color: var(--success); }
+.tag-warning { background: var(--warning-bg); color: var(--warning); }
+.tag-danger { background: var(--danger-bg); color: var(--danger); }
+.tag-info { background: var(--info-bg); color: var(--info); }
+.tag-muted { background: var(--surface); color: var(--text-secondary); }
+
+/* ── Dashboard ─────────────────────────────────── */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+}
+
+.stat {
+  display: grid;
+  gap: 4px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--copper);
+  border-radius: var(--radius-lg);
+  background: var(--white);
+  color: var(--text);
+}
+
+.stat:hover { border-color: var(--border-dark); text-decoration: none; }
+
+.stat span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.stat strong { font-family: var(--mono); font-size: 26px; line-height: 1.1; }
+.stat em { color: var(--text-tertiary); font-size: 12px; font-style: normal; }
+
+.dash-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.mini-list { display: grid; gap: 8px; margin: 0 0 12px; padding: 0; list-style: none; }
+
+.mini-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.mini-list li:last-child { padding-bottom: 0; border-bottom: 0; }
+.mini-list .mono { white-space: nowrap; font-size: 13px; }
+
+/* ── Detail grids ──────────────────────────────── */
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+}
+
+.detail-grid > div { display: grid; gap: 3px; align-content: start; }
+
+.detail-grid span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.detail-wide { grid-column: 1 / -1; }
+
+/* A pill in a grid cell would otherwise stretch to the column width and
+   stop reading as a tag. */
+.detail-grid .tag { justify-self: start; }
+
+/* ── Progress ──────────────────────────────────── */
+.progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.progress-track {
+  flex: 0 0 auto;
+  width: 72px;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface);
+}
+
+.progress-bar {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--success);
+}
+
+.progress span { font-size: 12px; color: var(--text-secondary); }
+
+/* ── Login ─────────────────────────────────────── */
+.login-page {
+  display: grid;
+  place-items: center;
+  min-height: 100%;
+  padding: 24px;
+  background: var(--surface);
+}
+
+.login-card {
+  display: grid;
+  gap: 14px;
+  width: 100%;
+  max-width: 380px;
+  padding: 26px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--white);
+}
+
+.login-brand { display: flex; align-items: center; gap: 10px; }
+.login-brand div { display: flex; flex-direction: column; line-height: 1.25; }
+.login-brand strong { font-size: 15px; }
+.login-brand span { color: var(--text-secondary); font-size: 12px; }
+
+.login-note { margin: 0; color: var(--text-tertiary); font-size: 12px; }
+
+/* ── Narrow screens ────────────────────────────── */
+@media (max-width: 860px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+
+  .sidebar {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidebar-nav { flex-direction: row; }
+  .sidebar-foot { margin-top: 0; }
+  .content { padding: 16px; }
+  .form-row { grid-template-columns: minmax(0, 1fr); }
+}

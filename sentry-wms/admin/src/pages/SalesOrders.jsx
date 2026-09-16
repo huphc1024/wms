@@ -9,6 +9,11 @@ import PageHeader from '../components/PageHeader.jsx';
 import Modal from '../components/Modal.jsx';
 import StatusTag from '../components/StatusTag.jsx';
 import CreateRmaModal from '../components/CreateRmaModal.jsx';
+import SkuBarcodeAutocomplete from '../components/SkuBarcodeAutocomplete.jsx';
+import OrderLineEditor from '../components/OrderLineEditor.jsx';
+import { emptyOrderLine, resolveOrderLines } from '../utils/orderLines.js';
+import { resolveItemFromScan } from '../utils/itemScanOptions.js';
+import { useWarehouse } from '../warehouse.jsx';
 
 const STATUS_OPTIONS = ['All', 'OPEN', 'PICKED', 'PACKED', 'SHIPPED', 'CANCELLED', 'REFUNDED'];
 const EDITABLE_STATUS_OPTIONS = ['OPEN', 'PICKED', 'PACKED', 'SHIPPED', 'CANCELLED', 'REFUNDED'];
@@ -84,12 +89,32 @@ function NullableValue({ value }) {
   return <span>{value}</span>;
 }
 
+function emptySoCreateForm(warehouseId) {
+  return {
+    so_number: '',
+    warehouse_id: warehouseId || '',
+    customer_name: '',
+    customer_phone: '',
+    customer_address: '',
+    ship_method: '',
+    ship_by_date: '',
+    lines: [emptyOrderLine()],
+  };
+}
+
 export default function SalesOrders() {
   const { user } = useAuth();
   const isAdmin = user?.role === 'ADMIN';
   const hasSOFullEdit = isAdmin || (user?.allowed_overrides || []).includes('so-full-edit');
 
   const [searchParams] = useSearchParams();
+  const { warehouses, warehouseId } = useWarehouse();
+  // Manual SO entry. Same story as the PO page: the create form existed
+  // only under Settings > Manual Entry, which is not where anyone looks
+  // for it when a customer phones an order in.
+  const [createForm, setCreateForm] = useState(null);
+  const [createError, setCreateError] = useState('');
+  const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState(searchParams.get('q') || '');
   const [orders, setOrders] = useState([]);
   const [pagination, setPagination] = useState(null);
@@ -137,7 +162,6 @@ export default function SalesOrders() {
   const [newLineQty, setNewLineQty] = useState('');
   const [newLineError, setNewLineError] = useState('');
   const [addingLine, setAddingLine] = useState(false);
-  const [skuSuggestions, setSkuSuggestions] = useState([]);
   const [resolvedItem, setResolvedItem] = useState(null);
   // Allocation-release confirm: shows what will happen before the
   // PATCH/DELETE leaves the browser so the operator can back out.
@@ -180,37 +204,48 @@ export default function SalesOrders() {
     });
   }, []);
 
-  // Debounced SKU typeahead matching the PO edit modal. Quiet when the
-  // edit modal is closed; minimum 2 characters to avoid spamming the
-  // items endpoint on every keystroke.
-  useEffect(() => {
-    if (!editing) return;
-    const sku = newLineSku.trim();
-    if (sku.length < 2) {
-      setSkuSuggestions([]);
-      setResolvedItem(null);
+  async function submitCreate() {
+    setCreateError('');
+    if (!String(createForm.so_number || '').trim()) {
+      setCreateError('SO number is required.');
       return;
     }
-    const handle = setTimeout(async () => {
-      const res = await api.get(
-        `/admin/items?q=${encodeURIComponent(sku)}&per_page=10&active=true`,
-        { silentPermissionDenied: true },
-      );
-      if (!res?.ok) {
-        setSkuSuggestions([]);
-        setResolvedItem(null);
-        return;
-      }
-      const data = await res.json();
-      const items = data.items || [];
-      setSkuSuggestions(items);
-      const exact = items.find(
-        (i) => String(i.sku || '').trim().toLowerCase() === sku.toLowerCase(),
-      ) || null;
-      setResolvedItem(exact);
-    }, 200);
-    return () => clearTimeout(handle);
-  }, [newLineSku, editing]);
+    if (!createForm.warehouse_id) {
+      setCreateError('Warehouse is required.');
+      return;
+    }
+    const { lines, error } = await resolveOrderLines(createForm.lines);
+    if (error) {
+      setCreateError(error);
+      return;
+    }
+
+    setCreating(true);
+    const address = createForm.customer_address.trim() || null;
+    const res = await api.post('/admin/sales-orders', {
+      so_number: createForm.so_number.trim(),
+      warehouse_id: Number(createForm.warehouse_id),
+      customer_name: createForm.customer_name.trim() || null,
+      customer_phone: createForm.customer_phone.trim() || null,
+      customer_address: address,
+      // The picking ticket prints ship_address; keeping the two in step
+      // means an order typed here produces the same label as one that
+      // arrived from a marketplace.
+      ship_address: address,
+      ship_method: createForm.ship_method.trim() || null,
+      ship_by_date: createForm.ship_by_date || null,
+      lines,
+    });
+    setCreating(false);
+    if (!res?.ok) {
+      const data = await res?.json().catch(() => null);
+      setCreateError(data?.error || 'Failed to create sales order');
+      return;
+    }
+    setCreateForm(null);
+    setPage(1);
+    await loadOrders();
+  }
 
   async function loadOrders() {
     const qp = new URLSearchParams({ page: String(page), per_page: '50' });
@@ -500,17 +535,15 @@ export default function SalesOrders() {
   // ── line CRUD ─────────────────────────────────────────────────────────────
 
   async function resolveSku(sku) {
-    const key = String(sku || '').trim().toLowerCase();
+    const key = String(sku || '').trim();
     if (!key) return null;
     const res = await api.get(
-      `/admin/items?q=${encodeURIComponent(sku)}&per_page=10&active=true`,
+      `/admin/items?q=${encodeURIComponent(key)}&per_page=10&active=true`,
       { silentPermissionDenied: true },
     );
     if (!res?.ok) return null;
     const data = await res.json();
-    return (data.items || []).find(
-      (i) => String(i.sku || '').trim().toLowerCase() === key,
-    ) || null;
+    return resolveItemFromScan(key, data.items || []);
   }
 
   async function addLine() {
@@ -539,7 +572,6 @@ export default function SalesOrders() {
         setNewLineSku('');
         setNewLineQty('');
         setResolvedItem(null);
-        setSkuSuggestions([]);
       } else {
         let data = null;
         try { data = await res?.json(); } catch (_) { /* non-JSON body */ }
@@ -850,7 +882,11 @@ export default function SalesOrders() {
 
   return (
     <div>
-      <PageHeader title="Sales Orders" />
+      <PageHeader title="Sales Orders">
+        <button className="btn btn-primary" onClick={() => { setCreateError(''); setCreateForm(emptySoCreateForm(warehouseId)); }}>
+          New sales order
+        </button>
+      </PageHeader>
       {successBanner && (
         <div
           role="status"
@@ -1366,19 +1402,18 @@ export default function SalesOrders() {
                   <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
                     <div style={{ flex: '0 0 240px' }}>
                       <label style={{ fontSize: 11, color: 'var(--text-secondary)', fontWeight: 500 }}>SKU</label>
-                      <input
+                      <SkuBarcodeAutocomplete
                         className="form-input mono"
-                        placeholder="Type SKU to search"
-                        list="so-edit-sku-suggestions"
+                        listId="so-edit-sku-suggestions"
+                        minChars={2}
+                        placeholder="Gõ hoặc scan SKU / barcode"
                         value={newLineSku}
-                        onChange={(e) => setNewLineSku(e.target.value)}
+                        onChange={setNewLineSku}
+                        onItemSelect={setResolvedItem}
                         onKeyDown={(e) => { if (e.key === 'Enter') addLine(); }}
+                        apiOptions={{ silentPermissionDenied: true }}
+                        showNoMatch
                       />
-                      <datalist id="so-edit-sku-suggestions">
-                        {skuSuggestions.map((it) => (
-                          <option key={it.item_id} value={it.sku}>{it.item_name}</option>
-                        ))}
-                      </datalist>
                     </div>
                     <div style={{ flex: '0 0 120px' }}>
                       <label style={{ fontSize: 11, color: 'var(--text-secondary)', fontWeight: 500 }}>Quantity</label>
@@ -1410,11 +1445,6 @@ export default function SalesOrders() {
                   {!newLineError && resolvedItem && (
                     <div style={{ marginTop: 8, fontSize: 12, color: 'var(--success)' }}>
                       Found: <strong>{resolvedItem.sku}</strong> - {resolvedItem.item_name}
-                    </div>
-                  )}
-                  {!newLineError && !resolvedItem && newLineSku.trim().length >= 2 && skuSuggestions.length === 0 && (
-                    <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-secondary)' }}>
-                      No matches for "{newLineSku.trim()}". Click Add Line to retry the lookup.
                     </div>
                   )}
                 </div>
@@ -1833,6 +1863,110 @@ export default function SalesOrders() {
               maxLength={500}
             />
           </div>
+        </Modal>
+      )}
+
+      {createForm && (
+        <Modal
+          title="New sales order"
+          onClose={() => setCreateForm(null)}
+          footer={
+            <>
+              <button className="btn" onClick={() => setCreateForm(null)} disabled={creating}>Cancel</button>
+              <button className="btn btn-primary" onClick={submitCreate} disabled={creating}>
+                {creating ? 'Creating...' : 'Create sales order'}
+              </button>
+            </>
+          }
+        >
+          {createError && <div className="alert alert-error">{createError}</div>}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div className="form-group">
+              <label htmlFor="so-create-number">SO number</label>
+              <input
+                id="so-create-number"
+                className="form-input mono"
+                value={createForm.so_number}
+                onChange={(e) => setCreateForm({ ...createForm, so_number: e.target.value })}
+                placeholder="SO-2026-010"
+                autoFocus
+              />
+            </div>
+            <div className="form-group">
+              <label htmlFor="so-create-warehouse">Warehouse</label>
+              <select
+                id="so-create-warehouse"
+                className="form-input"
+                value={createForm.warehouse_id}
+                onChange={(e) => setCreateForm({ ...createForm, warehouse_id: e.target.value })}
+              >
+                <option value="">— Select warehouse —</option>
+                {warehouses.map((w) => (
+                  <option key={w.warehouse_id || w.id} value={w.warehouse_id || w.id}>
+                    {w.warehouse_code} &middot; {w.warehouse_name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="form-group">
+              <label htmlFor="so-create-customer">Customer</label>
+              <input
+                id="so-create-customer"
+                className="form-input"
+                value={createForm.customer_name}
+                onChange={(e) => setCreateForm({ ...createForm, customer_name: e.target.value })}
+              />
+            </div>
+            <div className="form-group">
+              <label htmlFor="so-create-phone">Phone</label>
+              <input
+                id="so-create-phone"
+                className="form-input"
+                value={createForm.customer_phone}
+                onChange={(e) => setCreateForm({ ...createForm, customer_phone: e.target.value })}
+              />
+            </div>
+            <div className="form-group">
+              <label htmlFor="so-create-ship-method">Ship method</label>
+              <input
+                id="so-create-ship-method"
+                className="form-input"
+                value={createForm.ship_method}
+                onChange={(e) => setCreateForm({ ...createForm, ship_method: e.target.value })}
+              />
+            </div>
+            <div className="form-group">
+              <label htmlFor="so-create-ship-by">Ship by date</label>
+              <input
+                id="so-create-ship-by"
+                className="form-input"
+                type="date"
+                value={createForm.ship_by_date}
+                onChange={(e) => setCreateForm({ ...createForm, ship_by_date: e.target.value })}
+              />
+            </div>
+          </div>
+          <div className="form-group">
+            <label htmlFor="so-create-address">Shipping address</label>
+            <textarea
+              id="so-create-address"
+              className="form-input"
+              rows={2}
+              value={createForm.customer_address}
+              onChange={(e) => setCreateForm({ ...createForm, customer_address: e.target.value })}
+            />
+          </div>
+          <h4 style={{ margin: '16px 0 8px', fontSize: 13, color: 'var(--text-secondary)' }}>Lines</h4>
+          <OrderLineEditor
+            lines={createForm.lines}
+            onChange={(lines) => setCreateForm({ ...createForm, lines })}
+            listIdPrefix="so-create"
+            disabled={creating}
+          />
+          <p style={{ marginTop: 12, fontSize: 12, color: 'var(--text-secondary)' }}>
+            Stock is reserved for each line as far as the warehouse can cover it,
+            the moment the order is created.
+          </p>
         </Modal>
       )}
     </div>

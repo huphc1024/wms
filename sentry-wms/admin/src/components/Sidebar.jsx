@@ -36,7 +36,7 @@ const NAV = [
     labelKey: 'nav.outbound',
     items: [
       { to: '/sales-orders', label: 'Sales Orders', labelKey: 'nav.salesOrders', pageKey: 'sales-orders' },
-      { to: '/pos-activity', label: 'POS Activity', labelKey: 'nav.posActivity' },
+      { to: '/pos-activity', label: 'POS Activity', labelKey: 'nav.posActivity', pageKey: 'pos-activity' },
       { to: '/fraud', label: 'Fraud', labelKey: 'nav.fraud', pageKey: 'fraud' },
       { to: '/backorders', label: 'Backorders', labelKey: 'nav.backorders', pageKey: 'backorders' },
       { to: '/picking-tickets', label: 'Picking Tickets', labelKey: 'nav.pickingTickets', pageKey: 'picking-tickets' },
@@ -54,14 +54,27 @@ const NAV = [
       { to: '/adjustments', label: 'Inventory Adjustments', labelKey: 'nav.adjustments', pageKey: 'adjustments' },
       { to: '/inter-warehouse-transfers', label: 'Inventory Transfers', labelKey: 'nav.transfers', pageKey: 'inter-warehouse-transfers' },
       { to: '/transfer-orders', label: 'Transfer Orders', labelKey: 'nav.transferOrders', pageKey: 'transfer-orders' },
-      { to: '/data', label: 'Data', labelKey: 'nav.data', pageKeys: ['warehouses', 'bins', 'zones', 'preferred-bins'] },
+        { to: '/data', label: 'Data', labelKey: 'nav.data', pageKeys: ['warehouses', 'bins', 'zones', 'preferred-bins'] },
+        { to: '/pallets', label: 'Pallets', labelKey: 'nav.pallets', pageKey: 'pallets' },
+        { to: '/expiry', label: 'Expiry', labelKey: 'nav.expiry', pageKey: 'expiry' },
+        { to: '/vehicle-movements', label: 'Vehicle Movements', labelKey: 'nav.vehicleMovements', pageKey: 'vehicle-movements' },
     ],
   },
+    {
+      label: 'Billing',
+      labelKey: 'nav.billing',
+      items: [
+        { to: '/customers', label: 'Customers & Contracts', labelKey: 'nav.customers', pageKey: 'billing' },
+        { to: '/rate-cards', label: 'Rate Cards', labelKey: 'nav.rateCards', pageKey: 'billing' },
+        { to: '/invoices', label: 'Invoices', labelKey: 'nav.invoices', pageKey: 'billing' },
+      ],
+    },
   {
     label: 'System',
     labelKey: 'nav.system',
     items: [
       { to: '/users', label: 'Users', labelKey: 'nav.users', pageKey: 'users' },
+      { to: '/customer-users', label: 'Portal accounts', labelKey: 'nav.customerUsers', pageKey: 'customer-users' },
       { to: '/api-tokens', label: 'API tokens', labelKey: 'nav.apiTokens', pageKey: 'api-tokens' },
       { to: '/inbound', label: 'Inbound activity', labelKey: 'nav.inboundActivity', pageKey: 'inbound' },
       { to: '/consumer-groups', label: 'Consumer groups', labelKey: 'nav.consumerGroups', pageKey: 'consumer-groups' },
@@ -75,6 +88,20 @@ const NAV = [
     ],
   },
 ];
+
+function canSeeNavItem(user, item) {
+  if (!user) return false;
+  if (user.role === 'ADMIN') return true;
+  const allowed = user.allowed_pages;
+  if (!Array.isArray(allowed)) return false;
+  if (item.pageKeys) {
+    return item.pageKeys.some((k) => allowed.includes(k));
+  }
+  if (item.pageKey) {
+    return allowed.includes(item.pageKey);
+  }
+  return true;
+}
 
 export default function Sidebar() {
   const location = useLocation();
@@ -129,12 +156,16 @@ export default function Sidebar() {
     });
   }, [location.pathname, warehouseId]);
 
-  const navGroups = posActivityEnabled
+  const navGroups = (posActivityEnabled
     ? NAV
     : NAV.map((group) => ({
         ...group,
         items: group.items.filter((item) => item.to !== '/pos-activity'),
-      }));
+      }))
+  ).map((group) => ({
+    ...group,
+    items: group.items.filter((item) => canSeeNavItem(user, item)),
+  })).filter((group) => group.items.length > 0);
 
   // Per-section collapse, persisted so a hidden section stays hidden across
   // reloads. The header carries a caret; clicking it toggles its items.

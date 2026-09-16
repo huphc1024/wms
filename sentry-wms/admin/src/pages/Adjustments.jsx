@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { api } from '../api.js';
 import { useWarehouse } from '../warehouse.jsx';
 import PageHeader from '../components/PageHeader.jsx';
+import SkuBarcodeAutocomplete from '../components/SkuBarcodeAutocomplete.jsx';
 
 export default function Adjustments() {
   const { warehouseId } = useWarehouse();
@@ -12,7 +13,6 @@ export default function Adjustments() {
   // capped at 1000 which broke at 30K SKUs in production. Both now
   // hit the server's ILIKE :q index path on each keystroke.
   const [binResults, setBinResults] = useState([]);
-  const [itemResults, setItemResults] = useState([]);
   const [adjustments, setAdjustments] = useState([]);
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -23,10 +23,8 @@ export default function Adjustments() {
   const [binOpen, setBinOpen] = useState(false);
   const [binSearching, setBinSearching] = useState(false);
   const [itemSearch, setItemSearch] = useState('');
-  const [itemOpen, setItemOpen] = useState(false);
   const [itemSearching, setItemSearching] = useState(false);
   const binRef = useRef(null);
-  const itemRef = useRef(null);
 
   const [form, setForm] = useState({
     bin_id: '',
@@ -40,7 +38,6 @@ export default function Adjustments() {
   useEffect(() => {
     function handleClick(e) {
       if (binRef.current && !binRef.current.contains(e.target)) setBinOpen(false);
-      if (itemRef.current && !itemRef.current.contains(e.target)) setItemOpen(false);
     }
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
@@ -55,7 +52,6 @@ export default function Adjustments() {
     setBinSearch('');
     setItemSearch('');
     setBinResults([]);
-    setItemResults([]);
   }, [warehouseId]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // Debounced bin search. Triggers when the operator types in the
@@ -80,27 +76,6 @@ export default function Adjustments() {
     return () => clearTimeout(handle);
   }, [binSearch, warehouseId, form.bin_id]);
 
-  // Same shape for items. Three-char minimum keeps the 30K-SKU
-  // catalog from returning huge result sets on a two-letter prefix.
-  useEffect(() => {
-    const q = itemSearch.trim();
-    if (q.length < 2 || form.item_id) {
-      setItemResults([]);
-      return;
-    }
-    setItemSearching(true);
-    const handle = setTimeout(async () => {
-      const res = await api.get(
-        `/admin/items?q=${encodeURIComponent(q)}&per_page=25&active=true`,
-      );
-      setItemSearching(false);
-      if (!res?.ok) return;
-      const data = await res.json();
-      setItemResults(data.items || []);
-    }, 200);
-    return () => clearTimeout(handle);
-  }, [itemSearch, form.item_id]);
-
   async function loadAdjustments() {
     setLoading(true);
     const res = await api.get(`/admin/adjustments/list?warehouse_id=${warehouseId}`);
@@ -123,8 +98,7 @@ export default function Adjustments() {
 
   function selectItem(item) {
     updateForm('item_id', item.item_id);
-    setItemSearch(`${item.sku}  -  ${item.item_name}`);
-    setItemOpen(false);
+    setItemSearch(item.sku || '');
   }
 
   async function handleSubmit(e) {
@@ -222,30 +196,19 @@ export default function Adjustments() {
               )}
             </div>
 
-            <div className="form-group" ref={itemRef} style={{ position: 'relative' }}>
+            <div className="form-group">
               <label>Item {itemSearching && <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>(searching...)</span>}</label>
-              <input
-                className="form-input"
-                placeholder="Type SKU or item name (min 2 chars)"
+              <SkuBarcodeAutocomplete
+                listId="adjustments-item-options"
+                minChars={2}
+                perPage={25}
+                placeholder="Gõ hoặc scan SKU / barcode (tối thiểu 2 ký tự)"
                 value={itemSearch}
-                onChange={(e) => { setItemSearch(e.target.value); updateForm('item_id', ''); setItemOpen(true); }}
-                onFocus={() => setItemOpen(true)}
-                autoComplete="off"
+                onChange={(v) => { setItemSearch(v); updateForm('item_id', ''); }}
+                onItemSelect={(it) => { if (it) selectItem(it); }}
+                onSearchingChange={setItemSearching}
+                showNoMatch={itemSearch.trim().length >= 2 && !form.item_id}
               />
-              {itemOpen && itemResults.length > 0 && (
-                <div style={dropdownStyle}>
-                  {itemResults.map((i) => (
-                    <div key={i.item_id} style={dropdownItemStyle} onMouseDown={() => selectItem(i)}>
-                      <strong className="mono">{i.sku}</strong>  -  {i.item_name}
-                    </div>
-                  ))}
-                </div>
-              )}
-              {itemOpen && !itemSearching && itemSearch.trim().length >= 2 && !form.item_id && itemResults.length === 0 && (
-                <div style={{ ...dropdownStyle, padding: 12, fontSize: 12, color: 'var(--text-secondary)' }}>
-                  No items match "{itemSearch.trim()}".
-                </div>
-              )}
             </div>
           </div>
 

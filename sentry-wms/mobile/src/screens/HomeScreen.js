@@ -8,6 +8,14 @@ import ErrorPopup from '../components/ErrorPopup';
 import useScreenError from '../hooks/useScreenError';
 import WarehouseSelector from '../components/WarehouseSelector';
 import client, { getStoredApiUrl, setApiUrl } from '../api/client';
+import {
+  lookupScannedBarcode,
+  scanFailureMessage,
+  SCAN_ITEM,
+  SCAN_BIN,
+  SCAN_PO,
+  SCAN_SO,
+} from '../utils/scanLookup';
 import { colors, fonts, radii, spacing } from '../theme/styles';
 
 const FUNCTIONS = [
@@ -15,6 +23,7 @@ const FUNCTIONS = [
   { key: 'pack', label: 'PACK', sub: 'Verify & pack', screen: 'Pack', accent: 'red' },
   { key: 'receive', label: 'RECEIVE', sub: 'PO receiving', screen: 'Receive', accent: 'copper' },
   { key: 'putaway', label: 'PUT-AWAY', sub: 'Bin placement', screen: 'PutAway', accent: 'copper' },
+  { key: 'gate', label: 'GATE', sub: 'Xe ra / vào cổng', screen: 'Gate', accent: 'copper' },
   { key: 'transfer', label: 'TRANSFER', sub: 'Bin to bin', screen: 'Transfer', accent: 'gray' },
   { key: 'count', label: 'COUNT', sub: 'Cycle count', screen: 'Count', accent: 'gray' },
   { key: 'map', label: 'MAP', sub: 'Sơ đồ kho 2D', screen: 'Map', accent: 'gray' },
@@ -130,79 +139,63 @@ export default function HomeScreen({ navigation }) {
   const handleScan = async (barcode) => {
     const cleaned = barcode.replace(/[\r\n\s]+/g, '').trim();
     if (!cleaned) return;
-    const encoded = encodeURIComponent(cleaned);
 
-    // Try item lookup (UPC or SKU)
-    try {
-      const itemResp = await client.get(`/api/lookup/item/${encoded}`);
-      if (itemResp.data && itemResp.data.item) {
-        const item = itemResp.data.item;
-        const locations = (itemResp.data.locations || [])
+    // One helper walks item -> bin -> PO -> SO and tells us *why* it
+    // came back empty. Before this, every failure -- including a dropped
+    // Wi-Fi link -- surfaced as "Barcode not recognized", which sends the
+    // operator hunting for a bad label instead of a network problem.
+    const result = await lookupScannedBarcode(client, cleaned);
+
+    switch (result.kind) {
+      case SCAN_ITEM: {
+        const item = result.data.item;
+        const locations = (result.data.locations || [])
           .map((l) => `${l.bin_code}: ${l.quantity_on_hand}`)
           .join('\n');
-        setInfoModal({ visible: true, title: item.sku, message: `${item.item_name}\n\n${locations || 'No stock on hand'}` });
+        setInfoModal({
+          visible: true,
+          title: item.sku,
+          message: `${item.item_name}\n\n${locations || 'No stock on hand'}`,
+        });
         return;
       }
-    } catch {
-      // Not an item
-    }
-
-    // Try bin lookup
-    try {
-      const binResp = await client.get(`/api/lookup/bin/${encoded}`);
-      if (binResp.data && binResp.data.bin) {
-        const bin = binResp.data.bin;
-        const contents = (binResp.data.items || [])
+      case SCAN_BIN: {
+        const bin = result.data.bin;
+        const contents = (result.data.items || [])
           .map((c) => `${c.sku}: ${c.quantity_on_hand}`)
           .join('\n');
-        setInfoModal({ visible: true, title: bin.bin_code, message: `${bin.bin_type}\n\n${contents || 'Empty bin'}` });
+        setInfoModal({
+          visible: true,
+          title: bin.bin_code,
+          message: `${bin.bin_type}\n\n${contents || 'Empty bin'}`,
+        });
         return;
       }
-    } catch {
-      // Not a bin
-    }
-
-    // Try PO lookup
-    try {
-      const poResp = await client.get(`/api/receiving/po/${encoded}`);
-      if (poResp.data && poResp.data.purchase_order) {
-        const po = poResp.data.purchase_order;
-        navigation.navigate('Receive', { po_number: po.po_number });
+      case SCAN_PO:
+        navigation.navigate('Receive', { po_number: result.data.purchase_order.po_number });
         return;
-      }
-    } catch {
-      // Not a PO
-    }
-
-    // Try SO lookup  -  generic first to check status, then route appropriately
-    try {
-      const soResp = await client.get(`/api/lookup/so/${encoded}`);
-      if (soResp.data && soResp.data.sales_order) {
-        const so = soResp.data.sales_order;
-        if (so.status === 'PACKED') {
+      case SCAN_SO: {
+        const so = result.data.sales_order;
+        // PICKED and PACKED both belong on the ship screen; anything
+        // else is informational, since there is no floor action to take.
+        if (so.status === 'PACKED' || so.status === 'PICKED') {
           navigation.navigate('Ship', { so_number: so.so_number });
           return;
         }
-        if (so.status === 'PICKED') {
-          navigation.navigate('Ship', { so_number: so.so_number });
-          return;
-        }
-        // SO exists but not in actionable status  -  show info
         const infoLines = [so.customer_name, so.customer_phone, `Status: ${so.status}`].filter(Boolean);
         setInfoModal({ visible: true, title: so.so_number, message: infoLines.join('\n') });
         return;
       }
-    } catch {
-      // Not an SO
+      default:
+        showError(scanFailureMessage(result.kind, cleaned));
     }
-
-    showError('Barcode not recognized');
   };
 
   // MAP is always visible for any signed-in worker — it is a read-only
   // warehouse locator, not an operational privilege like pick/receive.
+  // Gate is available to any authenticated floor user (check-in is low-privilege).
   const visibleFunctions = FUNCTIONS.filter(
-    (fn) => fn.key === 'map' || allowedFunctions.includes(fn.key)
+    (fn) => fn.key === 'map' || fn.key === 'gate' || allowedFunctions.includes(fn.key)
   );
 
   const getBadgeCount = (key) => badges[key] || 0;

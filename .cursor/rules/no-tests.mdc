@@ -1,0 +1,27 @@
+---
+description: Không tự động viết/chạy test trong project WMS này
+alwaysApply: true
+---
+
+# Không test trừ khi được yêu cầu
+
+Rule này chỉ áp dụng cho repo `WMS` (sentry-wms).
+
+## Mặc định
+
+- **Không** tự thêm hoặc sửa file test (`*test*`, `*spec*`, `__tests__/`, `tests/`).
+- **Không** chạy test suite (`pytest`, `vitest`, `npm test`, v.v.) sau khi implement hoặc fix.
+- **Không** đề xuất "nên thêm test" trừ khi user hỏi về testing.
+
+## Khi nào được phép
+
+Chỉ viết hoặc chạy test khi user **nói rõ**, ví dụ:
+
+- "thêm test"
+- "chạy test"
+- "fix test đang fail"
+
+## Ưu tiên thay thế
+
+- Hoàn thành feature/fix với diff tối thiểu.
+- Kiểm tra bằng lint/typecheck hoặc đọc code nếu cần — không thay bằng test trừ khi user yêu cầu.

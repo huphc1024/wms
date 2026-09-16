@@ -6,30 +6,20 @@ import {
   Text,
   TouchableOpacity,
   ScrollView,
-  TextInput,
   StyleSheet,
-  ActivityIndicator,
 } from 'react-native';
-import ScanInput from '../ScanInput';
-import client from '../../api/client';
 import { colors, fonts, radii, buttonStyles } from '../../theme/styles';
+import { getExpiryStatus } from '../../utils/expiryStatus';
 
 export default function PalletInfoModal({
   visible,
   bin,
   pallet,
-  warehouseId,
   onClose,
   onSelect,
   selectLabel,
-  onInventoryChanged,
 }) {
   const [selectedLine, setSelectedLine] = useState(null);
-  const [item, setItem] = useState(null);
-  const [quantity, setQuantity] = useState('1');
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState('');
-  const [err, setErr] = useState('');
 
   const pallets = pallet ? [pallet] : (bin?.pallets || []);
   const contents = bin?.contents || [];
@@ -37,10 +27,6 @@ export default function PalletInfoModal({
   useEffect(() => {
     if (!visible) {
       setSelectedLine(null);
-      setItem(null);
-      setQuantity('1');
-      setMsg('');
-      setErr('');
       return;
     }
     if (pallet) {
@@ -51,6 +37,7 @@ export default function PalletInfoModal({
         item_name: pallet.item_name,
         quantity_on_hand: pallet.quantity_on_hand,
         lot_code: pallet.lot_code,
+        expiry_date: pallet.expiry_date,
       });
     }
   }, [visible, pallet]);
@@ -59,76 +46,6 @@ export default function PalletInfoModal({
 
   const pickLine = (line) => {
     setSelectedLine(line);
-    setItem(line.item_id ? {
-      item_id: line.item_id,
-      sku: line.sku,
-      item_name: line.item_name,
-    } : null);
-    setQuantity(String(Math.max(1, Number(line.quantity_on_hand) || 1)));
-    setErr('');
-    setMsg('');
-  };
-
-  const resolveItemFromScan = async (barcode) => {
-    setErr('');
-    setMsg('');
-    try {
-      const resp = await client.get(`/api/lookup/item/${encodeURIComponent(barcode)}`);
-      const found = resp.data?.item;
-      if (!found?.item_id) {
-        setErr('Không tìm thấy SKU');
-        return;
-      }
-      setItem(found);
-      setSelectedLine((prev) => (prev?.sku === found.sku ? prev : {
-        key: `scan-${found.item_id}`,
-        item_id: found.item_id,
-        sku: found.sku,
-        item_name: found.item_name,
-        quantity_on_hand: 1,
-      }));
-      setQuantity((q) => (parseInt(q, 10) > 0 ? q : '1'));
-    } catch {
-      setErr('Không tìm thấy SKU');
-    }
-  };
-
-  const submitMove = async (adjustmentType) => {
-    if (!warehouseId || !bin?.bin_id) {
-      setErr('Thiếu thông tin kho / ô');
-      return;
-    }
-    if (!item?.item_id) {
-      setErr('Scan hoặc chọn SKU trước');
-      return;
-    }
-    const qty = parseInt(quantity, 10);
-    if (!Number.isFinite(qty) || qty <= 0) {
-      setErr('Số lượng phải > 0');
-      return;
-    }
-
-    setBusy(true);
-    setErr('');
-    setMsg('');
-    try {
-      await client.post('/api/admin/adjustments/direct', {
-        warehouse_id: Number(warehouseId),
-        bin_id: bin.bin_id,
-        item_id: item.item_id,
-        adjustment_type: adjustmentType,
-        quantity: qty,
-        reason: `Mobile map ${adjustmentType === 'ADD' ? 'inbound' : 'outbound'} ${bin.bin_code}`,
-      });
-      setMsg(adjustmentType === 'ADD'
-        ? `Đã nhập ${qty} × ${item.sku}`
-        : `Đã xuất ${qty} × ${item.sku}`);
-      if (onInventoryChanged) await onInventoryChanged();
-    } catch (e) {
-      setErr(e.response?.data?.error || e.message || 'Thao tác thất bại');
-    } finally {
-      setBusy(false);
-    }
   };
 
   return (
@@ -151,6 +68,7 @@ export default function PalletInfoModal({
             {pallets.length > 0 ? (
               pallets.map((p) => {
                 const active = selectedLine?.key === p.pallet_id;
+                const expiryStatus = getExpiryStatus(p.expiry_date);
                 return (
                   <TouchableOpacity
                     key={p.pallet_id}
@@ -162,14 +80,28 @@ export default function PalletInfoModal({
                       item_name: p.item_name,
                       quantity_on_hand: p.quantity_on_hand,
                       lot_code: p.lot_code,
+                      expiry_date: p.expiry_date,
                     })}
                   >
-                    <Text style={styles.palletId}>{p.pallet_id}</Text>
+                    <Text style={styles.palletId}>{p.pallet_code || p.pallet_id}</Text>
                     <Text style={styles.palletSku}>{p.sku}</Text>
                     <Text style={styles.palletName}>{p.item_name}</Text>
                     <Text style={styles.palletQty}>SL: {p.quantity_on_hand}</Text>
                     {p.lot_code ? <Text style={styles.palletLot}>Lot: {p.lot_code}</Text> : null}
                     {p.expiry_date ? <Text style={styles.palletLot}>HSD: {p.expiry_date}</Text> : null}
+                    {expiryStatus && expiryStatus.level !== 'ok' ? (
+                      <View style={[
+                        styles.expiryBadge,
+                        expiryStatus.level === 'expired' ? styles.expiryBadgeDanger : styles.expiryBadgeWarning,
+                      ]}>
+                        <Text style={[
+                          styles.expiryBadgeText,
+                          expiryStatus.level === 'expired' ? styles.expiryBadgeDangerText : styles.expiryBadgeWarningText,
+                        ]}>
+                          {expiryStatus.label}
+                        </Text>
+                      </View>
+                    ) : null}
                   </TouchableOpacity>
                 );
               })
@@ -177,6 +109,7 @@ export default function PalletInfoModal({
               contents.map((c, i) => {
                 const key = `${c.item_id}-${i}`;
                 const active = selectedLine?.key === key;
+                const expiryStatus = getExpiryStatus(c.expiry_date);
                 return (
                   <TouchableOpacity
                     key={key}
@@ -188,46 +121,33 @@ export default function PalletInfoModal({
                       item_name: c.item_name,
                       quantity_on_hand: c.quantity_on_hand,
                       lot_code: c.lot_number,
+                      expiry_date: c.expiry_date,
                     })}
                   >
                     <Text style={styles.palletSku}>{c.sku}</Text>
                     <Text style={styles.palletName}>{c.item_name}</Text>
                     <Text style={styles.palletQty}>SL: {c.quantity_on_hand}</Text>
                     {c.lot_number ? <Text style={styles.palletLot}>Lot: {c.lot_number}</Text> : null}
+                    {expiryStatus && expiryStatus.level !== 'ok' ? (
+                      <Text style={[
+                        styles.expiryInline,
+                        expiryStatus.level === 'expired' ? styles.expiryDangerText : styles.expiryWarningText,
+                      ]}>
+                        HSD {c.expiry_date} · {expiryStatus.label}
+                      </Text>
+                    ) : null}
                   </TouchableOpacity>
                 );
               })
             ) : (
-              <Text style={styles.empty}>Ô trống — scan SKU để nhập hàng</Text>
+              <Text style={styles.empty}>Ô trống</Text>
             )}
 
             {!onSelect ? (
               <View style={styles.moveBox}>
-                <Text style={styles.sectionTitle}>Scan / chọn SKU</Text>
-                <ScanInput
-                  placeholder="SCAN SKU / UPC"
-                  onScan={resolveItemFromScan}
-                  autoFocus={false}
-                />
-                {item ? (
-                  <Text style={styles.selectedSku}>
-                    Đang chọn: <Text style={styles.selectedSkuBold}>{item.sku}</Text>
-                    {item.item_name ? ` — ${item.item_name}` : ''}
-                  </Text>
-                ) : null}
-                <View style={styles.qtyRow}>
-                  <Text style={styles.qtyLabel}>Số lượng</Text>
-                  <TextInput
-                    style={styles.qtyInput}
-                    keyboardType="number-pad"
-                    value={quantity}
-                    onChangeText={setQuantity}
-                    placeholder="1"
-                    placeholderTextColor={colors.textPlaceholder}
-                  />
-                </View>
-                {!!err && <Text style={styles.err}>{err}</Text>}
-                {!!msg && <Text style={styles.ok}>{msg}</Text>}
+                <Text style={styles.readOnlyHint}>
+                  Nhập / xuất hàng qua màn Nhận hàng hoặc Xuất kho — không điều chỉnh trực tiếp trên bản đồ.
+                </Text>
               </View>
             ) : null}
           </ScrollView>
@@ -237,28 +157,7 @@ export default function PalletInfoModal({
               <TouchableOpacity style={[buttonStyles.buttonPrimary, styles.btn]} onPress={onSelect}>
                 <Text style={buttonStyles.buttonPrimaryText}>{selectLabel || 'CHỌN VỊ TRÍ'}</Text>
               </TouchableOpacity>
-            ) : (
-              <>
-                <TouchableOpacity
-                  style={[buttonStyles.buttonPrimary, styles.btn]}
-                  disabled={busy}
-                  onPress={() => submitMove('ADD')}
-                >
-                  {busy ? (
-                    <ActivityIndicator color={colors.cream} />
-                  ) : (
-                    <Text style={buttonStyles.buttonPrimaryText}>NHẬP HÀNG</Text>
-                  )}
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[buttonStyles.buttonSecondary, styles.btn]}
-                  disabled={busy}
-                  onPress={() => submitMove('REMOVE')}
-                >
-                  <Text style={buttonStyles.buttonSecondaryText}>XUẤT HÀNG</Text>
-                </TouchableOpacity>
-              </>
-            )}
+            ) : null}
             <TouchableOpacity
               style={[buttonStyles.buttonSecondary, styles.btn, onSelect ? null : styles.closeBtn]}
               onPress={onClose}
@@ -364,6 +263,37 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     marginTop: 2,
   },
+  expiryBadge: {
+    alignSelf: 'flex-start',
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    marginTop: 7,
+  },
+  expiryBadgeDanger: {
+    backgroundColor: '#F8E9E6',
+    borderColor: '#C96755',
+  },
+  expiryBadgeWarning: {
+    backgroundColor: '#FEF3D7',
+    borderColor: colors.copper,
+  },
+  expiryBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 9,
+    fontWeight: '700',
+  },
+  expiryBadgeDangerText: { color: colors.danger },
+  expiryBadgeWarningText: { color: '#7C4618' },
+  expiryInline: {
+    fontFamily: fonts.mono,
+    fontSize: 9,
+    fontWeight: '700',
+    marginTop: 5,
+  },
+  expiryDangerText: { color: colors.danger },
+  expiryWarningText: { color: colors.warning },
   empty: {
     fontFamily: fonts.mono,
     fontSize: 12,
@@ -376,6 +306,12 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     borderTopWidth: 1,
     borderTopColor: colors.cardBorder,
+  },
+  readOnlyHint: {
+    fontFamily: fonts.mono,
+    fontSize: 11,
+    color: colors.textMuted,
+    lineHeight: 16,
   },
   selectedSku: {
     fontFamily: fonts.mono,

@@ -23,10 +23,56 @@ const ALL_FUNCTIONS = [
 // api/constants.py ALL_PAGE_KEYS exactly. ADMIN users bypass the
 // permission table server-side, so checking these for an ADMIN is
 // purely cosmetic - the PUT endpoint no-ops for ADMIN targets.
+
+// Operational personas (Phase 6). DB still only has ADMIN|USER; presets
+// fill allowed_functions + page_keys so go-live users match docs/role-matrix.md.
+const ROLE_PRESETS = [
+  {
+    id: 'supervisor',
+    label: 'Supervisor',
+    role: 'USER',
+    allowed_functions: ALL_FUNCTIONS.map((fn) => fn.key),
+    page_keys: [
+      'dashboard', 'inventory', 'cycle-counts', 'count-approvals',
+      'purchase-orders', 'receiving', 'putaway',
+      'sales-orders', 'backorders', 'fraud', 'picking-tickets', 'picking-batches',
+      'items', 'vendors', 'adjustments',
+      'warehouses', 'bins', 'zones', 'preferred-bins',
+      'pallets', 'expiry', 'vehicle-movements', 'warehouse-simulation',
+      'notifications', 'audit-log',
+    ],
+  },
+  {
+    id: 'picker',
+    label: 'Picker',
+    role: 'USER',
+    allowed_functions: ['pick', 'pack', 'ship', 'map'],
+    page_keys: ['dashboard', 'inventory', 'warehouse-simulation'],
+  },
+  {
+    id: 'billing_clerk',
+    label: 'Billing clerk',
+    role: 'USER',
+    allowed_functions: [],
+    page_keys: ['dashboard', 'billing'],
+  },
+  {
+    id: 'receiver',
+    label: 'Receiver',
+    role: 'USER',
+    allowed_functions: ['receive', 'putaway', 'map'],
+    page_keys: [
+      'dashboard', 'inventory', 'purchase-orders', 'receiving', 'putaway',
+      'pallets', 'vehicle-movements', 'warehouse-simulation',
+    ],
+  },
+];
+
 const PAGE_GROUPS = [
   {
     label: 'Floor',
     pages: [
+      { key: 'dashboard', label: 'Dashboard' },
       { key: 'inventory', label: 'Inventory' },
       { key: 'warehouse-simulation', label: 'Warehouse Simulation' },
       { key: 'cycle-counts', label: 'Cycle Counts' },
@@ -45,10 +91,11 @@ const PAGE_GROUPS = [
     label: 'Outbound',
     pages: [
       { key: 'sales-orders', label: 'Sales Orders' },
+      { key: 'backorders', label: 'Backorders' },
       { key: 'fraud', label: 'Fraud' },
-      // picking/packing/shipping retired in favour of the mobile flow;
-      // their page_keys are gone from ALL_PAGE_KEYS so a stale grant
-      // cannot persist past the next permissions save.
+      { key: 'picking-tickets', label: 'Picking Tickets' },
+      { key: 'picking-batches', label: 'Picking Batches' },
+      { key: 'pos-activity', label: 'POS Activity' },
     ],
   },
   {
@@ -63,6 +110,15 @@ const PAGE_GROUPS = [
       { key: 'bins', label: 'Bins' },
       { key: 'zones', label: 'Zones' },
       { key: 'preferred-bins', label: 'Preferred Bins' },
+      { key: 'pallets', label: 'Pallets' },
+      { key: 'expiry', label: 'Expiry' },
+      { key: 'vehicle-movements', label: 'Vehicle Movements' },
+    ],
+  },
+  {
+    label: 'Billing',
+    pages: [
+      { key: 'billing', label: 'Customers, contracts, rate cards & invoices' },
     ],
   },
   {
@@ -73,6 +129,8 @@ const PAGE_GROUPS = [
       { key: 'inbound', label: 'Inbound Activity' },
       { key: 'consumer-groups', label: 'Consumer Groups' },
       { key: 'webhooks', label: 'Webhooks' },
+      { key: 'channels', label: 'Channels' },
+      { key: 'notifications', label: 'Notifications' },
       { key: 'audit-log', label: 'Audit Log' },
       { key: 'imports', label: 'Imports' },
       { key: 'integrations', label: 'Integrations' },
@@ -87,9 +145,14 @@ const PAGE_GROUPS = [
   {
     label: 'Overrides',
     isOverride: true,
-    pages: [      {
+    pages: [
+      {
         key: 'so-full-edit',
         label: 'Full SO edit (past OPEN, incl. source_system + line CRUD)',
+      },
+      {
+        key: 'warehouse-map-edit',
+        label: 'Edit and save warehouse floor plans',
       },
     ],
   },
@@ -188,6 +251,17 @@ export default function Users() {
 
   function clearAllPages() {
     setPagePermissions([]);
+  }
+
+  function applyRolePreset(presetId) {
+    const preset = ROLE_PRESETS.find((p) => p.id === presetId);
+    if (!preset) return;
+    setForm((prev) => ({
+      ...prev,
+      role: preset.role,
+      allowed_functions: [...preset.allowed_functions],
+    }));
+    setPagePermissions([...preset.page_keys]);
   }
 
   async function save() {
@@ -359,6 +433,25 @@ export default function Users() {
             <select className="form-select" value={form.role || ''} onChange={(e) => setForm({ ...form, role: e.target.value })}>
               {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
             </select>
+          </div>
+          <div className="form-group">
+            <label>Apply role preset</label>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '8px 0' }}>
+              {ROLE_PRESETS.map((preset) => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => applyRolePreset(preset.id)}
+                  title="Sets DB role, mobile modules, and web page grants"
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+            <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: 0 }}>
+              Presets match docs/role-matrix.md. You can still tweak checkboxes after applying.
+            </p>
           </div>
           <div className="form-group">
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>

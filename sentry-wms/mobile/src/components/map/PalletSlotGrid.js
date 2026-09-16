@@ -1,6 +1,7 @@
 import React from 'react';
 import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
 import { colors, fonts, radii } from '../../theme/styles';
+import { getMostUrgentExpiry } from '../../utils/expiryStatus';
 
 const SLOT_COLORS = {
   empty: { fill: '#F0EDE6', border: '#B8AA96', text: colors.textMuted },
@@ -26,7 +27,7 @@ function slotStyle(slot, selectMode) {
   return SLOT_COLORS.partial;
 }
 
-export default function PalletSlotGrid({ levels = [], onSlotPress, selectMode = null }) {
+export default function PalletSlotGrid({ levels = [], onSlotPress, selectMode = null, focusedBinId = null }) {
   return (
     <View style={styles.wrap}>
       {levels.map((levelRow) => (
@@ -38,20 +39,34 @@ export default function PalletSlotGrid({ levels = [], onSlotPress, selectMode = 
             {(levelRow.positions || []).map((slot) => {
               const bin = slot.bin;
               const palette = slotStyle(slot, selectMode);
+              const isFocused = bin?.bin_id === focusedBinId;
               const qty = bin?.total_qty || 0;
               const sku = bin?.contents?.[0]?.sku || bin?.pallets?.[0]?.sku;
+              const expiryStatus = getMostUrgentExpiry([
+                ...(bin?.pallets || []),
+                ...(bin?.contents || []),
+              ]);
               return (
                 <TouchableOpacity
                   key={`L${levelRow.level}-P${slot.position}`}
                   style={[
                     styles.slot,
                     { backgroundColor: palette.fill, borderColor: palette.border },
-                    slot.highlight && styles.slotHighlight,
+                    (slot.highlight || isFocused) && styles.slotHighlight,
+                    isFocused && styles.slotFocused,
                   ]}
                   activeOpacity={0.75}
                   disabled={selectMode && !slot.selectable}
                   onPress={() => onSlotPress?.(slot, levelRow.level)}
                 >
+                  {expiryStatus && expiryStatus.level !== 'ok' ? (
+                    <View style={[
+                      styles.expiryDot,
+                      expiryStatus.level === 'expired' ? styles.expiryDotDanger : styles.expiryDotWarning,
+                    ]}>
+                      <Text style={styles.expiryDotText}>HSD</Text>
+                    </View>
+                  ) : null}
                   <Text style={[styles.slotCode, { color: palette.text }]}>
                     P{slot.position}
                   </Text>
@@ -106,8 +121,10 @@ const styles = StyleSheet.create({
     borderRadius: radii.card,
     padding: 8,
     justifyContent: 'center',
+    position: 'relative',
   },
   slotHighlight: { borderWidth: 2 },
+  slotFocused: { borderColor: colors.accentRed, borderWidth: 3 },
   slotCode: {
     fontFamily: fonts.mono,
     fontSize: 10,
@@ -136,5 +153,23 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     fontSize: 10,
     color: colors.textMuted,
+  },
+  expiryDot: {
+    position: 'absolute',
+    top: 5,
+    right: 5,
+    minWidth: 25,
+    paddingHorizontal: 4,
+    paddingVertical: 2,
+    borderRadius: 4,
+    alignItems: 'center',
+  },
+  expiryDotDanger: { backgroundColor: colors.danger },
+  expiryDotWarning: { backgroundColor: colors.warning },
+  expiryDotText: {
+    color: colors.cream,
+    fontFamily: fonts.mono,
+    fontSize: 7,
+    fontWeight: '700',
   },
 });
