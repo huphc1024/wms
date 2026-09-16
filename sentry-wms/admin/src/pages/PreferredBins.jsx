@@ -4,6 +4,7 @@ import { useWarehouse } from '../warehouse.jsx';
 import DataTable from '../components/DataTable.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import Modal from '../components/Modal.jsx';
+import SkuBarcodeAutocomplete from '../components/SkuBarcodeAutocomplete.jsx';
 
 export default function PreferredBins() {
   const { warehouseId } = useWarehouse();
@@ -11,7 +12,7 @@ export default function PreferredBins() {
   const [search, setSearch] = useState('');
   const [showAdd, setShowAdd] = useState(false);
   const [addForm, setAddForm] = useState({ item_id: '', bin_id: '', priority: '1' });
-  const [items, setItems] = useState([]);
+  const [itemSearch, setItemSearch] = useState('');
   const [bins, setBins] = useState([]);
   const [editingId, setEditingId] = useState(null);
   const [editPriority, setEditPriority] = useState('');
@@ -31,13 +32,10 @@ export default function PreferredBins() {
   }
 
   async function openAdd() {
-    const [itemRes, binRes] = await Promise.all([
-      api.get('/admin/items?per_page=200', { silentPermissionDenied: true }),
-      api.get(`/admin/bins?warehouse_id=${warehouseId}`),
-    ]);
-    if (itemRes?.ok) setItems((await itemRes.json()).items || []);
+    const binRes = await api.get(`/admin/bins?warehouse_id=${warehouseId}`);
     if (binRes?.ok) setBins((await binRes.json()).bins || []);
     setAddForm({ item_id: '', bin_id: '', priority: '1' });
+    setItemSearch('');
     setShowAdd(true);
   }
 
@@ -176,12 +174,23 @@ export default function PreferredBins() {
         >
           <div className="form-group">
             <label>Item</label>
-            <select className="form-select" value={addForm.item_id} onChange={(e) => setAddForm({ ...addForm, item_id: e.target.value })}>
-              <option value="">Select item...</option>
-              {items.map((it) => (
-                <option key={it.item_id} value={it.item_id}>{it.sku} - {it.item_name}</option>
-              ))}
-            </select>
+            <SkuBarcodeAutocomplete
+              listId="preferred-bins-item-options"
+              minChars={2}
+              placeholder="Gõ hoặc scan SKU / barcode"
+              value={itemSearch}
+              onChange={(v) => {
+                setItemSearch(v);
+                setAddForm((f) => ({ ...f, item_id: '' }));
+              }}
+              onItemSelect={(it) => {
+                if (it) {
+                  setAddForm((f) => ({ ...f, item_id: it.item_id }));
+                  setItemSearch(it.sku || '');
+                }
+              }}
+              apiOptions={{ silentPermissionDenied: true }}
+            />
           </div>
           <div className="form-group">
             <label>Bin</label>

@@ -5,6 +5,11 @@ import DataTable from '../components/DataTable.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import Modal from '../components/Modal.jsx';
 import StatusTag from '../components/StatusTag.jsx';
+import SkuBarcodeAutocomplete from '../components/SkuBarcodeAutocomplete.jsx';
+import OrderLineEditor from '../components/OrderLineEditor.jsx';
+import { emptyOrderLine, resolveOrderLines } from '../utils/orderLines.js';
+import { resolveItemFromScan } from '../utils/itemScanOptions.js';
+import { useWarehouse } from '../warehouse.jsx';
 
 const STATUS_OPTIONS = ['All', 'OPEN', 'PARTIAL', 'RECEIVED', 'CLOSED', 'ARCHIVED'];
 const ALL_PO_STATUSES = ['OPEN', 'PARTIAL', 'RECEIVED', 'CLOSED', 'ARCHIVED'];
@@ -38,8 +43,26 @@ function formatApiError(data, fallback) {
   return data.error || fallback;
 }
 
+function emptyCreateForm(warehouseId) {
+  return {
+    po_number: '',
+    warehouse_id: warehouseId || '',
+    vendor_name: '',
+    expected_date: '',
+    notes: '',
+    lines: [emptyOrderLine()],
+  };
+}
+
 export default function PurchaseOrders() {
   const [searchParams] = useSearchParams();
+  const { warehouses, warehouseId } = useWarehouse();
+  // Manual PO entry. The v1 product assumed every PO arrived from an ERP
+  // or a CSV import, so this lived in Settings under "Manual Entry" --
+  // three clicks away from the page where an operator looks for it.
+  const [createForm, setCreateForm] = useState(null);
+  const [createError, setCreateError] = useState('');
+  const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState(searchParams.get('q') || '');
   const [orders, setOrders] = useState([]);
   const [pagination, setPagination] = useState(null);
@@ -62,46 +85,78 @@ export default function PurchaseOrders() {
   const [newLineQty, setNewLineQty] = useState('');
   const [newLineError, setNewLineError] = useState('');
   const [addingLine, setAddingLine] = useState(false);
-  // Typeahead state: debounced fetch as the operator types in the
-  // SKU field populates a datalist + drives a live "Found: ..."
-  // preview so the operator can see the resolution before clicking
-  // Add. Beats the original "type a SKU and pray it matches" UX.
-  const [skuSuggestions, setSkuSuggestions] = useState([]);
   const [resolvedItem, setResolvedItem] = useState(null);
+  // Inbound ownership (mig 087). No backfill was possible, so every PO
+  // created before the portal landed reads "Own stock" until an operator
+  // attributes it here -- that is what makes it visible to the customer.
+  const [customers, setCustomers] = useState([]);
+  const [ownerForm, setOwnerForm] = useState(null);
+  const [ownerError, setOwnerError] = useState('');
 
   useEffect(() => { loadOrders(); }, [page, statusFilter, search, showArchived]);  // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Debounced SKU lookup. Fires while the operator is typing in the
-  // Add Line SKU input so suggestions surface without a server query
-  // per keystroke. Skips when the modal is not open or the field
-  // is empty.
+  // Initial remote-data hydration is intentionally effect-driven. The
+  // async IIFE keeps setState out of the effect body, so no
+  // set-state-in-effect suppression is needed here.
   useEffect(() => {
-    if (!editing) return;
-    const sku = newLineSku.trim();
-    if (sku.length < 2) {
-      setSkuSuggestions([]);
-      setResolvedItem(null);
+    (async () => {
+      const res = await api.get('/admin/customers');
+      if (res?.ok) setCustomers((await res.json()).customers || []);
+    })();
+  }, []);
+
+  async function saveOwner() {
+    setOwnerError('');
+    const res = await api.put(`/admin/purchase-orders/${ownerForm.po_id}/owner`, {
+      owner_customer_id: ownerForm.owner_customer_id || null,
+    });
+    if (!res?.ok) {
+      const data = await res?.json().catch(() => ({}));
+      setOwnerError(data?.error || 'Failed to set owner');
       return;
     }
-    const handle = setTimeout(async () => {
-      const res = await api.get(
-        `/admin/items?q=${encodeURIComponent(sku)}&per_page=10&active=true`,
-      );
-      if (!res?.ok) {
-        setSkuSuggestions([]);
-        setResolvedItem(null);
-        return;
-      }
-      const data = await res.json();
-      const items = data.items || [];
-      setSkuSuggestions(items);
-      const exact = items.find(
-        (i) => String(i.sku || '').trim().toLowerCase() === sku.toLowerCase(),
-      ) || null;
-      setResolvedItem(exact);
-    }, 200);
-    return () => clearTimeout(handle);
-  }, [newLineSku, editing]);
+    setOwnerForm(null);
+    await loadOrders();
+  }
+
+  async function submitCreate() {
+    setCreateError('');
+    if (!String(createForm.po_number || '').trim()) {
+      setCreateError('PO number is required.');
+      return;
+    }
+    if (!createForm.warehouse_id) {
+      setCreateError('Warehouse is required.');
+      return;
+    }
+    const { lines, error } = await resolveOrderLines(createForm.lines);
+    if (error) {
+      setCreateError(error);
+      return;
+    }
+
+    setCreating(true);
+    const res = await api.post('/admin/purchase-orders', {
+      po_number: createForm.po_number.trim(),
+      warehouse_id: Number(createForm.warehouse_id),
+      vendor_name: createForm.vendor_name.trim() || null,
+      expected_date: createForm.expected_date || null,
+      notes: createForm.notes.trim() || null,
+      lines,
+    });
+    setCreating(false);
+    if (!res?.ok) {
+      const data = await res?.json().catch(() => null);
+      setCreateError(formatApiError(data, 'Failed to create purchase order'));
+      return;
+    }
+    setCreateForm(null);
+    // Land on the new PO: it is OPEN, and a freshly created order is
+    // almost always the one the operator wants to look at next.
+    setStatusFilter('All');
+    setPage(1);
+    await loadOrders();
+  }
 
   async function loadOrders() {
     const qp = new URLSearchParams({ page: String(page), per_page: '50' });
@@ -241,16 +296,14 @@ export default function PurchaseOrders() {
   // and finds the exact case-insensitive match. Same pattern as
   // Settings.jsx Create PO so behavior is consistent across surfaces.
   async function resolveSku(sku) {
-    const key = String(sku || '').trim().toLowerCase();
+    const key = String(sku || '').trim();
     if (!key) return null;
     const res = await api.get(
-      `/admin/items?q=${encodeURIComponent(sku)}&per_page=10&active=true`,
+      `/admin/items?q=${encodeURIComponent(key)}&per_page=10&active=true`,
     );
     if (!res?.ok) return null;
     const data = await res.json();
-    return (data.items || []).find(
-      (i) => String(i.sku || '').trim().toLowerCase() === key,
-    ) || null;
+    return resolveItemFromScan(key, data.items || []);
   }
 
   async function addLine() {
@@ -293,7 +346,6 @@ export default function PurchaseOrders() {
         setNewLineSku('');
         setNewLineQty('');
         setResolvedItem(null);
-        setSkuSuggestions([]);
       } else {
         let data = null;
         try { data = await res?.json(); } catch (_) { /* non-JSON body */ }
@@ -345,15 +397,23 @@ export default function PurchaseOrders() {
     { key: 'vendor_name', label: 'Vendor' },
     { key: 'expected_date', label: 'Expected Date', mono: true, render: (r) => r.expected_date ? new Date(r.expected_date).toLocaleDateString() : '-' },
     { key: 'status', label: 'Status', render: (r) => <StatusTag status={r.status} /> },
+    { key: 'owner_customer_code', label: 'For customer', render: (r) => r.owner_customer_code || 'Own stock' },
     { key: 'created_at', label: 'Created', render: (r) => r.created_at ? new Date(r.created_at).toLocaleDateString() : '-' },
     { key: 'actions', label: '', render: (r) => (
-      <button className="btn btn-sm" onClick={(e) => { e.stopPropagation(); openEdit(r); }} aria-label="Edit" title="Edit">&#9998;</button>
+      <div style={{ display: 'flex', gap: 4 }}>
+        <button className="btn btn-sm" onClick={(e) => { e.stopPropagation(); openEdit(r); }} aria-label="Edit" title="Edit">&#9998;</button>
+        <button className="btn btn-sm" onClick={(e) => { e.stopPropagation(); setOwnerError(''); setOwnerForm({ po_id: r.po_id, po_number: r.po_number, owner_customer_id: r.owner_customer_id || '' }); }} aria-label="Set customer" title="Set customer">&#128100;</button>
+      </div>
     )},
   ];
 
   return (
     <div>
-      <PageHeader title="Purchase Orders" />
+      <PageHeader title="Purchase Orders">
+        <button className="btn btn-primary" onClick={() => { setCreateError(''); setCreateForm(emptyCreateForm(warehouseId)); }}>
+          New purchase order
+        </button>
+      </PageHeader>
 
       <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
         <label style={{ fontSize: 13, color: 'var(--text-secondary)' }}>Status:</label>
@@ -608,19 +668,17 @@ export default function PurchaseOrders() {
                 <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
                   <div style={{ flex: '0 0 240px' }}>
                     <label style={{ fontSize: 11, color: 'var(--text-secondary)', fontWeight: 500 }}>SKU</label>
-                    <input
+                    <SkuBarcodeAutocomplete
                       className="form-input mono"
-                      placeholder="Type SKU to search"
-                      list="po-edit-sku-suggestions"
+                      listId="po-edit-sku-suggestions"
+                      minChars={2}
+                      placeholder="Gõ hoặc scan SKU / barcode"
                       value={newLineSku}
-                      onChange={(e) => setNewLineSku(e.target.value)}
+                      onChange={setNewLineSku}
+                      onItemSelect={setResolvedItem}
                       onKeyDown={(e) => { if (e.key === 'Enter') addLine(); }}
+                      showNoMatch
                     />
-                    <datalist id="po-edit-sku-suggestions">
-                      {skuSuggestions.map((it) => (
-                        <option key={it.item_id} value={it.sku}>{it.item_name}</option>
-                      ))}
-                    </datalist>
                   </div>
                   <div style={{ flex: '0 0 120px' }}>
                     <label style={{ fontSize: 11, color: 'var(--text-secondary)', fontWeight: 500 }}>Quantity</label>
@@ -656,14 +714,126 @@ export default function PurchaseOrders() {
                     Found: <strong>{resolvedItem.sku}</strong> - {resolvedItem.item_name}
                   </div>
                 )}
-                {!newLineError && !resolvedItem && newLineSku.trim().length >= 2 && skuSuggestions.length === 0 && (
-                  <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-secondary)' }}>
-                    No matches for "{newLineSku.trim()}". Click Add Line to retry the lookup.
-                  </div>
-                )}
               </div>
             )}
           </section>
+        </Modal>
+      )}
+
+      {createForm && (
+        <Modal
+          title="New purchase order"
+          onClose={() => setCreateForm(null)}
+          footer={
+            <>
+              <button className="btn" onClick={() => setCreateForm(null)} disabled={creating}>Cancel</button>
+              <button className="btn btn-primary" onClick={submitCreate} disabled={creating}>
+                {creating ? 'Creating...' : 'Create purchase order'}
+              </button>
+            </>
+          }
+        >
+          {createError && <div className="alert alert-error">{createError}</div>}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div className="form-group">
+              <label htmlFor="po-create-number">PO number</label>
+              <input
+                id="po-create-number"
+                className="form-input mono"
+                value={createForm.po_number}
+                onChange={(e) => setCreateForm({ ...createForm, po_number: e.target.value })}
+                placeholder="PO-2026-010"
+                autoFocus
+              />
+            </div>
+            <div className="form-group">
+              <label htmlFor="po-create-warehouse">Warehouse</label>
+              <select
+                id="po-create-warehouse"
+                className="form-input"
+                value={createForm.warehouse_id}
+                onChange={(e) => setCreateForm({ ...createForm, warehouse_id: e.target.value })}
+              >
+                <option value="">— Select warehouse —</option>
+                {warehouses.map((w) => (
+                  <option key={w.warehouse_id || w.id} value={w.warehouse_id || w.id}>
+                    {w.warehouse_code} &middot; {w.warehouse_name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="form-group">
+              <label htmlFor="po-create-vendor">Vendor</label>
+              <input
+                id="po-create-vendor"
+                className="form-input"
+                value={createForm.vendor_name}
+                onChange={(e) => setCreateForm({ ...createForm, vendor_name: e.target.value })}
+              />
+            </div>
+            <div className="form-group">
+              <label htmlFor="po-create-expected">Expected date</label>
+              <input
+                id="po-create-expected"
+                className="form-input"
+                type="date"
+                value={createForm.expected_date}
+                onChange={(e) => setCreateForm({ ...createForm, expected_date: e.target.value })}
+              />
+            </div>
+          </div>
+          <div className="form-group">
+            <label htmlFor="po-create-notes">Notes</label>
+            <textarea
+              id="po-create-notes"
+              className="form-input"
+              rows={2}
+              value={createForm.notes}
+              onChange={(e) => setCreateForm({ ...createForm, notes: e.target.value })}
+            />
+          </div>
+          <h4 style={{ margin: '16px 0 8px', fontSize: 13, color: 'var(--text-secondary)' }}>Lines</h4>
+          <OrderLineEditor
+            lines={createForm.lines}
+            onChange={(lines) => setCreateForm({ ...createForm, lines })}
+            listIdPrefix="po-create"
+            disabled={creating}
+          />
+          <p style={{ marginTop: 12, fontSize: 12, color: 'var(--text-secondary)' }}>
+            The PO is created OPEN and its barcode is set to the PO number, so the
+            printed sheet scans straight into mobile Receive.
+          </p>
+        </Modal>
+      )}
+
+      {ownerForm && (
+        <Modal title={`Customer for ${ownerForm.po_number}`} onClose={() => setOwnerForm(null)}
+          footer={
+            <>
+              <button className="btn" onClick={() => setOwnerForm(null)}>Cancel</button>
+              <button className="btn btn-primary" onClick={saveOwner}>Save</button>
+            </>
+          }
+        >
+          {ownerError && <div className="alert alert-error">{ownerError}</div>}
+          <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 12 }}>
+            Attributing this PO is what makes the incoming goods show up in that
+            customer&apos;s portal. Leave it as own stock for the operator&apos;s own inbound.
+          </p>
+          <div className="form-group">
+            <label htmlFor="po-owner">For customer</label>
+            <select id="po-owner" className="form-input"
+              value={ownerForm.owner_customer_id}
+              onChange={(e) => setOwnerForm({ ...ownerForm, owner_customer_id: e.target.value })}
+            >
+              <option value="">Own stock (no customer)</option>
+              {customers.filter((c) => c.is_active).map((c) => (
+                <option key={c.customer_id} value={c.customer_id}>
+                  {c.customer_code} &middot; {c.customer_name}
+                </option>
+              ))}
+            </select>
+          </div>
         </Modal>
       )}
     </div>

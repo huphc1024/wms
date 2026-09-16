@@ -4,6 +4,32 @@
  * without rewriting every page.
  */
 export const extraVi = {
+  // Manual order entry (New purchase order / New sales order modals)
+  'New purchase order': 'Tạo đơn mua hàng',
+  'New sales order': 'Tạo đơn bán hàng',
+  'Create purchase order': 'Tạo đơn mua',
+  'Create sales order': 'Tạo đơn bán',
+  'PO number': 'Số đơn mua',
+  'SO number': 'Số đơn bán',
+  'Expected date': 'Ngày dự kiến về',
+  'Ship method': 'Hình thức giao',
+  'Ship by date': 'Cần giao trước',
+  'Shipping address': 'Địa chỉ giao hàng',
+  'Lines': 'Dòng hàng',
+  '+ Add line': '+ Thêm dòng',
+  'Remove line': 'Xóa dòng',
+  '— Select warehouse —': '— Chọn kho —',
+  'PO number is required.': 'Phải nhập số đơn mua.',
+  'SO number is required.': 'Phải nhập số đơn bán.',
+  'Warehouse is required.': 'Phải chọn kho.',
+  'Add at least one line.': 'Cần ít nhất một dòng hàng.',
+  'Failed to create purchase order': 'Không tạo được đơn mua hàng',
+  'Failed to create sales order': 'Không tạo được đơn bán hàng',
+  'The PO is created OPEN and its barcode is set to the PO number, so the printed sheet scans straight into mobile Receive.':
+    'Đơn mua tạo ra ở trạng thái OPEN và mã vạch lấy theo số đơn, nên phiếu in ra quét thẳng được ở màn Nhận hàng trên app.',
+  'Stock is reserved for each line as far as the warehouse can cover it, the moment the order is created.':
+    'Tồn được giữ cho từng dòng ngay khi tạo đơn, tới mức kho đang có.',
+
   // Page titles (exact PageHeader strings)
   'Dashboard': 'Tổng quan',
   'Inventory': 'Tồn kho',

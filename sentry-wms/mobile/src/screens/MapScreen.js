@@ -3,7 +3,9 @@ import { View, Text, TouchableOpacity, ScrollView, ActivityIndicator, StyleSheet
 import { useFocusEffect } from '@react-navigation/native';
 import { useAuth } from '../auth/AuthContext';
 import client from '../api/client';
+import WarehouseFloorPlan from '../components/map/WarehouseFloorPlan';
 import ScreenHeader from '../components/ScreenHeader';
+import ScanInput from '../components/ScanInput';
 import ErrorPopup from '../components/ErrorPopup';
 import useScreenError from '../hooks/useScreenError';
 import { colors, fonts, radii, screenStyles } from '../theme/styles';
@@ -12,6 +14,11 @@ export default function MapScreen({ navigation, route }) {
   const { warehouseId } = useAuth();
   const { error, showError, clearError } = useScreenError();
   const [zones, setZones] = useState([]);
+  const [mapLayout, setMapLayout] = useState(null);
+  const [mapRacks, setMapRacks] = useState([]);
+  const [highlightRackId, setHighlightRackId] = useState(null);
+  const [highlightRackKey, setHighlightRackKey] = useState(null);
+  const [expiryAlerts, setExpiryAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
 
   const selectMode = route.params?.selectMode || null;
@@ -23,14 +30,48 @@ export default function MapScreen({ navigation, route }) {
     if (!warehouseId) return;
     setLoading(true);
     try {
-      const resp = await client.get(`/api/warehouse-map?warehouse_id=${warehouseId}`);
-      setZones(resp.data?.zones || []);
+      const [mapResp, alertResp] = await Promise.all([
+        client.get(`/api/warehouse-map?warehouse_id=${warehouseId}`),
+        client.get(`/api/warehouse-map/expiry-alerts?warehouse_id=${warehouseId}&days=30`),
+      ]);
+      setZones(mapResp.data?.zones || []);
+      setMapLayout(mapResp.data?.layout || null);
+      setMapRacks(mapResp.data?.racks || []);
+      setExpiryAlerts(alertResp.data?.alerts || []);
     } catch (err) {
       showError(err.response?.data?.error || 'Không tải được sơ đồ kho');
     } finally {
       setLoading(false);
     }
   }, [warehouseId, showError]);
+
+  const locatePallet = async (palletCode) => {
+    if (!warehouseId) return;
+    try {
+      const encodedCode = encodeURIComponent(palletCode.trim());
+      const resp = await client.get(`/api/warehouse-map/pallet/${encodedCode}?warehouse_id=${warehouseId}`);
+      const location = resp.data?.location;
+      const pallet = resp.data?.pallet;
+      if (!location?.rack_key) {
+        showError('Không tìm thấy vị trí pallet');
+        return;
+      }
+      navigation.navigate('RackMap', {
+        rackId: location.rack_id,
+        rackKey: location.rack_key,
+        rackLabel: location.rack_label,
+        zoneCode: location.zone_code,
+        focusedBinId: location.bin_id,
+        palletCode: pallet?.pallet_code || palletCode,
+        palletSku: pallet?.sku,
+        palletSlot: location.slot_label,
+      });
+      setHighlightRackId(location.rack_id || null);
+      setHighlightRackKey(location.rack_key);
+    } catch (err) {
+      showError(err.response?.data?.error || 'Không tìm thấy pallet');
+    }
+  };
 
   useFocusEffect(
     useCallback(() => {
@@ -56,6 +97,59 @@ export default function MapScreen({ navigation, route }) {
           </Text>
         ) : (
           <Text style={styles.hint}>Chọn khu để xem dãy kệ và từng tầng pallet</Text>
+        )}
+        {!selectMode && mapLayout?.has_saved_layout && (
+          <WarehouseFloorPlan
+            layout={mapLayout}
+            zones={zones}
+            racks={mapRacks}
+            highlightRackId={highlightRackId}
+            highlightRackKey={highlightRackKey}
+          />
+        )}
+        {!selectMode && (
+          <View style={styles.palletLookup}>
+            <Text style={styles.palletLookupTitle}>QUÉT QR / MÃ PALLET</Text>
+            <Text style={styles.palletLookupHint}>Quét mã trên nhãn để mở đúng dãy kệ và tầng pallet.</Text>
+            <ScanInput
+              placeholder="QUÉT MÃ PALLET"
+              onScan={locatePallet}
+            />
+          </View>
+        )}
+        {!selectMode && expiryAlerts.length > 0 && (
+          <View style={styles.expiryPanel}>
+            <Text style={styles.expiryTitle}>CẢNH BÁO HẾT HẠN · {expiryAlerts.length}</Text>
+            {expiryAlerts.slice(0, 5).map((alert) => (
+              <TouchableOpacity
+                key={alert.pallet_id}
+                style={styles.expiryRow}
+                onPress={() => navigation.navigate('RackMap', {
+                  rackId: alert.location.rack_id,
+                  rackKey: alert.location.rack_key,
+                  rackLabel: alert.location.rack_label,
+                  zoneCode: alert.location.zone_code,
+                  focusedBinId: alert.location.bin_id,
+                  palletCode: alert.pallet_code,
+                  palletSku: alert.sku,
+                  palletSlot: alert.location.slot_label,
+                })}
+              >
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.expiryPallet}>{alert.pallet_code} · {alert.sku}</Text>
+                  <Text style={styles.expiryLocation}>
+                    {alert.location.rack_label} · {alert.location.slot_label} · {alert.location.bin_code}
+                  </Text>
+                </View>
+                <Text style={[
+                  styles.expiryDays,
+                  alert.days_remaining < 0 && styles.expiryDaysCritical,
+                ]}>
+                  {alert.days_remaining < 0 ? `QUÁ ${Math.abs(alert.days_remaining)} NGÀY` : `CÒN ${alert.days_remaining} NGÀY`}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
         )}
 
         {loading ? (
@@ -104,6 +198,56 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     lineHeight: 16,
   },
+  palletLookup: {
+    backgroundColor: colors.cardBg,
+    borderColor: colors.cardBorder,
+    borderWidth: 1,
+    borderRadius: radii.card,
+    padding: 12,
+    marginBottom: 12,
+  },
+  palletLookupTitle: {
+    fontFamily: fonts.mono,
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.textPrimary,
+    letterSpacing: 0.4,
+  },
+  palletLookupHint: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    color: colors.textMuted,
+    lineHeight: 15,
+    marginTop: 4,
+    marginBottom: 10,
+  },
+  expiryPanel: {
+    backgroundColor: '#FFF8E7',
+    borderColor: '#E9B949',
+    borderWidth: 1,
+    borderRadius: radii.card,
+    padding: 12,
+    marginBottom: 12,
+  },
+  expiryTitle: {
+    fontFamily: fonts.mono,
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#9A6700',
+    marginBottom: 8,
+  },
+  expiryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#F0D98A',
+    paddingVertical: 8,
+  },
+  expiryPallet: { fontFamily: fonts.mono, fontSize: 10, fontWeight: '700', color: colors.textPrimary },
+  expiryLocation: { fontFamily: fonts.mono, fontSize: 9, color: colors.textMuted, marginTop: 2 },
+  expiryDays: { fontFamily: fonts.mono, fontSize: 9, fontWeight: '700', color: '#9A6700' },
+  expiryDaysCritical: { color: colors.accentRed },
   zoneCard: {
     backgroundColor: colors.cardBg,
     borderWidth: 1,

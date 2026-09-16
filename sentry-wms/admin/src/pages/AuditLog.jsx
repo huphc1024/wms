@@ -3,6 +3,7 @@ import { api } from '../api.js';
 import DataTable from '../components/DataTable.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import Modal from '../components/Modal.jsx';
+import SkuBarcodeAutocomplete from '../components/SkuBarcodeAutocomplete.jsx';
 
 // Action-type categorization drives the badge color in the table and
 // modal header. Categories map to existing tag-* classes in App.css so
@@ -186,7 +187,6 @@ function ItemHistoryView() {
   // Two-character minimum keeps the catalog from returning a huge result
   // set on a single-letter prefix; the dropdown caps at 25.
   const [itemSearch, setItemSearch] = useState('');
-  const [itemResults, setItemResults] = useState([]);
   const [itemSearching, setItemSearching] = useState(false);
   const [item, setItem] = useState(null);
   const [logs, setLogs] = useState([]);
@@ -196,26 +196,6 @@ function ItemHistoryView() {
   const [selected, setSelected] = useState(null);
   const [sortKey, setSortKey] = useState('created_at');
   const [sortDir, setSortDir] = useState('desc');
-
-  useEffect(() => {
-    const q = itemSearch.trim();
-    if (q.length < 2 || item) {
-      setItemResults([]);
-      return;
-    }
-    setItemSearching(true);
-    const handle = setTimeout(async () => {
-      const res = await api.get(
-        `/admin/items?q=${encodeURIComponent(q)}&per_page=25&active=true`,
-        { silentPermissionDenied: true },
-      );
-      setItemSearching(false);
-      if (!res?.ok) return;
-      const data = await res.json();
-      setItemResults(data.items || []);
-    }, 200);
-    return () => clearTimeout(handle);
-  }, [itemSearch, item]);
 
   useEffect(() => {
     if (!item) {
@@ -246,15 +226,13 @@ function ItemHistoryView() {
 
   function pickItem(it) {
     setItem(it);
-    setItemSearch(`${it.sku} - ${it.item_name}`);
-    setItemResults([]);
+    setItemSearch(it.sku || '');
     setPage(1);
   }
 
   function clearItem() {
     setItem(null);
     setItemSearch('');
-    setItemResults([]);
     setLogs([]);
     setPagination(null);
     setPage(1);
@@ -278,40 +256,23 @@ function ItemHistoryView() {
         <label style={FILTER_LABEL_STYLE}>
           SKU {itemSearching && <span style={{ textTransform: 'none', fontWeight: 400 }}>(searching...)</span>}
         </label>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <input
-            className="form-input"
-            placeholder="Type SKU or item name (min 2 chars)"
+        <div style={{ display: 'flex', gap: 8, flex: 1 }}>
+          <SkuBarcodeAutocomplete
+            listId="audit-log-item-options"
+            minChars={2}
+            perPage={25}
+            placeholder="Gõ hoặc scan SKU / barcode (tối thiểu 2 ký tự)"
             value={itemSearch}
-            onChange={(e) => { setItemSearch(e.target.value); if (item) setItem(null); }}
-            autoComplete="off"
+            onChange={(v) => { setItemSearch(v); if (item) setItem(null); }}
+            onItemSelect={(it) => { if (it) pickItem(it); }}
+            onSearchingChange={setItemSearching}
+            apiOptions={{ silentPermissionDenied: true }}
+            showNoMatch={!item}
           />
           {item && (
             <button className="btn btn-sm" onClick={clearItem}>Clear</button>
           )}
         </div>
-        {!item && itemResults.length > 0 && (
-          <div style={{
-            position: 'absolute', top: '100%', left: 0, right: 0,
-            maxHeight: 240, overflowY: 'auto', background: 'var(--white)',
-            border: '1px solid var(--border-dark)', borderRadius: 8,
-            boxShadow: '0 4px 12px rgba(0,0,0,0.08)', zIndex: 100,
-            marginTop: 4,
-          }}>
-            {itemResults.map((it) => (
-              <div
-                key={it.item_id}
-                onMouseDown={() => pickItem(it)}
-                style={{
-                  padding: '8px 12px', cursor: 'pointer',
-                  borderBottom: '1px solid var(--border)', fontSize: 13,
-                }}
-              >
-                <strong className="mono">{it.sku}</strong>  -  {it.item_name}
-              </div>
-            ))}
-          </div>
-        )}
       </div>
 
       {!item && (

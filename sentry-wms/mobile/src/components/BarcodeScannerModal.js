@@ -61,8 +61,8 @@ export default function BarcodeScannerModal({ visible, onClose, onScan }) {
     try {
       await Promise.resolve(onScan?.(trimmed));
       onClose?.();
-    } catch {
-      setStatus('Scan failed - try again');
+    } catch (error) {
+      setStatus(error?.message || 'Scan failed - try again');
       processingRef.current = false;
     }
   }, [onClose, onScan]);

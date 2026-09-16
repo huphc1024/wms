@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
+import SkuBarcodeAutocomplete from '../components/SkuBarcodeAutocomplete.jsx';
 
 // Bin + item lookups switched from preloaded
 // dropdowns to debounced server-side search so 30K SKUs and 3K bins
@@ -76,12 +77,9 @@ export default function InterWarehouseTransfers() {
   const [destBinSearch, setDestBinSearch] = useState('');
   const [destBinOpen, setDestBinOpen] = useState(false);
   const [itemSearch, setItemSearch] = useState('');
-  const [itemOpen, setItemOpen] = useState(false);
-  const [itemResults, setItemResults] = useState([]);
   const [itemSearching, setItemSearching] = useState(false);
   const sourceBinRef = useRef(null);
   const destBinRef = useRef(null);
-  const itemRef = useRef(null);
 
   const sourceBinQuery = useDebouncedBinSearch(
     form.source_warehouse_id, sourceBinSearch, form.source_bin_id,
@@ -94,30 +92,11 @@ export default function InterWarehouseTransfers() {
   // transfer endpoint validates that the chosen item actually has
   // inventory in the source bin, so an unrelated catalog match just
   // bounces back with a clear error.
-  useEffect(() => {
-    const q = itemSearch.trim();
-    if (q.length < 2 || form.item_id) {
-      setItemResults([]);
-      return;
-    }
-    setItemSearching(true);
-    const handle = setTimeout(async () => {
-      const res = await api.get(
-        `/admin/items?q=${encodeURIComponent(q)}&per_page=25&active=true`,
-      );
-      setItemSearching(false);
-      if (!res?.ok) return;
-      const data = await res.json();
-      setItemResults(data.items || []);
-    }, 200);
-    return () => clearTimeout(handle);
-  }, [itemSearch, form.item_id]);
 
   useEffect(() => {
     function handleClick(e) {
       if (sourceBinRef.current && !sourceBinRef.current.contains(e.target)) setSourceBinOpen(false);
       if (destBinRef.current && !destBinRef.current.contains(e.target)) setDestBinOpen(false);
-      if (itemRef.current && !itemRef.current.contains(e.target)) setItemOpen(false);
     }
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
@@ -174,8 +153,7 @@ export default function InterWarehouseTransfers() {
 
   function selectItem(i) {
     setForm((f) => ({ ...f, item_id: i.item_id }));
-    setItemSearch(`${i.sku}  -  ${i.item_name}`);
-    setItemOpen(false);
+    setItemSearch(i.sku || '');
   }
 
   async function handleSubmit(e) {
@@ -320,30 +298,19 @@ export default function InterWarehouseTransfers() {
           </div>
 
           <div className="form-row">
-            <div className="form-group" ref={itemRef} style={{ position: 'relative' }}>
+            <div className="form-group">
               <label>Item {itemSearching && <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>(searching...)</span>}</label>
-              <input
-                className="form-input"
-                placeholder="Type SKU or item name (min 2 chars)"
+              <SkuBarcodeAutocomplete
+                listId="iwt-item-options"
+                minChars={2}
+                perPage={25}
+                placeholder="Gõ hoặc scan SKU / barcode (tối thiểu 2 ký tự)"
                 value={itemSearch}
-                onChange={(e) => { setItemSearch(e.target.value); updateField('item_id', ''); setItemOpen(true); }}
-                onFocus={() => setItemOpen(true)}
-                autoComplete="off"
+                onChange={(v) => { setItemSearch(v); updateField('item_id', ''); }}
+                onItemSelect={(it) => { if (it) selectItem(it); }}
+                onSearchingChange={setItemSearching}
+                showNoMatch={itemSearch.trim().length >= 2 && !form.item_id}
               />
-              {itemOpen && itemResults.length > 0 && (
-                <div style={dropdownStyle}>
-                  {itemResults.map((i) => (
-                    <div key={i.item_id} style={dropdownItemStyle} onMouseDown={() => selectItem(i)}>
-                      <strong className="mono">{i.sku}</strong>  -  {i.item_name}
-                    </div>
-                  ))}
-                </div>
-              )}
-              {itemOpen && !itemSearching && itemSearch.trim().length >= 2 && !form.item_id && itemResults.length === 0 && (
-                <div style={{ ...dropdownStyle, padding: 12, fontSize: 12, color: 'var(--text-secondary)' }}>
-                  No items match "{itemSearch.trim()}".
-                </div>
-              )}
             </div>
             <div className="form-group">
               <label>Quantity</label>
